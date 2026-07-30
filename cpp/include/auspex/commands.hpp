@@ -1,0 +1,100 @@
+// Spoken-command interpretation and execution.
+//
+// This is the piece src/magi_shell/desktop_assistant.py was meant to be: turning
+// an utterance into a desktop action rather than just an answer.
+//
+// SAFETY MODEL -- the important part of this file:
+//
+//   1. The model never produces a command line. It produces one JSON object whose
+//      "action" must be one of a fixed set of verbs. Anything else degrades to
+//      Answer (speak the text), never to execution.
+//   2. Every action is executed via execvp with an argv vector. No shell is
+//      involved anywhere, so shell metacharacters in a target are inert -- a
+//      hallucinated `; rm -rf ~` is a literal filename argument to xdg-open, not
+//      a command.
+//   3. Targets are validated against reality before use: a path must exist on
+//      disk, an app must resolve in PATH, a window must actually be open, a
+//      workspace index must be in range, a volume must be 0-100. A hallucinated
+//      target fails closed with a spoken explanation.
+//   4. Window focus never trusts a model-supplied window id. The model names a
+//      title; the id is looked up from the live window list.
+#pragma once
+
+#include <optional>
+#include <utility>
+#include <string>
+#include <vector>
+
+#include "auspex/config.hpp"
+#include "auspex/desktop.hpp"
+
+namespace auspex {
+
+enum class ActionKind {
+    Answer,           // no desktop action; speak `target`
+    OpenPath,         // xdg-open a file or directory
+    LaunchApp,        // run an executable found in PATH, no arguments
+    SwitchWorkspace,  // go to workspace `number`
+    FocusWindow,      // raise the window whose title matches `target`
+    SetVolume,        // set the default sink to `number` percent
+    OpenUrl,          // open an http/https URL in the browser
+    WebSearch,        // search the web for `target`
+};
+
+std::string_view to_string(ActionKind kind);
+
+struct Action {
+    ActionKind  kind   = ActionKind::Answer;
+    std::string target;
+    int         number = 0;
+
+    bool operator==(const Action&) const = default;
+};
+
+// What the model is allowed to know about the desktop, so its targets can be
+// grounded in things that actually exist.
+struct CommandContext {
+    int                      workspace_count = 4;
+    std::vector<WindowEntry> windows;
+    std::string              focused_window;
+    std::string              selection;
+
+    // Copied from Config so execute_action() needs no separate Config argument.
+    std::string browser;
+    std::string search_url;
+
+    // Recent (question, answer) turns, oldest first. Replayed into the prompt so
+    // follow-ups like "what about the second one?" resolve. voice_assistant.py had
+    // this; Auspex was stateless until now.
+    std::vector<std::pair<std::string, std::string>> history;
+};
+
+CommandContext gather_context(const Config& config);
+
+// The instruction given to the model. Kept in one place so it can be inspected
+// and tested rather than being buried in a string literal at the call site.
+std::string build_command_prompt(const std::string& utterance,
+                                 const CommandContext& context);
+
+struct ParseResult {
+    std::optional<Action> action;
+    std::string           error;   // set when the output could not be used
+};
+
+// Extracts the first balanced JSON object from `model_output` (a reasoning model
+// may wrap it in prose), then validates it against the whitelist and `context`.
+ParseResult parse_action(const std::string& model_output, const CommandContext& context);
+
+struct ExecResult {
+    bool        ok = false;
+    std::string message;   // spoken back to the user
+};
+
+ExecResult execute_action(const Action& action, const CommandContext& context);
+
+// Resolves a spoken path: expands ~, and if that misses, retries the final
+// component case-insensitively inside its parent, so "~/downloads" finds
+// "~/Downloads". nullopt if nothing on disk matches.
+std::optional<std::filesystem::path> resolve_path(std::string_view spoken);
+
+}  // namespace auspex
