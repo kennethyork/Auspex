@@ -21,6 +21,7 @@
 
 #include "auspex/agents.hpp"
 #include "auspex/autostart.hpp"
+#include "auspex/calendar.hpp"
 #include "auspex/canvas.hpp"
 #include "auspex/commands.hpp"
 #include "auspex/crew.hpp"
@@ -1842,6 +1843,227 @@ void test_crew() {
 
 // The invariant Kenny asked for in one sentence: whatever the canvas does, no window
 // it places may touch a monitor other than its own.
+void test_calendar_notes() {
+    std::cout << "calendar\n";
+
+    using namespace auspex;
+    namespace fs = std::filesystem;
+
+    // Dates and times are checked as real ones, not by shape. An event filed under
+    // 2026-02-30 is an event no view will ever show again.
+    {
+        check(is_valid_date("2026-07-31"), "a real date");
+        check(is_valid_date("2024-02-29"), "a leap day in a leap year");
+        check(!is_valid_date("2023-02-29"), "a leap day in a common year");
+        check(!is_valid_date("2026-02-30"), "February the 30th");
+        check(!is_valid_date("2026-13-01"), "month 13");
+        check(!is_valid_date("2026-7-31"), "an unpadded month");
+        check(!is_valid_date(""), "empty");
+
+        // Empty is an all-day event, which is a different thing from midnight.
+        check(is_valid_time(""), "no time means all day");
+        check(is_valid_time("00:00"), "midnight is a time");
+        check(is_valid_time("23:59"), "and so is the last minute");
+        check(!is_valid_time("24:00"), "hour 24 is not");
+        check(!is_valid_time("09:60"), "minute 60 is not");
+        check(!is_valid_time("9:00"), "an unpadded hour is not");
+        check(!is_valid_time("0900"), "a missing colon is not");
+
+        check_eq(format_date(2026, 7, 31), std::string("2026-07-31"), "formatting pads");
+        check(format_date(2026, 2, 30).empty(), "an unreal date formats to nothing");
+
+        // The bug this caught in the running shell: a stream formats through the
+        // global locale, and one with digit grouping writes 2026 as "2,026" -- an
+        // 11-character key that fails validation, so every entry was refused. Only
+        // in the shell, because a test binary runs under the C locale.
+        {
+            const std::locale previous = std::locale();
+            bool grouping = true;
+            try {
+                std::locale::global(std::locale("en_US.UTF-8"));
+            } catch (const std::exception&) {
+                grouping = false;
+            }
+            if (grouping) {
+                check_eq(format_date(2026, 7, 31), std::string("2026-07-31"),
+                         "a grouping locale does not put a comma in the year");
+                check(is_valid_date(format_date(2026, 7, 31)),
+                      "and what it produces is still a valid date");
+                std::locale::global(previous);
+            }
+        }
+
+        check_eq(days_in_month(2024, 2), 29, "February in a leap year");
+        check_eq(days_in_month(1900, 2), 28, "1900 is not a leap year");
+        check_eq(days_in_month(2000, 2), 29, "2000 is");
+    }
+
+    // Weekdays, which the month grid is built from. 0 is Sunday.
+    {
+        check_eq(weekday_of("2026-07-31"), 5, "2026-07-31 is a Friday");
+        check_eq(weekday_of("2026-08-02"), 0, "2026-08-02 is a Sunday");
+        check_eq(weekday_of("2000-01-01"), 6, "the millennium began on a Saturday");
+        check_eq(weekday_of("nonsense"), -1, "an unreal date has no weekday");
+    }
+
+    // The month grid: always six full rows, padded from the months either side.
+    {
+        const auto july = month_grid(2026, 7);
+        check_eq(july.size(), std::size_t{42}, "a month is always six rows of seven");
+        if (july.size() == 42) {
+            // July 2026 starts on a Wednesday, so the grid opens with three days of
+            // June rather than three holes.
+            check_eq(july[0].date, std::string("2026-06-28"), "the grid starts on a Sunday");
+            check(!july[0].in_month, "and that day belongs to the month before");
+            check_eq(july[3].date, std::string("2026-07-01"), "the 1st lands on Wednesday");
+            check(july[3].in_month, "and belongs to this month");
+            check_eq(july[33].date, std::string("2026-07-31"), "the last day is in place");
+            check(july[33].in_month, "and belongs to this month");
+            check(!july[34].in_month, "the days after it belong to the next month");
+            check_eq(july[41].date, std::string("2026-08-08"), "the grid runs on to fill six rows");
+        }
+
+        // Every cell is a real date and every row is a full week, in every month of
+        // a leap year -- the padding arithmetic is the easiest thing here to get
+        // wrong at a boundary.
+        for (int month = 1; month <= 12; ++month) {
+            const auto grid = month_grid(2024, month);
+            bool sound = grid.size() == 42;
+            for (std::size_t i = 0; sound && i < grid.size(); ++i) {
+                if (!is_valid_date(grid[i].date)) sound = false;
+                if (weekday_of(grid[i].date) != static_cast<int>(i % 7)) sound = false;
+            }
+            check(sound, std::string("month grid is sound for 2024-") +
+                             (month < 10 ? "0" : "") + std::to_string(month));
+        }
+
+        check(month_grid(2026, 13).empty(), "an impossible month has no grid");
+    }
+
+    // Events: adding, ordering, removing, and what happens to a day that empties.
+    {
+        EventStore store;
+        check(store.empty(), "a new calendar is empty");
+
+        check(store.add("2026-07-31", {.start = "14:00", .title = "Dentist"}),
+              "an event is added");
+        check(store.add("2026-07-31", {.start = "09:00", .title = "Standup"}),
+              "and an earlier one");
+        check(store.add("2026-07-31", {.start = "", .title = "Bins out"}),
+              "and an all-day one");
+
+        const auto day = store.on("2026-07-31");
+        check_eq(day.size(), std::size_t{3}, "all three are on the day");
+        if (day.size() == 3) {
+            // All-day first, then by time -- which is where a day view shows them,
+            // regardless of the order they were entered in.
+            check_eq(day[0].title, std::string("Bins out"), "all-day comes first");
+            check_eq(day[1].start, std::string("09:00"), "then the earliest");
+            check_eq(day[2].start, std::string("14:00"), "then the later one");
+        }
+
+        check(!store.add("2026-07-31", {.start = "09:00", .title = "   "}),
+              "a blank title is refused");
+        check(!store.add("2026-07-31", {.start = "25:00", .title = "Impossible"}),
+              "an impossible time is refused");
+        check(!store.add("2026-02-30", {.start = "", .title = "Never"}),
+              "an event on an unreal date is refused");
+        check_eq(store.on("2026-07-31").size(), std::size_t{3}, "and none of them landed");
+
+        check(store.remove("2026-07-31", 0), "an event is removed by index");
+        check_eq(store.on("2026-07-31").size(), std::size_t{2}, "leaving the rest");
+        check(!store.remove("2026-07-31", 9), "an index past the end is refused");
+
+        check(store.remove("2026-07-31", 0), "and the others go");
+        check(store.remove("2026-07-31", 0), "one at a time");
+        check(store.dates().empty(),
+              "a day with nothing left stops being a day, so no mark is left behind");
+    }
+
+    // Counts per month, which is what fills a month view's cells.
+    {
+        EventStore store;
+        store.add("2026-07-01", {.start = "", .title = "a"});
+        store.add("2026-07-01", {.start = "10:00", .title = "b"});
+        store.add("2026-07-31", {.start = "", .title = "c"});
+        store.add("2026-08-15", {.start = "", .title = "d"});
+        store.add("2025-07-04", {.start = "", .title = "e"});
+
+        const auto july = store.counts_in_month(2026, 7);
+        check_eq(july.size(), std::size_t{2}, "July has two days with anything on them");
+        check_eq(july.at(1), 2, "the 1st has two events");
+        check_eq(july.at(31), 1, "the 31st has one");
+
+        // The same month a year earlier must not be swept up by a short prefix.
+        const auto last_year = store.counts_in_month(2025, 7);
+        check_eq(last_year.size(), std::size_t{1}, "last July is its own month");
+        check(store.counts_in_month(2026, 9).empty(), "an empty month has no counts");
+    }
+
+    // Round trip through the file, including the older format.
+    {
+        const fs::path path = fs::temp_directory_path() / "auspex-selftest-calendar.json";
+        std::error_code ec;
+        fs::remove(path, ec);
+
+        EventStore store;
+        store.add("2026-07-31", {.start = "09:00", .title = "Standup"});
+        store.add("2026-08-02", {.start = "", .title = "Dentist"});
+        check(store.save(path), "the calendar saves");
+
+        const auto reloaded = EventStore::load(path);
+        check_eq(reloaded.dates().size(), std::size_t{2}, "both days come back");
+        if (!reloaded.on("2026-07-31").empty()) {
+            check_eq(reloaded.on("2026-07-31")[0].start, std::string("09:00"),
+                     "with the time intact");
+            check_eq(reloaded.on("2026-07-31")[0].title, std::string("Standup"),
+                     "and the title");
+        }
+
+        // The first version of this file stored bare strings. Anything written then
+        // is read as an all-day event rather than dropped.
+        {
+            std::ofstream out(path, std::ios::trunc);
+            out << R"({"2026-07-31":["Bins out"]})";
+        }
+        const auto old_format = EventStore::load(path);
+        check_eq(old_format.on("2026-07-31").size(), std::size_t{1},
+                 "an entry in the old format still loads");
+        if (!old_format.on("2026-07-31").empty()) {
+            check_eq(old_format.on("2026-07-31")[0].title, std::string("Bins out"),
+                     "with its text");
+            check(old_format.on("2026-07-31")[0].start.empty(),
+                  "as an all-day event, since it never had a time");
+        }
+
+        // A file that is not JSON must not take the desktop down with it.
+        {
+            std::ofstream out(path, std::ios::trunc);
+            out << "this is not json";
+        }
+        check(EventStore::load(path).empty(), "a corrupt file loads as empty");
+
+        // Hand-edited nonsense is filtered rather than trusted; this file is meant
+        // to be editable.
+        {
+            std::ofstream out(path, std::ios::trunc);
+            out << R"({"2026-02-30":[{"title":"impossible"}],)"
+                << R"("2026-07-31":[{"start":"09:00","title":"real"},{"title":""}],)"
+                << R"("not-a-date":[{"title":"x"}],"2026-08-01":"not an array"})";
+        }
+        const auto filtered = EventStore::load(path);
+        check_eq(filtered.dates().size(), std::size_t{1},
+                 "only the day that is a real date survives");
+        check_eq(filtered.on("2026-07-31").size(), std::size_t{1},
+                 "and the untitled entry in it is dropped");
+
+        check(EventStore::load(fs::temp_directory_path() / "auspex-no-such.json").empty(),
+              "a missing file is an empty calendar, not a failure");
+
+        fs::remove(path, ec);
+    }
+}
+
 void test_timekeeping() {
     std::cout << "date and time\n";
 
@@ -2900,6 +3122,7 @@ int main(int argc, char** argv) {
     test_monitors_current();
     test_minimize();
     test_crew();
+    test_calendar_notes();
     test_timekeeping();
     test_volume_and_network();
     test_tray();

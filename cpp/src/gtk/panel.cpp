@@ -271,10 +271,35 @@ Clock::Clock(const Config& config)
     set_has_frame(false);
     set_child(label_);
 
+    note_heading_.set_xalign(0.0f);
+    note_heading_.add_css_class("subtitle");
+
+    note_scroller_.set_child(note_box_);
+    note_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    note_scroller_.set_max_content_height(160);
+    note_scroller_.set_propagate_natural_height(true);
+
+    open_calendar_.signal_clicked().connect([this] {
+        popover_.popdown();
+        if (on_open_) on_open_();
+    });
+
     popover_box_.set_margin(10);
     popover_box_.append(calendar_);
     popover_box_.append(today_);
+    popover_box_.append(note_rule_);
+    popover_box_.append(note_heading_);
+    popover_box_.append(note_scroller_);
+    popover_box_.append(open_calendar_);
     popover_.set_child(popover_box_);
+
+    // Selecting a day changes which notes are shown; changing month changes which
+    // days are marked. Both are needed -- GTK reports them separately.
+    calendar_.signal_day_selected().connect([this] { reload_notes(); });
+    calendar_.signal_prev_month().connect([this] { refresh_marks(); });
+    calendar_.signal_next_month().connect([this] { refresh_marks(); });
+    calendar_.signal_prev_year().connect([this] { refresh_marks(); });
+    calendar_.signal_next_year().connect([this] { refresh_marks(); });
 
     // Upward, like every other popover on the bottom bar -- except this one is on
     // the TOP bar, so it opens downwards. Stated rather than defaulted because the
@@ -284,7 +309,15 @@ Clock::Clock(const Config& config)
 
     // Opened on today, always. A calendar left on last March because that is where
     // it was when you closed it is a calendar you have to reset before reading.
-    popover_.signal_show().connect([this] { calendar_.select_day(Glib::DateTime::create_now_local()); });
+    //
+    // Re-read from disk on every open rather than trusting what is in memory: the
+    // notes file is plain JSON in the user's own data directory and editing it by
+    // hand is a perfectly reasonable thing to do.
+    popover_.signal_show().connect([this] {
+        notes_ = EventStore::load();
+        calendar_.select_day(Glib::DateTime::create_now_local());
+        reload_notes();
+    });
     today_.signal_clicked().connect(
         [this] { calendar_.select_day(Glib::DateTime::create_now_local()); });
 
@@ -295,6 +328,56 @@ Clock::Clock(const Config& config)
             return true;
         },
         1000);
+}
+
+void Clock::refresh_marks() {
+    calendar_.clear_marks();
+
+    const auto shown = calendar_.get_date();
+    for (const auto& [day, count] : notes_.counts_in_month(shown.get_year(),
+                                                          shown.get_month())) {
+        (void)count;
+        calendar_.mark_day(static_cast<guint>(day));
+    }
+}
+
+void Clock::reload_notes() {
+    const auto shown = calendar_.get_date();
+    selected_date_ = format_date(shown.get_year(), shown.get_month(),
+                                 shown.get_day_of_month());
+
+    refresh_marks();
+
+    while (Gtk::Widget* child = note_box_.get_first_child()) note_box_.remove(*child);
+    note_rows_.clear();
+
+    // Read-only here. Adding and removing live in the calendar window, where there
+    // is room to show a time next to a title without the popover becoming a form.
+    const auto day = notes_.on(selected_date_);
+    note_heading_.set_text(day.empty() ? selected_date_ + "  \u2014  nothing on"
+                                       : selected_date_);
+    note_scroller_.set_visible(!day.empty());
+
+    for (const auto& event : day) {
+        auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
+
+        auto* when = Gtk::make_managed<Gtk::Label>(
+            event.start.empty() ? "All day" : event.start);
+        when->set_xalign(0.0f);
+        when->set_size_request(56, -1);
+        when->add_css_class("subtitle");
+
+        auto* what = Gtk::make_managed<Gtk::Label>(event.title);
+        what->set_xalign(0.0f);
+        what->set_hexpand(true);
+        what->set_wrap(true);
+        what->set_max_width_chars(26);
+
+        row->append(*when);
+        row->append(*what);
+        note_box_.append(*row);
+        note_rows_.push_back(std::move(row));
+    }
 }
 
 void Clock::refresh_format() {
@@ -741,6 +824,7 @@ void Panel::build_top() {
     // one place is a row of pixels back for the window list.
 
     clock_ = std::make_unique<Clock>(config_);
+    clock_->set_open_handler([this] { show_calendar(); });
     box_.append(*clock_);
 }
 
@@ -947,6 +1031,7 @@ void Panel::show_panel_menu(double x, double y) {
     };
 
     add("Settings", [this] { show_settings(); });
+    add("Calendar", [this] { show_calendar(); });
     // Only when ollamadev is installed: a menu entry that always explains it
     // cannot work is worse than no entry.
     if (crew_available()) add("Crew board", [this] { show_board(); });
@@ -989,6 +1074,21 @@ void Panel::confirm_quit() {
         // the desktop window and the voice worker running.
         if (auto app = get_application()) app->quit();
     });
+}
+
+void Panel::show_calendar() {
+    if (calendar_window_) {
+        calendar_window_->present();
+        return;
+    }
+    calendar_window_ = std::make_unique<CalendarWindow>();
+    calendar_window_->signal_close_request().connect(
+        [this] {
+            Glib::signal_idle().connect_once([this] { calendar_window_.reset(); });
+            return false;
+        },
+        false);
+    calendar_window_->present();
 }
 
 void Panel::show_board() {

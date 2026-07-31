@@ -18,6 +18,7 @@
 #include <gtkmm/checkbutton.h>
 #include <gtkmm/dropdown.h>
 #include <gtkmm/entry.h>
+#include <gtkmm/grid.h>
 #include <gtkmm/label.h>
 #include <gtkmm/listbox.h>
 #include <gtkmm/scrolledwindow.h>
@@ -26,6 +27,7 @@
 #include <gtkmm/window.h>
 
 #include "auspex/config.hpp"
+#include "auspex/calendar.hpp"
 #include "auspex/desktop_entries.hpp"
 #include "auspex/timekeeping.hpp"
 
@@ -86,6 +88,65 @@ private:
     Gtk::Button         close_{"Close"};
 
     std::vector<std::unique_ptr<Gtk::Widget>> rows_;
+};
+
+// A month view, laid out the way a calendar is expected to look: a heading with
+// the month and year, a row of weekday names, and a six-by-seven grid of days each
+// showing what is on it.
+//
+// A window rather than a panel popover. A popover big enough to read a month in is
+// a window that has to be dismissed by clicking away from it, and one small enough
+// to be a popover cannot show a month.
+class CalendarWindow : public Gtk::Window {
+public:
+    CalendarWindow();
+
+private:
+    void build_grid();
+    void show_month(int year, int month);
+    void select_day(const std::string& date);
+    void reload_day();
+    void add_event();
+    void go_today();
+
+    EventStore  events_;
+    int         year_  = 0;
+    int         month_ = 0;
+    std::string selected_;
+
+    Gtk::Box    root_{Gtk::Orientation::VERTICAL, 0};
+
+    Gtk::Box    header_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Button previous_;
+    Gtk::Button next_;
+    Gtk::Button today_{"Today"};
+    Gtk::Label  heading_;
+
+    Gtk::Box    body_{Gtk::Orientation::HORIZONTAL, 0};
+    Gtk::Grid   grid_;
+
+    // The day panel down the side, which is where events are actually read and
+    // entered -- a grid cell has room to say that something is there, not what.
+    Gtk::Box            day_panel_{Gtk::Orientation::VERTICAL, 8};
+    Gtk::Label          day_heading_;
+    Gtk::ScrolledWindow day_scroller_;
+    Gtk::Box            day_box_{Gtk::Orientation::VERTICAL, 4};
+    Gtk::Box            entry_row_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Entry          time_entry_;
+    Gtk::Entry          title_entry_;
+    Gtk::Button         add_{"Add"};
+
+    // One button per grid cell, kept so the month can be redrawn without rebuilding
+    // the widgets -- 42 cells rebuilt on every page turn is a visible flicker.
+    struct Cell {
+        Gtk::Button* button = nullptr;
+        Gtk::Box*    box    = nullptr;
+        Gtk::Label*  number = nullptr;
+        Gtk::Label*  detail = nullptr;
+        std::string  date;
+    };
+    std::vector<Cell> cells_;
+    std::vector<std::unique_ptr<Gtk::Widget>> day_rows_;
 };
 
 // Conversation window. Replaces llm_menu.py, including its per-message actions:

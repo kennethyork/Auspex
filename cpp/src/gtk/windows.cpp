@@ -15,6 +15,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <glibmm/datetime.h>
+
 #include <gtkmm/expression.h>
 #include <gtkmm/stringobject.h>
 
@@ -296,6 +298,287 @@ void BoardWindow::decide(int n, bool accept) {
     // separate process, and reading the board before it has written would show the
     // change still pending and invite a second click on something already actioned.
     Glib::signal_timeout().connect_once([this] { refresh(); }, 1200);
+}
+
+// ---------------------------------------------------------------------------
+// CalendarWindow
+// ---------------------------------------------------------------------------
+CalendarWindow::CalendarWindow() {
+    set_title("Auspex Calendar");
+    add_css_class("auspex-window");
+    set_default_size(980, 660);
+
+    events_ = EventStore::load();
+
+    previous_.set_icon_name("pan-start-symbolic");
+    previous_.set_has_frame(false);
+    next_.set_icon_name("pan-end-symbolic");
+    next_.set_has_frame(false);
+
+    heading_.add_css_class("title-2");
+    heading_.set_xalign(0.0f);
+    heading_.set_hexpand(true);
+
+    previous_.signal_clicked().connect([this] {
+        int year = year_, month = month_ - 1;
+        if (month < 1) { month = 12; --year; }
+        show_month(year, month);
+    });
+    next_.signal_clicked().connect([this] {
+        int year = year_, month = month_ + 1;
+        if (month > 12) { month = 1; ++year; }
+        show_month(year, month);
+    });
+    today_.signal_clicked().connect([this] { go_today(); });
+
+    header_.set_margin(12);
+    header_.append(previous_);
+    header_.append(next_);
+    header_.append(today_);
+    header_.append(heading_);
+    root_.append(header_);
+
+    build_grid();
+
+    grid_.set_hexpand(true);
+    grid_.set_vexpand(true);
+    body_.append(grid_);
+
+    // ---- the day panel ----
+    day_heading_.add_css_class("subtitle");
+    day_heading_.set_xalign(0.0f);
+
+    day_scroller_.set_child(day_box_);
+    day_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    day_scroller_.set_vexpand(true);
+
+    // Time first and narrow, title second and wide, which is the order they are
+    // spoken in and the order they are read in.
+    time_entry_.set_placeholder_text("09:00");
+    time_entry_.set_max_width_chars(6);
+    time_entry_.set_width_chars(6);
+    title_entry_.set_placeholder_text("What is happening\u2026");
+    title_entry_.set_hexpand(true);
+    // Enter from either field adds it. Reaching for the mouse is most of the reason
+    // people do not bother writing something down.
+    time_entry_.signal_activate().connect([this] { add_event(); });
+    title_entry_.signal_activate().connect([this] { add_event(); });
+    add_.signal_clicked().connect([this] { add_event(); });
+
+    entry_row_.append(time_entry_);
+    entry_row_.append(title_entry_);
+    entry_row_.append(add_);
+
+    day_panel_.set_margin(12);
+    day_panel_.set_size_request(300, -1);
+    day_panel_.append(day_heading_);
+    day_panel_.append(day_scroller_);
+    day_panel_.append(entry_row_);
+    body_.append(day_panel_);
+
+    root_.append(body_);
+    set_child(root_);
+
+    go_today();
+}
+
+void CalendarWindow::build_grid() {
+    grid_.set_row_homogeneous(true);
+    grid_.set_column_homogeneous(true);
+
+    static const char* names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    for (int column = 0; column < 7; ++column) {
+        auto* label = Gtk::make_managed<Gtk::Label>(names[column]);
+        label->add_css_class("subtitle");
+        label->set_margin_bottom(4);
+        grid_.attach(*label, column, 0, 1, 1);
+    }
+    // The weekday row must not stretch with the day rows, or it takes a sixth of
+    // the height for one word.
+    grid_.set_row_homogeneous(false);
+    grid_.set_vexpand(true);
+
+    cells_.resize(42);
+    for (int i = 0; i < 42; ++i) {
+        auto* box = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 2);
+        auto* number = Gtk::make_managed<Gtk::Label>();
+        auto* detail = Gtk::make_managed<Gtk::Label>();
+
+        number->set_xalign(0.0f);
+        detail->set_xalign(0.0f);
+        detail->set_wrap(true);
+        detail->set_max_width_chars(16);
+        detail->add_css_class("subtitle");
+        detail->set_vexpand(true);
+        detail->set_valign(Gtk::Align::START);
+
+        box->set_margin(4);
+        box->append(*number);
+        box->append(*detail);
+
+        auto* button = Gtk::make_managed<Gtk::Button>();
+        button->set_child(*box);
+        button->set_has_frame(false);
+        button->set_hexpand(true);
+        button->set_vexpand(true);
+        const int index = i;
+        button->signal_clicked().connect([this, index] {
+            if (!cells_[index].date.empty()) select_day(cells_[index].date);
+        });
+
+        grid_.attach(*button, i % 7, 1 + i / 7, 1, 1);
+        cells_[i] = {button, box, number, detail, ""};
+    }
+}
+
+void CalendarWindow::show_month(int year, int month) {
+    year_  = year;
+    month_ = month;
+    heading_.set_text(month_name(month) + " " + std::to_string(year));
+
+    const auto grid   = month_grid(year, month);
+    const auto counts = events_.counts_in_month(year, month);
+
+    for (std::size_t i = 0; i < cells_.size() && i < grid.size(); ++i) {
+        auto& cell = cells_[i];
+        cell.date = grid[i].date;
+
+        // The day number alone; the date is already in the heading.
+        cell.number->set_text(std::to_string(std::stoi(grid[i].date.substr(8, 2))));
+
+        // Days from the months either side are shown but dimmed. Hiding them would
+        // leave holes in the first and last weeks; showing them at full weight makes
+        // the month's own edges impossible to find.
+        if (grid[i].in_month) {
+            cell.button->remove_css_class("subtitle");
+            cell.button->set_opacity(1.0);
+        } else {
+            cell.button->set_opacity(0.45);
+        }
+
+        // What is on the day, in the cell. Two entries then a count, because a cell
+        // that lists eight things is a cell you cannot read at a glance.
+        const auto day = events_.on(grid[i].date);
+        std::string detail;
+        for (std::size_t n = 0; n < day.size() && n < 2; ++n) {
+            if (!detail.empty()) detail += "\n";
+            detail += day[n].start.empty() ? day[n].title
+                                           : day[n].start + "  " + day[n].title;
+        }
+        if (day.size() > 2) {
+            detail += "\n+" + std::to_string(day.size() - 2) + " more";
+        }
+        cell.detail->set_text(detail);
+
+        if (grid[i].date == selected_) {
+            cell.button->add_css_class("active-workspace");
+        } else {
+            cell.button->remove_css_class("active-workspace");
+        }
+    }
+    (void)counts;
+}
+
+void CalendarWindow::select_day(const std::string& date) {
+    selected_ = date;
+
+    // Clicking a day in the trailing or leading week moves to that month, which is
+    // what clicking it plainly means.
+    const int year  = std::stoi(date.substr(0, 4));
+    const int month = std::stoi(date.substr(5, 2));
+    if (year != year_ || month != month_) {
+        show_month(year, month);
+    } else {
+        show_month(year_, month_);   // repaint, to move the selection highlight
+    }
+
+    reload_day();
+}
+
+void CalendarWindow::reload_day() {
+    while (Gtk::Widget* child = day_box_.get_first_child()) day_box_.remove(*child);
+    day_rows_.clear();
+
+    day_heading_.set_text(selected_);
+
+    const auto day = events_.on(selected_);
+    if (day.empty()) {
+        auto* empty = Gtk::make_managed<Gtk::Label>("Nothing on this day");
+        empty->add_css_class("subtitle");
+        empty->set_xalign(0.0f);
+        day_box_.append(*empty);
+        return;
+    }
+
+    for (std::size_t i = 0; i < day.size(); ++i) {
+        auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
+
+        auto* when = Gtk::make_managed<Gtk::Label>(
+            day[i].start.empty() ? "All day" : day[i].start);
+        when->set_xalign(0.0f);
+        when->set_size_request(64, -1);
+        when->add_css_class("subtitle");
+
+        auto* what = Gtk::make_managed<Gtk::Label>(day[i].title);
+        what->set_xalign(0.0f);
+        what->set_hexpand(true);
+        what->set_wrap(true);
+        what->set_max_width_chars(24);
+
+        // Removal is per event and immediate. A one-line entry is not worth a
+        // confirmation dialog, and the file behind it is plain JSON.
+        auto* remove = Gtk::make_managed<Gtk::Button>();
+        remove->set_icon_name("edit-delete-symbolic");
+        remove->set_has_frame(false);
+        remove->set_tooltip_text("Remove");
+        const std::size_t index = i;
+        remove->signal_clicked().connect([this, index] {
+            if (events_.remove(selected_, index)) {
+                events_.save();
+                show_month(year_, month_);
+                reload_day();
+            }
+        });
+
+        row->append(*when);
+        row->append(*what);
+        row->append(*remove);
+        day_box_.append(*row);
+        day_rows_.push_back(std::move(row));
+    }
+}
+
+void CalendarWindow::add_event() {
+    CalendarEvent event;
+    event.start = std::string(time_entry_.get_text());
+    event.title = std::string(title_entry_.get_text());
+
+    if (!events_.add(selected_, event)) {
+        // The two ways this fails are worth telling apart: a blank title is a slip,
+        // a malformed time is a typo with a specific fix.
+        day_heading_.set_text(is_valid_time(event.start)
+                                  ? selected_ + "  \u2014  needs a title"
+                                  : selected_ + "  \u2014  time must be HH:MM");
+        return;
+    }
+
+    // Saved as it is entered. An event only in memory is an event lost to the next
+    // restart, and nothing here is worth a Save button.
+    events_.save();
+    time_entry_.set_text("");
+    title_entry_.set_text("");
+
+    show_month(year_, month_);
+    reload_day();
+}
+
+void CalendarWindow::go_today() {
+    const auto now = Glib::DateTime::create_now_local();
+    const std::string today = format_date(now.get_year(), now.get_month(),
+                                          now.get_day_of_month());
+    selected_ = today;
+    show_month(now.get_year(), now.get_month());
+    reload_day();
 }
 
 // ---------------------------------------------------------------------------

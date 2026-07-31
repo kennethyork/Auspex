@@ -29,10 +29,12 @@
 #include <gtkmm/gestureclick.h>
 #include <gtkmm/calendar.h>
 #include <gtkmm/menubutton.h>
+#include <gtkmm/entry.h>
 #include <gtkmm/scrolledwindow.h>
 #include <gtkmm/scale.h>
 #include <gtkmm/togglebutton.h>
 
+#include "auspex/calendar.hpp"
 #include "auspex/config.hpp"
 #include "auspex/desktop.hpp"
 #include "auspex/panel_dock.hpp"
@@ -181,6 +183,11 @@ class Clock : public Gtk::MenuButton {
 public:
     explicit Clock(const Config& config);
 
+    // Wired by the Panel, which owns the calendar window.
+    void set_open_handler(sigc::slot<void()> handler) {
+        on_open_ = std::move(handler);
+    }
+
 private:
     void tick();
 
@@ -202,11 +209,31 @@ private:
     bool clock_24_hour_ = true;
     std::filesystem::file_time_type config_mtime_{};
 
+    // Notes on the selected day: shown, added and removed without leaving the
+    // popover. Days carrying notes are marked on the calendar itself, which is the
+    // only way a month view is useful for this -- otherwise you have to click every
+    // day to find out where anything is.
+    void reload_notes();
+    void refresh_marks();
+
     Gtk::Label    label_;
     Gtk::Popover  popover_;
     Gtk::Box      popover_box_{Gtk::Orientation::VERTICAL, 8};
     Gtk::Calendar calendar_;
     Gtk::Button   today_{"Today"};
+
+    Gtk::Separator      note_rule_{Gtk::Orientation::HORIZONTAL};
+    Gtk::Label          note_heading_;
+    Gtk::ScrolledWindow note_scroller_;
+    Gtk::Box            note_box_{Gtk::Orientation::VERTICAL, 2};
+    // Opening the full month view. The popover shows what is on a day; entering
+    // and editing belongs in the window, where there is room for it.
+    Gtk::Button         open_calendar_{"Open calendar\u2026"};
+
+    EventStore  notes_;
+    std::string selected_date_;
+    std::vector<std::unique_ptr<Gtk::Widget>> note_rows_;
+    sigc::slot<void()> on_open_;
 };
 
 // "Ask about <window>..." button, tracking the focused window and primary
@@ -238,6 +265,7 @@ private:
     void show_settings();
     void show_chat();
     void show_board();
+    void show_calendar();
 
 public:
     // Wired by the shell to the DesktopWindow, which owns the canvas view. A
@@ -350,6 +378,7 @@ private:
     std::unique_ptr<SettingsWindow> settings_window_;
     std::unique_ptr<ChatWindow>     chat_window_;
     std::unique_ptr<BoardWindow>    board_window_;
+    std::unique_ptr<CalendarWindow> calendar_window_;
 
     bool                       watching_geometry_ = false;
     std::optional<std::string> window_id_;

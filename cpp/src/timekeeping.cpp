@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 
+#include "auspex/calendar.hpp"
 #include "auspex/process.hpp"
 
 namespace auspex {
@@ -23,16 +24,6 @@ bool all_digits(std::string_view text) {
     return !text.empty() &&
            std::all_of(text.begin(), text.end(),
                        [](unsigned char c) { return std::isdigit(c) != 0; });
-}
-
-int days_in_month(int year, int month) {
-    static const int lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (month < 1 || month > 12) return 0;
-    if (month == 2) {
-        const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-        return leap ? 29 : 28;
-    }
-    return lengths[month - 1];
 }
 
 }  // namespace
