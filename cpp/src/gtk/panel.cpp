@@ -264,8 +264,29 @@ SystemMonitorWidget::SystemMonitorWidget() : Gtk::Box(Gtk::Orientation::HORIZONT
 // ---------------------------------------------------------------------------
 // Clock
 // ---------------------------------------------------------------------------
-Clock::Clock() {
+Clock::Clock(const Config& config) : config_(config) {
     add_css_class("clock-label");
+    add_css_class("flat");
+    set_has_frame(false);
+    set_child(label_);
+
+    popover_box_.set_margin(10);
+    popover_box_.append(calendar_);
+    popover_box_.append(today_);
+    popover_.set_child(popover_box_);
+
+    // Upward, like every other popover on the bottom bar -- except this one is on
+    // the TOP bar, so it opens downwards. Stated rather than defaulted because the
+    // two bars are built from the same class and the difference is easy to lose.
+    set_direction(Gtk::ArrowType::DOWN);
+    set_popover(popover_);
+
+    // Opened on today, always. A calendar left on last March because that is where
+    // it was when you closed it is a calendar you have to reset before reading.
+    popover_.signal_show().connect([this] { calendar_.select_day(Glib::DateTime::create_now_local()); });
+    today_.signal_clicked().connect(
+        [this] { calendar_.select_day(Glib::DateTime::create_now_local()); });
+
     tick();
     Glib::signal_timeout().connect(
         [this] {
@@ -280,9 +301,15 @@ void Clock::tick() {
     std::tm local{};
     if (!localtime_r(&now, &local)) return;
 
+    // %I is the 12-hour hour and %p the AM/PM marker; both come from the C library
+    // rather than being assembled here, so a locale that writes "p.m." gets its own
+    // spelling instead of an English one.
+    const char* format = config_.clock_24_hour ? "%Y-%m-%d %H:%M:%S"
+                                               : "%Y-%m-%d %I:%M:%S %p";
+
     char buffer[64];
-    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local) > 0) {
-        set_text(buffer);
+    if (std::strftime(buffer, sizeof(buffer), format, &local) > 0) {
+        label_.set_text(buffer);
     }
 }
 
@@ -696,7 +723,7 @@ void Panel::build_top() {
     // the tray, where the rest of the status controls now live -- and one button in
     // one place is a row of pixels back for the window list.
 
-    clock_ = std::make_unique<Clock>();
+    clock_ = std::make_unique<Clock>(config_);
     box_.append(*clock_);
 }
 
@@ -773,6 +800,41 @@ void Panel::build_bottom() {
     speak_.signal_clicked().connect(
         [this] { voice_.submit(VoiceController::Action::SpeakSelection); });
     button_box_.append(speak_);
+
+    // Voice to text. Click to start, click again to stop, then whisper transcribes
+    // what was said and it is typed into whatever window has focus.
+    //
+    // Deliberately NOT routed through the command parser. Dictation is the one voice
+    // path where the words are the point -- "open my downloads" typed into a document
+    // must land as those words and not open anything.
+    to_text_icon_.set_from_icon_name("insert-text-symbolic");
+    to_text_label_.set_text("Text");
+    to_text_box_.append(to_text_icon_);
+    to_text_box_.append(to_text_label_);
+    to_text_.set_child(to_text_box_);
+    to_text_.set_tooltip_text("Click to dictate into the focused window, click again to stop");
+    to_text_.signal_toggled().connect([this] {
+        if (to_text_.get_active()) {
+            to_text_label_.set_text("Listening");
+            to_text_.add_css_class("recording");
+            voice_.press_hold(VoiceController::Action::Dictate);
+        } else {
+            to_text_label_.set_text("Text");
+            to_text_.remove_css_class("recording");
+            voice_.release_hold();
+        }
+    });
+    button_box_.append(to_text_);
+
+    // Ask aloud: speak a question, hear the answer. Separate from the command button
+    // because they want opposite things from the same sentence -- one is trying to
+    // find a verb in it, this one is not trying to interpret it at all.
+    ask_icon_.set_from_icon_name("dialog-question-symbolic");
+    ask_.set_child(ask_icon_);
+    ask_.set_tooltip_text("Ask a question aloud and hear the answer");
+    ask_.signal_clicked().connect(
+        [this] { voice_.submit(VoiceController::Action::AskAloud); });
+    button_box_.append(ask_);
 
     // Press-and-hold dictation: recording lasts exactly as long as the button is
     // down, restoring the gesture behaviour of widgets/voice.py. A GestureClick is

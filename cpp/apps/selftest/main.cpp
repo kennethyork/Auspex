@@ -30,6 +30,7 @@
 #include "auspex/panel_dock.hpp"
 #include "auspex/session.hpp"
 #include "auspex/sysmon.hpp"
+#include "auspex/timekeeping.hpp"
 #include "auspex/tray.hpp"
 #include "auspex/voice_gate.hpp"
 #include "auspex/theme.hpp"
@@ -1841,6 +1842,115 @@ void test_crew() {
 
 // The invariant Kenny asked for in one sentence: whatever the canvas does, no window
 // it places may touch a monitor other than its own.
+void test_timekeeping() {
+    std::cout << "date and time\n";
+
+    using namespace auspex;
+
+    // Captured from this machine.
+    {
+        const std::string output =
+            "               Local time: Fri 2026-07-31 18:31:28 EDT\n"
+            "           Universal time: Fri 2026-07-31 22:31:28 UTC\n"
+            "                 RTC time: Fri 2026-07-31 22:31:28\n"
+            "                Time zone: America/New_York (EDT, -0400)\n"
+            "System clock synchronized: yes\n"
+            "              NTP service: active\n"
+            "          RTC in local TZ: no\n";
+
+        const auto settings = parse_timedatectl(output);
+        check(settings.known, "timedatectl output is understood");
+        check_eq(settings.local_time, std::string("Fri 2026-07-31 18:31:28 EDT"),
+                 "the local time is read");
+        // The abbreviation and offset change twice a year and are not an id.
+        check_eq(settings.timezone, std::string("America/New_York"),
+                 "the zone is the id alone, without (EDT, -0400)");
+        check(settings.ntp_active, "the NTP service is seen as active");
+        check(settings.synchronized, "and the clock as synchronised");
+
+        const auto off = parse_timedatectl(
+            "                Time zone: Etc/UTC (UTC, +0000)\n"
+            "System clock synchronized: no\n"
+            "              NTP service: inactive\n");
+        check(!off.ntp_active, "an inactive NTP service is read as inactive");
+        check(!off.synchronized, "and an unsynchronised clock as unsynchronised");
+        check_eq(off.timezone, std::string("Etc/UTC"), "a zone with no space is fine");
+
+        check(!parse_timedatectl("").known, "no output is not an answer");
+    }
+
+    // The validation in front of a command that runs as ROOT. Everything below is
+    // refused before a password is ever asked for.
+    {
+        check(is_valid_datetime("2026-07-31 18:31:28"), "a real time is accepted");
+        check(is_valid_datetime("2024-02-29 00:00:00"), "a leap day in a leap year");
+
+        check(!is_valid_datetime("2026-02-30 12:00:00"),
+              "February the 30th is refused by the calendar, not by timedatectl");
+        check(!is_valid_datetime("2023-02-29 12:00:00"),
+              "a leap day in a non-leap year is refused");
+        check(!is_valid_datetime("2026-07-31 25:00:00"), "hour 25 is refused");
+        check(!is_valid_datetime("2026-07-31 18:60:00"), "minute 60 is refused");
+        check(!is_valid_datetime("2026-13-01 00:00:00"), "month 13 is refused");
+        check(!is_valid_datetime("2026-00-01 00:00:00"), "month 0 is refused");
+        check(!is_valid_datetime("2026-07-00 00:00:00"), "day 0 is refused");
+
+        // Shape. The string becomes one argv element of a privileged command, so
+        // anything that is not exactly the expected 19 characters is refused --
+        // there is no upside to being lenient here.
+        check(!is_valid_datetime("2026-7-31 18:31:28"), "an unpadded month is refused");
+        check(!is_valid_datetime("2026-07-31 18:31"), "a missing seconds field is refused");
+        check(!is_valid_datetime("2026-07-31T18:31:28"), "an ISO T separator is refused");
+        check(!is_valid_datetime("2026-07-31 18:31:28 "), "a trailing space is refused");
+        check(!is_valid_datetime(""), "empty is refused");
+        check(!is_valid_datetime("now"), "a word is refused");
+        check(!is_valid_datetime("2026-07-31 18:31:2a"), "a stray letter is refused");
+        // Nothing shell-ish can get through, but the check is the shape, not a
+        // blacklist -- the command is exec'd with an argv vector and never a shell.
+        check(!is_valid_datetime("2026-07-31 18:31:28; rm -rf /"),
+              "anything appended is refused");
+    }
+
+    // The clock format setting round-trips through config.json like every other
+    // option, and defaults to what the shell has always shown.
+    {
+        namespace fs = std::filesystem;
+        const fs::path path = fs::temp_directory_path() / "auspex-selftest-clock.json";
+        std::error_code ec;
+        fs::remove(path, ec);
+
+        check(auspex::Config::load(path).clock_24_hour,
+              "a missing config leaves the clock on 24 hours");
+
+        {
+            std::ofstream out(path, std::ios::trunc);
+            out << "{\"clock_24_hour\": false}\n";
+        }
+        check(!auspex::Config::load(path).clock_24_hour, "false is read back");
+
+        {
+            std::ofstream out(path, std::ios::trunc);
+            out << "{\"clock_24_hour\": true}\n";
+        }
+        check(auspex::Config::load(path).clock_24_hour, "and true is read back");
+
+        fs::remove(path, ec);
+    }
+
+    // Timezones are validated against the system's own list rather than by pattern.
+    {
+        const std::vector<std::string> known{"America/New_York", "Etc/UTC",
+                                             "Europe/London"};
+        check(is_known_timezone("America/New_York", known), "a listed zone is known");
+        check(!is_known_timezone("America/Nowhere", known), "an unlisted one is not");
+        check(!is_known_timezone("", known), "empty is not a zone");
+        check(!is_known_timezone("../../etc/passwd", known),
+              "a path that is not a zone is not a zone");
+        check(!is_known_timezone("America/New_York", {}),
+              "with no list to check against, nothing is known");
+    }
+}
+
 void test_volume_and_network() {
     std::cout << "volume and network\n";
 
@@ -2790,6 +2900,7 @@ int main(int argc, char** argv) {
     test_monitors_current();
     test_minimize();
     test_crew();
+    test_timekeeping();
     test_volume_and_network();
     test_tray();
     test_windows_stay_on_one_monitor();

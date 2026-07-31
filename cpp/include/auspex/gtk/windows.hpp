@@ -27,6 +27,7 @@
 
 #include "auspex/config.hpp"
 #include "auspex/desktop_entries.hpp"
+#include "auspex/timekeeping.hpp"
 
 namespace auspex::gtk {
 
@@ -139,6 +140,29 @@ private:
     Gtk::SpinButton vad_threshold_;
     Gtk::CheckButton enable_ai_{"Enable AI features"};
     Gtk::CheckButton autostart_{"Start Auspex when I log in"};
+    Gtk::CheckButton clock_24_{"Use a 24-hour clock"};
+
+    // Date and time. Applied immediately on their own controls rather than on Save,
+    // because they do not live in config.json -- they are system state behind a
+    // polkit prompt, and batching a password prompt into "Save" would mean pressing
+    // Save could ask for a password for a setting you did not touch.
+    void refresh_time();
+    void apply_timezone();
+    void apply_manual_time();
+
+    Gtk::Label       time_now_;
+    Gtk::CheckButton time_automatic_{"Set the time automatically"};
+    Gtk::DropDown    timezone_;
+    Gtk::Entry       manual_time_;
+    Gtk::Button      apply_time_{"Set"};
+    Gtk::Box         manual_time_row_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Label       time_status_;
+
+    std::vector<std::string> timezones_;
+    TimeSettings             time_state_;
+    // Set while the controls are being filled in from the system, so their own
+    // change handlers do not fire and try to apply what was just read.
+    bool                     loading_time_ = false;
     Gtk::Entry terminal_;
     Gtk::Entry launcher_;
     Gtk::Label status_;

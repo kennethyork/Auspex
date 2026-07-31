@@ -91,6 +91,7 @@ Config Config::load(const fs::path& path) {
     assign_if(j, "workspace_count",   cfg.workspace_count);
     assign_if(j, "enable_effects",    cfg.enable_effects);
     assign_if(j, "enable_ai",         cfg.enable_ai);
+    assign_if(j, "clock_24_hour",     cfg.clock_24_hour);
     assign_if(j, "terminal",          cfg.terminal);
     assign_if(j, "launcher",          cfg.launcher);
     assign_if(j, "background",        cfg.background);

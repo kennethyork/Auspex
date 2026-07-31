@@ -16,6 +16,9 @@ struct Config {
     int         workspace_count  = 4;
     bool        enable_effects   = true;
     bool        enable_ai        = true;
+    // Panel clock format. True is 24-hour, which is what the shell has always
+    // shown; the setting exists because that is not what everyone reads quickly.
+    bool        clock_24_hour    = true;
     // Empty means "detect at runtime". Hardcoding one desktop's binaries would
     // make the shell Xfce-only; these are resolved against PATH on first use so a
     // config written on Mint still works on Fedora/KDE/GNOME/i3.

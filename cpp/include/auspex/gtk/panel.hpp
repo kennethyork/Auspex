@@ -26,6 +26,7 @@
 #include <gtkmm/image.h>
 #include <gtkmm/label.h>
 #include <gtkmm/gestureclick.h>
+#include <gtkmm/calendar.h>
 #include <gtkmm/menubutton.h>
 #include <gtkmm/scrolledwindow.h>
 #include <gtkmm/scale.h>
@@ -170,12 +171,25 @@ private:
     SystemMonitor  monitor_;
 };
 
-class Clock : public Gtk::Label {
+// The clock, and the calendar behind it.
+//
+// A MenuButton rather than a Label, because a clock you cannot click to see the
+// month is a clock that makes you open something else to answer "what day is the
+// 14th" -- which is the one question a panel clock is asked.
+class Clock : public Gtk::MenuButton {
 public:
-    Clock();
+    explicit Clock(const Config& config);
 
 private:
     void tick();
+
+    const Config& config_;
+
+    Gtk::Label    label_;
+    Gtk::Popover  popover_;
+    Gtk::Box      popover_box_{Gtk::Orientation::VERTICAL, 8};
+    Gtk::Calendar calendar_;
+    Gtk::Button   today_{"Today"};
 };
 
 // "Ask about <window>..." button, tracking the focused window and primary
@@ -286,6 +300,23 @@ private:
     Gtk::Image                        speak_icon_;
     Gtk::Button                       dictate_;
     Gtk::Image                        dictate_icon_;
+
+    // Voice to text, as a TOGGLE rather than a press-and-hold.
+    //
+    // The mic beside it records only while held, which is right for a quick word
+    // and wrong for a sentence -- holding a mouse button steady for thirty seconds
+    // while composing is not something to ask of anyone. This one starts on a click
+    // and stops on the next.
+    Gtk::ToggleButton                 to_text_;
+    Gtk::Box                          to_text_box_{Gtk::Orientation::HORIZONTAL, 4};
+    Gtk::Image                        to_text_icon_;
+    Gtk::Label                        to_text_label_;
+
+    // Ask a question aloud and hear the answer. This path was implemented and
+    // reachable from nothing at all -- every spoken utterance went through the
+    // command parser first, which can read a plain question as an action.
+    Gtk::Button                       ask_;
+    Gtk::Image                        ask_icon_;
     Gtk::Button                       terminal_;
     Gtk::Image                        terminal_icon_;
     // A toggle, not a button: this is the always-on ear, the closest equivalent to

@@ -15,6 +15,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <gtkmm/expression.h>
+#include <gtkmm/stringobject.h>
+
 #include "auspex/audio.hpp"
 #include "auspex/autostart.hpp"
 #include "auspex/crew.hpp"
@@ -528,6 +531,59 @@ SettingsWindow::SettingsWindow(Config config) : config_(std::move(config)) {
     autostart_.set_active(autostart_enabled());
     root_.append(autostart_);
 
+    clock_24_.set_active(config_.clock_24_hour);
+    root_.append(clock_24_);
+
+    // ---- date and time ----
+    //
+    // System state, not Auspex's, so these apply on their own controls rather than
+    // waiting for Save -- each one is a polkit prompt, and Save should never ask for
+    // a password on behalf of a setting the user did not touch.
+    {
+        time_now_.set_xalign(0.0f);
+        time_now_.add_css_class("subtitle");
+        root_.append(time_now_);
+
+        timezones_ = list_timezones();
+        std::vector<Glib::ustring> names;
+        names.reserve(timezones_.size());
+        for (const auto& zone : timezones_) names.emplace_back(zone);
+        timezone_.set_model(Gtk::StringList::create(names));
+        // 598 zones is a scroll, not a list. Search is what makes it usable.
+        timezone_.set_enable_search(true);
+        timezone_.set_expression(
+            Gtk::ClosureExpression<Glib::ustring>::create([](const Glib::RefPtr<Glib::ObjectBase>& item) {
+                const auto text = std::dynamic_pointer_cast<Gtk::StringObject>(item);
+                return text ? text->get_string() : Glib::ustring{};
+            }));
+        add_row("Time zone", timezone_);
+        timezone_.property_selected().signal_changed().connect(
+            [this] { apply_timezone(); });
+
+        root_.append(time_automatic_);
+        time_automatic_.signal_toggled().connect([this] {
+            if (loading_time_) return;
+            if (!set_automatic_time(time_automatic_.get_active())) {
+                time_status_.set_text("Could not change automatic time");
+            }
+            refresh_time();
+        });
+
+        manual_time_.set_placeholder_text("YYYY-MM-DD HH:MM:SS");
+        manual_time_.set_hexpand(true);
+        apply_time_.signal_clicked().connect([this] { apply_manual_time(); });
+        manual_time_row_.append(manual_time_);
+        manual_time_row_.append(apply_time_);
+        add_row("Set the time", manual_time_row_);
+
+        time_status_.add_css_class("subtitle");
+        time_status_.set_xalign(0.0f);
+        time_status_.set_wrap(true);
+        root_.append(time_status_);
+
+        refresh_time();
+    }
+
     status_.add_css_class("subtitle");
     status_.set_xalign(0.0f);
     root_.append(status_);
@@ -542,6 +598,82 @@ SettingsWindow::SettingsWindow(Config config) : config_(std::move(config)) {
     root_.append(buttons_);
 
     set_child(root_);
+}
+
+void SettingsWindow::refresh_time() {
+    time_state_ = current_time_settings();
+
+    // timedatectl absent: hide the whole section rather than offer controls that
+    // cannot do anything.
+    const bool have = time_state_.known;
+    time_now_.set_visible(have);
+    time_automatic_.set_visible(have);
+    timezone_.set_visible(have);
+    manual_time_row_.set_visible(have);
+    if (!have) return;
+
+    loading_time_ = true;
+
+    time_now_.set_text(time_state_.local_time);
+    time_automatic_.set_active(time_state_.ntp_active);
+
+    const auto at = std::find(timezones_.begin(), timezones_.end(), time_state_.timezone);
+    if (at != timezones_.end()) {
+        timezone_.set_selected(static_cast<guint>(std::distance(timezones_.begin(), at)));
+    }
+
+    // The part that makes this honest. With NTP running, timedatectl refuses a
+    // manual time outright -- so rather than offering a field that silently fails,
+    // it is disabled and the reason is written next to it.
+    const bool manual = !time_state_.ntp_active;
+    manual_time_.set_sensitive(manual);
+    apply_time_.set_sensitive(manual);
+    if (!manual) {
+        time_status_.set_text(
+            "The clock is set automatically. Turn that off to set it by hand.");
+        manual_time_.set_text("");
+    } else if (time_status_.get_text().empty()) {
+        time_status_.set_text("");
+    }
+
+    loading_time_ = false;
+}
+
+void SettingsWindow::apply_timezone() {
+    if (loading_time_) return;
+
+    const auto index = timezone_.get_selected();
+    if (index >= timezones_.size()) return;
+    const std::string zone = timezones_[index];
+    if (zone == time_state_.timezone) return;
+
+    if (!set_system_timezone(zone)) {
+        // Cancelling the password prompt lands here too, which is a refusal rather
+        // than a fault -- so it is reported the same way and the controls are put
+        // back to whatever the system actually says.
+        time_status_.set_text("Time zone unchanged");
+    } else {
+        time_status_.set_text("Time zone set to " + zone);
+    }
+    refresh_time();
+}
+
+void SettingsWindow::apply_manual_time() {
+    const std::string text = std::string(manual_time_.get_text());
+
+    // Checked before anything privileged is run, so a typo costs a message rather
+    // than a password prompt for a command that was always going to be refused.
+    if (!is_valid_datetime(text)) {
+        time_status_.set_text("Enter the time as YYYY-MM-DD HH:MM:SS");
+        return;
+    }
+
+    if (!set_system_time(text)) {
+        time_status_.set_text("Could not set the time");
+    } else {
+        time_status_.set_text("Time set");
+    }
+    refresh_time();
 }
 
 void SettingsWindow::populate_microphones() {
@@ -603,6 +735,7 @@ void SettingsWindow::save() {
     document["memory_turns"]    = memory_turns_.get_value_as_int();
     document["vad_threshold"]   = vad_threshold_.get_value();
     document["enable_ai"]       = enable_ai_.get_active();
+    document["clock_24_hour"]   = clock_24_.get_active();
     document["terminal"]        = std::string(terminal_.get_text());
     document["launcher"]        = std::string(launcher_.get_text());
 
