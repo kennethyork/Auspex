@@ -369,11 +369,38 @@ CalendarWindow::CalendarWindow() {
     entry_row_.append(title_entry_);
     entry_row_.append(add_);
 
+    {
+        std::vector<Glib::ustring> labels;
+        for (const auto& [value, label] : repeat_choices()) {
+            repeat_values_.push_back(value);
+            labels.emplace_back(label);
+        }
+        repeat_.set_model(Gtk::StringList::create(labels));
+        repeat_.set_selected(0);
+        repeat_.set_hexpand(true);
+    }
+    until_entry_.set_placeholder_text("until (optional)");
+    until_entry_.set_max_width_chars(14);
+    until_entry_.signal_activate().connect([this] { add_event(); });
+    // The end date is meaningless without a rule, so it only appears once one is
+    // chosen rather than sitting there inert.
+    repeat_.property_selected().signal_changed().connect([this] {
+        const auto index = repeat_.get_selected();
+        const bool repeating = index < repeat_values_.size() &&
+                               repeat_values_[index] != Repeat::None;
+        until_entry_.set_visible(repeating);
+    });
+    until_entry_.set_visible(false);
+
+    repeat_row_.append(repeat_);
+    repeat_row_.append(until_entry_);
+
     day_panel_.set_margin(12);
     day_panel_.set_size_request(300, -1);
     day_panel_.append(day_heading_);
     day_panel_.append(day_scroller_);
     day_panel_.append(entry_row_);
+    day_panel_.append(repeat_row_);
     body_.append(day_panel_);
 
     root_.append(body_);
@@ -462,8 +489,9 @@ void CalendarWindow::show_month(int year, int month) {
         std::string detail;
         for (std::size_t n = 0; n < day.size() && n < 2; ++n) {
             if (!detail.empty()) detail += "\n";
-            detail += day[n].start.empty() ? day[n].title
-                                           : day[n].start + "  " + day[n].title;
+            const auto& event = day[n].event;
+            detail += event.start.empty() ? event.title
+                                          : event.start + "  " + event.title;
         }
         if (day.size() > 2) {
             detail += "\n+" + std::to_string(day.size() - 2) + " more";
@@ -514,12 +542,15 @@ void CalendarWindow::reload_day() {
         auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
 
         auto* when = Gtk::make_managed<Gtk::Label>(
-            day[i].start.empty() ? "All day" : day[i].start);
+            day[i].event.start.empty() ? "All day" : day[i].event.start);
         when->set_xalign(0.0f);
         when->set_size_request(64, -1);
         when->add_css_class("subtitle");
 
-        auto* what = Gtk::make_managed<Gtk::Label>(day[i].title);
+        // A repeat is marked, because deleting one deletes the whole series and
+        // that is not something to discover afterwards.
+        auto* what = Gtk::make_managed<Gtk::Label>(
+            day[i].repeating ? day[i].event.title + "  \u21bb" : day[i].event.title);
         what->set_xalign(0.0f);
         what->set_hexpand(true);
         what->set_wrap(true);
@@ -530,10 +561,15 @@ void CalendarWindow::reload_day() {
         auto* remove = Gtk::make_managed<Gtk::Button>();
         remove->set_icon_name("edit-delete-symbolic");
         remove->set_has_frame(false);
-        remove->set_tooltip_text("Remove");
-        const std::size_t index = i;
-        remove->signal_clicked().connect([this, index] {
-            if (events_.remove(selected_, index)) {
+        remove->set_tooltip_text(day[i].repeating ? "Remove every occurrence"
+                                                  : "Remove");
+        // Removal goes through the occurrence's ORIGIN, not the day being viewed: a
+        // repeat shown on the 14th is stored on the 1st, and removing "the 14th"
+        // would find nothing there.
+        const std::string origin = day[i].origin;
+        const std::size_t index  = day[i].index;
+        remove->signal_clicked().connect([this, origin, index] {
+            if (events_.remove(origin, index)) {
                 events_.save();
                 show_month(year_, month_);
                 reload_day();
@@ -553,6 +589,12 @@ void CalendarWindow::add_event() {
     event.start = std::string(time_entry_.get_text());
     event.title = std::string(title_entry_.get_text());
 
+    const auto choice = repeat_.get_selected();
+    if (choice < repeat_values_.size()) event.repeat = repeat_values_[choice];
+    if (event.repeat != Repeat::None) {
+        event.until = std::string(until_entry_.get_text());
+    }
+
     if (!events_.add(selected_, event)) {
         // The two ways this fails are worth telling apart: a blank title is a slip,
         // a malformed time is a typo with a specific fix.
@@ -567,6 +609,9 @@ void CalendarWindow::add_event() {
     events_.save();
     time_entry_.set_text("");
     title_entry_.set_text("");
+    until_entry_.set_text("");
+    // The rule is left as it was: entering three weekly things in a row should not
+    // mean choosing "every week" three times.
 
     show_month(year_, month_);
     reload_day();
@@ -817,6 +862,23 @@ SettingsWindow::SettingsWindow(Config config) : config_(std::move(config)) {
     clock_24_.set_active(config_.clock_24_hour);
     root_.append(clock_24_);
 
+    // ---- pinned applications ----
+    pinned_ = config_.pinned;
+    pins_summary_.set_xalign(0.0f);
+    pins_summary_.set_hexpand(true);
+    pins_summary_.add_css_class("subtitle");
+    import_pins_.signal_clicked().connect([this] { import_pins(); });
+    pins_row_.append(pins_summary_);
+    pins_row_.append(import_pins_);
+    add_row("Pinned applications", pins_row_);
+    {
+        // Written here rather than in a helper so the empty case reads as an
+        // invitation rather than as a fault.
+        const std::size_t count = pinned_.size();
+        pins_summary_.set_text(count == 0 ? "None pinned"
+                                          : std::to_string(count) + " pinned");
+    }
+
     // ---- date and time ----
     //
     // System state, not Auspex's, so these apply on their own controls rather than
@@ -959,6 +1021,22 @@ void SettingsWindow::apply_manual_time() {
     refresh_time();
 }
 
+void SettingsWindow::import_pins() {
+    const auto found = import_xfce_launchers();
+    if (found.empty()) {
+        pins_summary_.set_text("Nothing found on xfce4-panel");
+        return;
+    }
+
+    // Ids, not commands. Stored that way so the icon and name follow the
+    // application when it is updated, and so nothing in config.json is a command
+    // line waiting for something to run it.
+    pinned_.clear();
+    for (const auto& entry : found) pinned_.push_back(entry.id);
+
+    pins_summary_.set_text(std::to_string(pinned_.size()) + " pinned \u2014 press Save");
+}
+
 void SettingsWindow::populate_microphones() {
     microphone_names_.clear();
     // Index 0 is the system default, so there is always a way back to it.
@@ -1019,6 +1097,7 @@ void SettingsWindow::save() {
     document["vad_threshold"]   = vad_threshold_.get_value();
     document["enable_ai"]       = enable_ai_.get_active();
     document["clock_24_hour"]   = clock_24_.get_active();
+    document["pinned"]          = pinned_;
     document["terminal"]        = std::string(terminal_.get_text());
     document["launcher"]        = std::string(launcher_.get_text());
 

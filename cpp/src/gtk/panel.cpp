@@ -9,6 +9,8 @@
 
 #include <glibmm/main.h>
 
+#include <glibmm/markup.h>
+
 #include "auspex/crew.hpp"
 #include "auspex/display.hpp"
 #include "auspex/gtk/voice.hpp"
@@ -358,7 +360,8 @@ void Clock::reload_notes() {
                                        : selected_date_);
     note_scroller_.set_visible(!day.empty());
 
-    for (const auto& event : day) {
+    for (const auto& occurrence : day) {
+        const auto& event = occurrence.event;
         auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
 
         auto* when = Gtk::make_managed<Gtk::Label>(
@@ -367,7 +370,8 @@ void Clock::reload_notes() {
         when->set_size_request(56, -1);
         when->add_css_class("subtitle");
 
-        auto* what = Gtk::make_managed<Gtk::Label>(event.title);
+        auto* what = Gtk::make_managed<Gtk::Label>(
+            occurrence.repeating ? event.title + "  \u21bb" : event.title);
         what->set_xalign(0.0f);
         what->set_hexpand(true);
         what->set_wrap(true);
@@ -410,6 +414,283 @@ void Clock::tick() {
     char buffer[64];
     if (std::strftime(buffer, sizeof(buffer), format, &local) > 0) {
         label_.set_text(buffer);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PinnedLaunchers
+// ---------------------------------------------------------------------------
+PinnedLaunchers::PinnedLaunchers(const Config& config)
+    : Gtk::Box(Gtk::Orientation::HORIZONTAL, 1), config_(config) {
+    reload();
+}
+
+void PinnedLaunchers::reload() {
+    while (Gtk::Widget* child = get_first_child()) remove(*child);
+    buttons_.clear();
+
+    for (const auto& id : config_.pinned) {
+        // Resolved against the installed applications rather than trusted. A pin
+        // whose application has been uninstalled is skipped, not turned into a
+        // button that fails silently when pressed.
+        const auto entry = find_desktop_entry(id);
+        if (!entry) continue;
+
+        auto button = std::make_unique<Gtk::Button>();
+        button->set_has_frame(false);
+        button->add_css_class("flat");
+        button->set_tooltip_text(entry->name);
+
+        auto* icon = Gtk::make_managed<Gtk::Image>();
+        icon->set_from_icon_name(entry->icon.empty() ? "application-x-executable"
+                                                     : entry->icon);
+        icon->set_pixel_size(std::max(16, config_.panel_height - 10));
+        button->set_child(*icon);
+
+        const std::string command = entry->exec;
+        const bool in_terminal = entry->terminal;
+        const std::string terminal = config_.terminal;
+        button->signal_clicked().connect([command, in_terminal, terminal] {
+            // Field codes are already stripped by the parser, so this is a plain
+            // argv split and never a shell.
+            if (in_terminal && !terminal.empty()) {
+                auto argv = split_words(terminal);
+                argv.push_back("-e");
+                for (auto& word : split_words(command)) argv.push_back(word);
+                spawn_detached(argv);
+            } else {
+                spawn_detached(split_words(command));
+            }
+        });
+
+        append(*button);
+        buttons_.push_back(std::move(button));
+    }
+
+    // Nothing pinned is not an empty gap in the panel.
+    set_visible(!buttons_.empty());
+}
+
+// ---------------------------------------------------------------------------
+// NotificationButton
+// ---------------------------------------------------------------------------
+NotificationButton::NotificationButton() {
+    add_css_class("flat");
+    set_has_frame(false);
+    set_icon_name("preferences-system-notifications-symbolic");
+    set_tooltip_text("Notifications");
+
+    heading_.set_xalign(0.0f);
+    heading_.add_css_class("subtitle");
+
+    scroller_.set_child(list_);
+    scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    scroller_.set_max_content_height(320);
+    scroller_.set_propagate_natural_height(true);
+    scroller_.set_size_request(320, -1);
+
+    // Only offered when a daemon whose switch we know how to reach is running.
+    // A toggle that silently does nothing is worse than no toggle.
+    dnd_.set_visible(dnd_supported());
+    dnd_.set_active(dnd_supported() && dnd_enabled());
+    dnd_.signal_toggled().connect([this] {
+        if (!set_dnd(dnd_.get_active())) {
+            // Put it back rather than showing a state the daemon does not have.
+            dnd_.set_active(dnd_enabled());
+        }
+    });
+
+    clear_.signal_clicked().connect([this] {
+        log_.clear();
+        rebuild();
+    });
+
+    actions_.append(dnd_);
+    actions_.append(clear_);
+
+    popover_box_.set_margin(10);
+    popover_box_.append(heading_);
+    popover_box_.append(scroller_);
+    popover_box_.append(actions_);
+    popover_.set_child(popover_box_);
+
+    set_direction(Gtk::ArrowType::DOWN);
+    set_popover(popover_);
+    popover_.signal_show().connect([this] {
+        if (dnd_supported()) dnd_.set_active(dnd_enabled());
+        log_.mark_seen();
+        rebuild();
+        remove_css_class("recording");
+    });
+
+    start_monitor();
+    rebuild();
+}
+
+NotificationButton::~NotificationButton() {
+    // The filter is removed with the connection; closing it is what stops the
+    // worker thread that would otherwise call back into a destroyed widget.
+    if (monitor_ != nullptr) {
+        g_dbus_connection_close_sync(monitor_, nullptr, nullptr);
+        g_object_unref(monitor_);
+    }
+}
+
+void NotificationButton::start_monitor() {
+    // A private connection, not the shared session bus.
+    //
+    // BecomeMonitor puts the CONNECTION into monitor mode: it can then receive
+    // everything and call nothing. Doing that to the bus the tray and the rest of
+    // the shell are using would break all of them.
+    GError* error = nullptr;
+    gchar*  address = g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, nullptr,
+                                                      &error);
+    if (address == nullptr) {
+        if (error != nullptr) g_error_free(error);
+        return;
+    }
+
+    monitor_ = g_dbus_connection_new_for_address_sync(
+        address,
+        static_cast<GDBusConnectionFlags>(G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
+                                          G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
+        nullptr, nullptr, &error);
+    g_free(address);
+
+    if (monitor_ == nullptr) {
+        if (error != nullptr) g_error_free(error);
+        return;
+    }
+
+    // Watch the method CALL, not a signal: Notify is a call an application makes to
+    // the daemon, and there is no signal announcing that a notification was shown.
+    GVariantBuilder rules;
+    g_variant_builder_init(&rules, G_VARIANT_TYPE("as"));
+    g_variant_builder_add(&rules, "s",
+                          "type='method_call',interface='org.freedesktop.Notifications',"
+                          "member='Notify'");
+
+    GVariant* reply = g_dbus_connection_call_sync(
+        monitor_, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus.Monitoring", "BecomeMonitor",
+        g_variant_new("(asu)", &rules, static_cast<guint32>(0)), nullptr,
+        G_DBUS_CALL_FLAGS_NONE, 1000, nullptr, &error);
+
+    if (reply == nullptr) {
+        // Some bus configurations refuse monitoring. The log is then simply empty,
+        // which is a missing feature rather than a broken panel.
+        if (error != nullptr) g_error_free(error);
+        g_object_unref(monitor_);
+        monitor_ = nullptr;
+        return;
+    }
+    g_variant_unref(reply);
+
+    // A message FILTER, not a signal subscription.
+    //
+    // Notify is a method CALL an application makes to the daemon, and
+    // g_dbus_connection_signal_subscribe only ever dispatches signals -- so a
+    // subscription here sees the monitored traffic go past and never fires once.
+    // A filter sees every message on the connection, which is what a monitor is
+    // for. Measured: the bell stayed empty through every test notification until
+    // this was changed.
+    g_dbus_connection_add_filter(
+        monitor_,
+        [](GDBusConnection*, GDBusMessage* message, gboolean incoming,
+           gpointer user_data) -> GDBusMessage* {
+            auto* self = static_cast<NotificationButton*>(user_data);
+            if (!incoming || message == nullptr) return message;
+
+            if (g_dbus_message_get_message_type(message) !=
+                G_DBUS_MESSAGE_TYPE_METHOD_CALL) {
+                return message;
+            }
+            const gchar* interface = g_dbus_message_get_interface(message);
+            const gchar* member    = g_dbus_message_get_member(message);
+            if (interface == nullptr || member == nullptr) return message;
+            if (g_strcmp0(interface, "org.freedesktop.Notifications") != 0) return message;
+            if (g_strcmp0(member, "Notify") != 0) return message;
+
+            GVariant* body = g_dbus_message_get_body(message);
+            if (body == nullptr || g_variant_n_children(body) < 5) return message;
+
+            const auto text_at = [body](gsize index) -> std::string {
+                GVariant* child = g_variant_get_child_value(body, index);
+                std::string value;
+                if (g_variant_is_of_type(child, G_VARIANT_TYPE_STRING)) {
+                    value = g_variant_get_string(child, nullptr);
+                }
+                g_variant_unref(child);
+                return value;
+            };
+
+            Notification notification;
+            notification.app     = text_at(0);
+            notification.summary = text_at(3);
+            notification.body    = text_at(4);
+
+            const std::time_t now = std::time(nullptr);
+            std::tm local{};
+            char stamp[16] = {};
+            if (localtime_r(&now, &local) &&
+                std::strftime(stamp, sizeof(stamp), "%H:%M", &local) > 0) {
+                notification.when = stamp;
+            }
+
+            // This runs on the connection's own worker thread, so nothing here may
+            // touch a widget or the log directly. g_idle_add is thread-safe and is
+            // what carries it back to the GTK thread.
+            Glib::signal_idle().connect_once([self, notification] {
+                self->log_.add(notification);
+                if (self->log_.unseen() > 0) self->add_css_class("recording");
+            });
+
+            // A monitor must not consume what it sees; returning the message
+            // unchanged is what lets the daemon still receive it.
+            return message;
+        },
+        this, nullptr);
+}
+
+void NotificationButton::rebuild() {
+    while (Gtk::Widget* child = list_.get_first_child()) list_.remove(*child);
+    rows_.clear();
+
+    const auto recent = log_.recent();
+    heading_.set_text(recent.empty() ? "No notifications"
+                                     : std::to_string(recent.size()) + " recent");
+    scroller_.set_visible(!recent.empty());
+    clear_.set_sensitive(!recent.empty());
+
+    for (const auto& notification : recent) {
+        auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 0);
+
+        auto* top = Gtk::make_managed<Gtk::Label>();
+        top->set_markup("<b>" + Glib::Markup::escape_text(notification.summary) +
+                        "</b>");
+        top->set_xalign(0.0f);
+        top->set_wrap(true);
+        top->set_max_width_chars(34);
+
+        auto* who = Gtk::make_managed<Gtk::Label>(
+            notification.app + (notification.when.empty() ? ""
+                                                          : "  " + notification.when));
+        who->set_xalign(0.0f);
+        who->add_css_class("subtitle");
+
+        row->append(*who);
+        row->append(*top);
+
+        if (!notification.body.empty()) {
+            auto* body = Gtk::make_managed<Gtk::Label>(notification.body);
+            body->set_xalign(0.0f);
+            body->set_wrap(true);
+            body->set_max_width_chars(34);
+            row->append(*body);
+        }
+
+        list_.append(*row);
+        rows_.push_back(std::move(row));
     }
 }
 
@@ -798,6 +1079,11 @@ void Panel::build_top() {
     launcher_.signal_clicked().connect([this] { show_launcher(); });
     box_.append(launcher_);
 
+    // The pinned row sits next to the launcher, which is where xfce4-panel puts it
+    // and therefore where the hand already goes.
+    pinned_ = std::make_unique<PinnedLaunchers>(config_);
+    box_.append(*pinned_);
+
     workspaces_ = std::make_unique<WorkspaceSwitcher>(config_.workspace_count);
     box_.append(*workspaces_);
 
@@ -822,6 +1108,9 @@ void Panel::build_top() {
     // No network button up here. It moved to the bottom bar next to the volume and
     // the tray, where the rest of the status controls now live -- and one button in
     // one place is a row of pixels back for the window list.
+
+    notifications_ = std::make_unique<NotificationButton>();
+    box_.append(*notifications_);
 
     clock_ = std::make_unique<Clock>(config_);
     clock_->set_open_handler([this] { show_calendar(); });

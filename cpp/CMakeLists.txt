@@ -224,6 +224,7 @@ add_library(auspex-core STATIC
     src/tray.cpp
     src/timekeeping.cpp
     src/calendar.cpp
+    src/notifications.cpp
     src/ollama_client.cpp
     src/audio.cpp
     src/asr.cpp

@@ -173,6 +173,69 @@ std::vector<MonthCell> month_grid(int year, int month) {
     return cells;
 }
 
+std::string repeat_to_string(Repeat repeat) {
+    switch (repeat) {
+        case Repeat::Daily:   return "daily";
+        case Repeat::Weekly:  return "weekly";
+        case Repeat::Monthly: return "monthly";
+        case Repeat::Yearly:  return "yearly";
+        case Repeat::None:    break;
+    }
+    return "none";
+}
+
+Repeat repeat_from_string(std::string_view text) {
+    if (text == "daily")   return Repeat::Daily;
+    if (text == "weekly")  return Repeat::Weekly;
+    if (text == "monthly") return Repeat::Monthly;
+    if (text == "yearly")  return Repeat::Yearly;
+    // Anything unrecognised is a one-off. A rule we cannot honour must not silently
+    // become a different rule.
+    return Repeat::None;
+}
+
+std::vector<std::pair<Repeat, std::string>> repeat_choices() {
+    return {{Repeat::None, "Does not repeat"},
+            {Repeat::Daily, "Every day"},
+            {Repeat::Weekly, "Every week"},
+            {Repeat::Monthly, "Every month"},
+            {Repeat::Yearly, "Every year"}};
+}
+
+bool repeats_on(const std::string& first, Repeat rule, const std::string& until,
+                const std::string& date) {
+    if (rule == Repeat::None) return false;
+    if (!is_valid_date(first) || !is_valid_date(date)) return false;
+
+    // Never before it started, and never after it was told to stop. Both compare as
+    // strings, which is exact for zero-padded ISO dates.
+    if (date < first) return false;
+    if (!until.empty() && is_valid_date(until) && date > until) return false;
+
+    switch (rule) {
+        case Repeat::Daily:
+            return true;
+
+        case Repeat::Weekly:
+            return weekday_of(date) == weekday_of(first);
+
+        case Repeat::Monthly:
+            // Comparing the day NUMBER is what makes the 31st skip February rather
+            // than land on the 28th. A calendar that clamps moves an event to a day
+            // its owner never chose, and does it silently.
+            return date.compare(8, 2, first, 8, 2) == 0;
+
+        case Repeat::Yearly:
+            // Month and day both. The 29th of February falls out correctly: no
+            // common year has one to match.
+            return date.compare(5, 5, first, 5, 5) == 0;
+
+        case Repeat::None:
+            break;
+    }
+    return false;
+}
+
 std::filesystem::path EventStore::default_path() {
     return data_home() / "auspex" / "calendar.json";
 }
@@ -220,12 +283,20 @@ EventStore EventStore::load(const std::filesystem::path& path) {
                 if (entry.contains("start") && entry["start"].is_string()) {
                     event.start = trim(entry["start"].get<std::string>());
                 }
+                if (entry.contains("repeat") && entry["repeat"].is_string()) {
+                    event.repeat = repeat_from_string(entry["repeat"].get<std::string>());
+                }
+                if (entry.contains("until") && entry["until"].is_string()) {
+                    event.until = trim(entry["until"].get<std::string>());
+                }
             } else {
                 continue;
             }
 
             if (event.title.empty()) continue;
             if (!is_valid_time(event.start)) event.start.clear();
+            if (event.repeat == Repeat::None) event.until.clear();
+            if (!event.until.empty() && !is_valid_date(event.until)) event.until.clear();
             day.push_back(std::move(event));
         }
 
@@ -247,7 +318,14 @@ bool EventStore::save(const std::filesystem::path& path) const {
     for (const auto& [date, day] : events_) {
         json entries = json::array();
         for (const auto& event : day) {
-            entries.push_back({{"start", event.start}, {"title", event.title}});
+            json record{{"start", event.start}, {"title", event.title}};
+            // Only written when they say something. A file full of "repeat":"none"
+            // is noise in something meant to be read and edited by hand.
+            if (event.repeat != Repeat::None) {
+                record["repeat"] = repeat_to_string(event.repeat);
+                if (!event.until.empty()) record["until"] = event.until;
+            }
+            entries.push_back(std::move(record));
         }
         document[date] = std::move(entries);
     }
@@ -270,10 +348,39 @@ bool EventStore::save(const std::filesystem::path& path) const {
     return true;
 }
 
-std::vector<CalendarEvent> EventStore::on(const std::string& date) const {
-    const auto found = events_.find(date);
-    if (found == events_.end()) return {};
-    return found->second;
+std::vector<Occurrence> EventStore::on(const std::string& date) const {
+    std::vector<Occurrence> day;
+    if (!is_valid_date(date)) return day;
+
+    for (const auto& [origin, stored] : events_) {
+        // Nothing stored after this day can reach back to it.
+        if (origin > date) break;
+
+        for (std::size_t i = 0; i < stored.size(); ++i) {
+            const CalendarEvent& event = stored[i];
+
+            const bool here = origin == date;
+            const bool repeated =
+                !here && repeats_on(origin, event.repeat, event.until, date);
+            if (!here && !repeated) continue;
+
+            day.push_back({.event = event,
+                           .origin = origin,
+                           .index = i,
+                           .repeating = event.repeat != Repeat::None});
+        }
+    }
+
+    // Merged from several days, so the order has to be imposed here rather than
+    // inherited from any one of them.
+    std::stable_sort(day.begin(), day.end(),
+                     [](const Occurrence& a, const Occurrence& b) {
+                         if (a.event.start.empty() != b.event.start.empty()) {
+                             return a.event.start.empty();
+                         }
+                         return a.event.start < b.event.start;
+                     });
+    return day;
 }
 
 bool EventStore::add(const std::string& date, CalendarEvent event) {
@@ -285,6 +392,17 @@ bool EventStore::add(const std::string& date, CalendarEvent event) {
     // guessing which one it is.
     if (event.title.empty()) return false;
     if (!is_valid_time(event.start)) return false;
+
+    event.until = trim(std::move(event.until));
+    // A one-off has no end to its repetition; keeping one would be a field that
+    // means nothing and shows in the file.
+    if (event.repeat == Repeat::None) event.until.clear();
+    // An "until" that is not a date is dropped rather than refusing the event: the
+    // event is the thing being asked for, and an unbounded repeat is the honest
+    // reading of a bound nobody can parse.
+    if (!event.until.empty() && !is_valid_date(event.until)) event.until.clear();
+    // An end before the beginning would mean an event that never happens at all.
+    if (!event.until.empty() && event.until < date) return false;
 
     events_[date].push_back(std::move(event));
     sort_day(events_[date]);
@@ -307,19 +425,15 @@ std::map<int, int> EventStore::counts_in_month(int year, int month) const {
     std::map<int, int> counts;
     if (month < 1 || month > 12) return counts;
 
-    // The prefix bounds the scan to one month rather than walking every event.
-    const std::string first = format_date(year, month, 1);
-    if (first.empty()) return counts;
-    const std::string prefix = first.substr(0, 8);
-
-    for (auto it = events_.lower_bound(prefix); it != events_.end(); ++it) {
-        if (it->first.compare(0, 8, prefix) != 0) break;
-        try {
-            counts[std::stoi(it->first.substr(8, 2))] =
-                static_cast<int>(it->second.size());
-        } catch (...) {
-            continue;
-        }
+    // Asked day by day rather than by scanning the month's own keys, because a
+    // repeating event stored in a previous year still happens in this month and a
+    // key scan would never see it.
+    const int length = days_in_month(year, month);
+    for (int day = 1; day <= length; ++day) {
+        const std::string date = format_date(year, month, day);
+        if (date.empty()) continue;
+        const auto n = on(date).size();
+        if (n > 0) counts[day] = static_cast<int>(n);
     }
     return counts;
 }

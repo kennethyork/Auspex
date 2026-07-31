@@ -39,6 +39,7 @@
 #include "auspex/desktop.hpp"
 #include "auspex/panel_dock.hpp"
 #include "auspex/gtk/tray.hpp"
+#include "auspex/notifications.hpp"
 #include "auspex/gtk/windows.hpp"
 #include "auspex/sysmon.hpp"
 
@@ -103,6 +104,55 @@ private:
     std::string  menu_target_;
     sigc::slot<void(const std::string&)> on_restore_;
     sigc::slot<void(const std::string&)> on_full_;
+};
+
+// The row of applications kept one click away.
+//
+// xfce4-panel calls this a launcher plugin and most people have had the same four
+// or five icons in it for years. A panel meant to replace that one without it is a
+// panel that costs its user something on the first day.
+class PinnedLaunchers : public Gtk::Box {
+public:
+    explicit PinnedLaunchers(const Config& config);
+
+    void reload();
+
+private:
+    const Config& config_;
+    std::vector<std::unique_ptr<Gtk::Button>> buttons_;
+};
+
+// Notifications: what has been shown, and the switch that stops them.
+//
+// Auspex does not own org.freedesktop.Notifications -- taking that name from the
+// running daemon would make Auspex responsible for drawing every popup on the
+// desktop. It watches the bus instead and keeps the log; the daemon is untouched.
+class NotificationButton : public Gtk::MenuButton {
+public:
+    NotificationButton();
+    ~NotificationButton() override;
+
+private:
+    void rebuild();
+    void start_monitor();
+
+    NotificationLog log_;
+
+    Gtk::Popover        popover_;
+    Gtk::Box            popover_box_{Gtk::Orientation::VERTICAL, 8};
+    Gtk::Label          heading_;
+    Gtk::ScrolledWindow scroller_;
+    Gtk::Box            list_{Gtk::Orientation::VERTICAL, 4};
+    Gtk::Box            actions_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::ToggleButton   dnd_{"Do not disturb"};
+    Gtk::Button         clear_{"Clear"};
+
+    std::vector<std::unique_ptr<Gtk::Widget>> rows_;
+
+    // A PRIVATE bus connection. Putting a connection into monitor mode makes it
+    // unusable for ordinary calls, so it cannot be the shared session bus every
+    // other part of the shell is talking on.
+    GDBusConnection* monitor_ = nullptr;
 };
 
 // Volume, as a panel control rather than a tray icon.
@@ -323,6 +373,8 @@ private:
     Gtk::Button                          zoom_reset_{"1:1"};
     std::unique_ptr<WorkspaceSwitcher>   workspaces_;
     std::unique_ptr<WindowList>          windows_;
+    std::unique_ptr<PinnedLaunchers>     pinned_;
+    std::unique_ptr<NotificationButton>  notifications_;
     std::unique_ptr<SystemTray>          tray_;
     std::unique_ptr<VolumeButton>        volume_;
     std::unique_ptr<NetworkButton>       network_button_;

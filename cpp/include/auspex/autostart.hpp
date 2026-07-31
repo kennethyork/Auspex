@@ -28,6 +28,26 @@ std::filesystem::path autostart_path();
 // in one day and the panel is not there.
 std::filesystem::path own_executable();
 
+// $XDG_BIN_HOME/auspex-shell, else ~/.local/bin/auspex-shell.
+//
+// A fixed place for the autostart entry to point at, so what starts at login does
+// not depend on where the source tree happens to live. Pointing an autostart entry
+// straight at a build directory works right up until the directory is moved or
+// renamed, and then it fails the way autostart failures always do: silently, at
+// login, with nothing on screen to say why.
+std::filesystem::path stable_executable_path();
+
+// Points `link` at `target`, replacing whatever was there.
+//
+// A SYMLINK, not a copy. A copy is 120MB that goes stale the moment the shell is
+// rebuilt -- you would be running last week's panel and have no way to tell. A link
+// follows every rebuild for free, and if the tree really is moved it breaks in one
+// obvious place that re-ticking the setting repairs.
+//
+// Returns the link path on success, empty on failure.
+std::filesystem::path install_stable_executable(
+    const std::filesystem::path& link, const std::filesystem::path& target);
+
 // The desktop entry text that would launch `executable`.
 std::string autostart_entry(const std::filesystem::path& executable);
 

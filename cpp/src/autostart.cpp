@@ -38,6 +38,41 @@ std::filesystem::path autostart_path() {
     return config_home() / "autostart" / "auspex.desktop";
 }
 
+std::filesystem::path stable_executable_path() {
+    if (const char* xdg = std::getenv("XDG_BIN_HOME"); xdg && *xdg) {
+        return std::filesystem::path(xdg) / "auspex-shell";
+    }
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        return std::filesystem::path(home) / ".local" / "bin" / "auspex-shell";
+    }
+    return {};
+}
+
+std::filesystem::path install_stable_executable(const std::filesystem::path& link,
+                                                const std::filesystem::path& target) {
+    if (link.empty() || target.empty()) return {};
+
+    std::error_code ec;
+    if (!std::filesystem::exists(target, ec)) return {};
+
+    std::filesystem::create_directories(link.parent_path(), ec);
+    if (ec) return {};
+
+    // Already pointing where it should: leave it alone rather than churning the
+    // link every time the setting is saved.
+    if (std::filesystem::is_symlink(link, ec)) {
+        const auto current = std::filesystem::read_symlink(link, ec);
+        if (!ec && current == target) return link;
+    }
+
+    // Removed first: create_symlink will not overwrite, and a stale link here is
+    // exactly the thing being fixed.
+    std::filesystem::remove(link, ec);
+    std::filesystem::create_symlink(target, link, ec);
+    if (ec) return {};
+    return link;
+}
+
 std::filesystem::path own_executable() {
     std::error_code ec;
     const auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
@@ -60,10 +95,13 @@ std::string autostart_entry(const std::filesystem::path& executable) {
           // land somewhere we look for it.
           << "Hidden=false\n"
           << "X-GNOME-Autostart-enabled=true\n"
-          // The panel docks with _NET_WM_STRUT_PARTIAL and needs a window manager
-          // already running to honour it. Autostart entries fire early, and on a
-          // cold login Auspex can otherwise dock against a screen no one is
-          // managing yet, landing at the wrong size.
+          // Honoured by GNOME and by nothing else. Checked: xfce4-session does not
+          // contain this string at all, so on an Xfce desktop it does nothing.
+          //
+          // It is kept because it is correct where it IS read, but it must not be
+          // mistaken for the thing that stops Auspex docking before the window
+          // manager is up. What actually protects against that is the docking
+          // retry in Panel::dock(), which runs everywhere.
           << "X-GNOME-Autostart-Delay=3\n";
     return entry.str();
 }
@@ -116,7 +154,18 @@ bool set_autostart(bool enabled, const std::filesystem::path& path,
 }
 
 bool set_autostart(bool enabled) {
-    return set_autostart(enabled, autostart_path(), own_executable());
+    // Prefer the stable path, and create it as part of enabling: ticking the box
+    // after moving the source tree is then also what repairs the link, rather than
+    // leaving a login that quietly starts nothing.
+    std::filesystem::path target = own_executable();
+    if (enabled) {
+        if (const auto stable = install_stable_executable(stable_executable_path(),
+                                                          target);
+            !stable.empty()) {
+            target = stable;
+        }
+    }
+    return set_autostart(enabled, autostart_path(), target);
 }
 
 }  // namespace auspex

@@ -92,6 +92,17 @@ Config Config::load(const fs::path& path) {
     assign_if(j, "enable_effects",    cfg.enable_effects);
     assign_if(j, "enable_ai",         cfg.enable_ai);
     assign_if(j, "clock_24_hour",     cfg.clock_24_hour);
+
+    // Only strings, and only ones that look like an entry id. A config file is
+    // hand-edited, and a stray number here should be skipped rather than turned
+    // into a pin that resolves to nothing.
+    if (j.contains("pinned") && j["pinned"].is_array()) {
+        for (const auto& item : j["pinned"]) {
+            if (!item.is_string()) continue;
+            std::string id = item.get<std::string>();
+            if (!id.empty()) cfg.pinned.push_back(std::move(id));
+        }
+    }
     assign_if(j, "terminal",          cfg.terminal);
     assign_if(j, "launcher",          cfg.launcher);
     assign_if(j, "background",        cfg.background);

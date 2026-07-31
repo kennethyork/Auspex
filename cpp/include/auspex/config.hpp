@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace auspex {
 
@@ -16,6 +17,13 @@ struct Config {
     int         workspace_count  = 4;
     bool        enable_effects   = true;
     bool        enable_ai        = true;
+    // Applications pinned to the panel, as desktop entry ids ("firefox.desktop").
+    //
+    // Ids rather than command lines: the icon and name then follow the application
+    // when it is updated, and nothing in the config file is a command waiting to be
+    // run by whatever reads it.
+    std::vector<std::string> pinned;
+
     // Panel clock format. True is 24-hour, which is what the shell has always
     // shown; the setting exists because that is not what everyone reads quickly.
     bool        clock_24_hour    = true;

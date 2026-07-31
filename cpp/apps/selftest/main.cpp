@@ -22,6 +22,7 @@
 #include "auspex/agents.hpp"
 #include "auspex/autostart.hpp"
 #include "auspex/calendar.hpp"
+#include "auspex/notifications.hpp"
 #include "auspex/canvas.hpp"
 #include "auspex/commands.hpp"
 #include "auspex/crew.hpp"
@@ -863,6 +864,48 @@ void test_autostart() {
     check(auspex::own_executable() == fs::path("/proc/self/exe") ||
               fs::exists(auspex::own_executable()),
           "own_executable resolves to a real file");
+
+    // The stable path: a fixed place for the entry to point at, so what starts at
+    // login does not depend on where the source tree happens to live.
+    {
+        const fs::path link   = root / "bin" / "auspex-shell";
+        const fs::path target = root / "build" / "auspex-shell";
+
+        check(auspex::install_stable_executable(link, target).empty(),
+              "a link to a target that does not exist is refused");
+
+        fs::create_directories(target.parent_path(), ec);
+        { std::ofstream out(target); out << "#!/bin/sh\n"; }
+
+        check_eq(auspex::install_stable_executable(link, target), link,
+                 "the link is created, parent directory and all");
+        check(fs::is_symlink(link), "and it is a symlink, not a 120MB copy");
+        check_eq(fs::read_symlink(link), target, "pointing at the real binary");
+
+        // Idempotent: saving the setting repeatedly must not churn the link.
+        check_eq(auspex::install_stable_executable(link, target), link,
+                 "installing it again is fine");
+        check(fs::is_symlink(link), "and it is still a link");
+
+        // The repair case. This is the whole point: the tree moved, the link is
+        // stale, and re-enabling the setting is what fixes it.
+        const fs::path moved = root / "elsewhere" / "auspex-shell";
+        fs::create_directories(moved.parent_path(), ec);
+        { std::ofstream out(moved); out << "#!/bin/sh\n"; }
+        check_eq(auspex::install_stable_executable(link, moved), link,
+                 "a stale link is repointed");
+        check_eq(fs::read_symlink(link), moved, "at the new location");
+
+        check(auspex::install_stable_executable({}, target).empty(),
+              "no link path installs nothing");
+        check(auspex::install_stable_executable(link, {}).empty(),
+              "no target installs nothing");
+
+        check(!auspex::stable_executable_path().empty(),
+              "there is always a stable path to aim at");
+        check_eq(auspex::stable_executable_path().filename(),
+                 fs::path("auspex-shell"), "named after the binary it stands for");
+    }
 
     fs::remove_all(root, ec);
 }
@@ -1843,6 +1886,135 @@ void test_crew() {
 
 // The invariant Kenny asked for in one sentence: whatever the canvas does, no window
 // it places may touch a monitor other than its own.
+void test_notifications_and_pins() {
+    std::cout << "notifications and pins\n";
+
+    using namespace auspex;
+    namespace fs = std::filesystem;
+
+    // The log is bounded, newest-first, and counts what has not been looked at.
+    {
+        NotificationLog log;
+        check(log.empty(), "a new log is empty");
+        check_eq(log.unseen(), std::size_t{0}, "with nothing unseen");
+
+        log.add({.app = "Firefox", .summary = "Download finished", .body = "",
+                 .when = "18:30"});
+        log.add({.app = "Steam", .summary = "Friend online", .body = "Kenny",
+                 .when = "18:31"});
+
+        const auto recent = log.recent();
+        check_eq(recent.size(), std::size_t{2}, "both are logged");
+        if (recent.size() == 2) {
+            check_eq(recent[0].summary, std::string("Friend online"),
+                     "newest first, which is how a log is read");
+            check_eq(recent[1].summary, std::string("Download finished"),
+                     "then the older one");
+        }
+        check_eq(log.unseen(), std::size_t{2}, "both are unseen");
+        log.mark_seen();
+        check_eq(log.unseen(), std::size_t{0}, "until looked at");
+
+        // Some applications send an empty Notify to withdraw an earlier one. There
+        // is nothing to show, and a row saying nothing is worse than no row.
+        log.add({.app = "Thing", .summary = "", .body = "", .when = "18:32"});
+        check_eq(log.size(), std::size_t{2}, "an empty notification is not logged");
+        check_eq(log.unseen(), std::size_t{0}, "and does not count as unseen");
+
+        // Bounded: this runs for a whole session and some applications never stop.
+        for (int i = 0; i < 100; ++i) {
+            log.add({.app = "Chatty", .summary = "message " + std::to_string(i),
+                     .body = "", .when = "18:33"});
+        }
+        check_eq(log.size(), NotificationLog::kCapacity,
+                 "the log stops growing at its capacity");
+        check_eq(log.recent()[0].summary, std::string("message 99"),
+                 "keeping the newest");
+        check(log.unseen() <= NotificationLog::kCapacity,
+              "and the unseen count is bounded too");
+
+        log.clear();
+        check(log.empty(), "clearing empties it");
+        check_eq(log.unseen(), std::size_t{0}, "and resets the count");
+    }
+
+    // Importing the pinned row from xfce4-panel. Its layout is one directory per
+    // launcher, and only the FIRST file in each is the button -- the others are that
+    // launcher's right-click actions and must not become separate buttons.
+    {
+        const fs::path root = fs::temp_directory_path() / "auspex-selftest-pins";
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        fs::create_directories(root / "launcher-2", ec);
+        fs::create_directories(root / "launcher-10", ec);
+        fs::create_directories(root / "not-a-launcher", ec);
+
+        const auto write = [](const fs::path& path, const std::string& name,
+                              const std::string& exec) {
+            std::ofstream out(path);
+            out << "[Desktop Entry]\nType=Application\nName=" << name
+                << "\nExec=" << exec << "\nIcon=" << name << "\n";
+        };
+
+        // Firefox, with its two right-click actions alongside, exactly as
+        // xfce4-panel writes them.
+        write(root / "launcher-2" / "1000-1.desktop", "Firefox", "firefox %u");
+        write(root / "launcher-2" / "1000-2.desktop", "New Window", "firefox -new-window");
+        write(root / "launcher-10" / "1000-1.desktop", "Thunar", "thunar %U");
+        write(root / "not-a-launcher" / "1000-1.desktop", "Ignored", "ignored");
+
+        const auto pins = import_xfce_launchers(root);
+        check_eq(pins.size(), std::size_t{2},
+                 "one pin per launcher, not one per file in it");
+        if (pins.size() == 2) {
+            // launcher-10 sorts before launcher-2 as text, which is what the
+            // directory order gives; both are present and that is what matters.
+            const bool has_firefox =
+                pins[0].name == "Firefox" || pins[1].name == "Firefox";
+            const bool has_thunar =
+                pins[0].name == "Thunar" || pins[1].name == "Thunar";
+            check(has_firefox, "Firefox is imported");
+            check(has_thunar, "Thunar is imported");
+            check(pins[0].exec.find('%') == std::string::npos,
+                  "and the field codes are already stripped");
+        }
+
+        check(import_xfce_launchers(root / "nowhere").empty(),
+              "a missing directory imports nothing rather than failing");
+
+        fs::remove_all(root, ec);
+    }
+
+    // Pins round-trip through config.json as ids, and nonsense in the file is
+    // skipped rather than turned into a button that resolves to nothing.
+    {
+        const fs::path path = fs::temp_directory_path() / "auspex-selftest-pins.json";
+        std::error_code ec;
+        fs::remove(path, ec);
+
+        {
+            std::ofstream out(path);
+            out << R"({"pinned":["firefox.desktop","thunar.desktop",42,"",null]})";
+        }
+        const auto config = auspex::Config::load(path);
+        check_eq(config.pinned.size(), std::size_t{2},
+                 "only the usable entries are kept");
+        if (config.pinned.size() == 2) {
+            check_eq(config.pinned[0], std::string("firefox.desktop"), "in order");
+            check_eq(config.pinned[1], std::string("thunar.desktop"), "both of them");
+        }
+
+        {
+            std::ofstream out(path, std::ios::trunc);
+            out << R"({"pinned":"not an array"})";
+        }
+        check(auspex::Config::load(path).pinned.empty(),
+              "a pinned value that is not a list is ignored");
+
+        fs::remove(path, ec);
+    }
+}
+
 void test_calendar_notes() {
     std::cout << "calendar\n";
 
@@ -1945,11 +2117,11 @@ void test_calendar_notes() {
         EventStore store;
         check(store.empty(), "a new calendar is empty");
 
-        check(store.add("2026-07-31", {.start = "14:00", .title = "Dentist"}),
+        check(store.add("2026-07-31", CalendarEvent{.start = "14:00", .title = "Dentist", .repeat = Repeat::None, .until = ""}),
               "an event is added");
-        check(store.add("2026-07-31", {.start = "09:00", .title = "Standup"}),
+        check(store.add("2026-07-31", CalendarEvent{.start = "09:00", .title = "Standup", .repeat = Repeat::None, .until = ""}),
               "and an earlier one");
-        check(store.add("2026-07-31", {.start = "", .title = "Bins out"}),
+        check(store.add("2026-07-31", CalendarEvent{.start = "", .title = "Bins out", .repeat = Repeat::None, .until = ""}),
               "and an all-day one");
 
         const auto day = store.on("2026-07-31");
@@ -1957,16 +2129,16 @@ void test_calendar_notes() {
         if (day.size() == 3) {
             // All-day first, then by time -- which is where a day view shows them,
             // regardless of the order they were entered in.
-            check_eq(day[0].title, std::string("Bins out"), "all-day comes first");
-            check_eq(day[1].start, std::string("09:00"), "then the earliest");
-            check_eq(day[2].start, std::string("14:00"), "then the later one");
+            check_eq(day[0].event.title, std::string("Bins out"), "all-day comes first");
+            check_eq(day[1].event.start, std::string("09:00"), "then the earliest");
+            check_eq(day[2].event.start, std::string("14:00"), "then the later one");
         }
 
-        check(!store.add("2026-07-31", {.start = "09:00", .title = "   "}),
+        check(!store.add("2026-07-31", CalendarEvent{.start = "09:00", .title = "   ", .repeat = Repeat::None, .until = ""}),
               "a blank title is refused");
-        check(!store.add("2026-07-31", {.start = "25:00", .title = "Impossible"}),
+        check(!store.add("2026-07-31", CalendarEvent{.start = "25:00", .title = "Impossible", .repeat = Repeat::None, .until = ""}),
               "an impossible time is refused");
-        check(!store.add("2026-02-30", {.start = "", .title = "Never"}),
+        check(!store.add("2026-02-30", CalendarEvent{.start = "", .title = "Never", .repeat = Repeat::None, .until = ""}),
               "an event on an unreal date is refused");
         check_eq(store.on("2026-07-31").size(), std::size_t{3}, "and none of them landed");
 
@@ -1983,11 +2155,11 @@ void test_calendar_notes() {
     // Counts per month, which is what fills a month view's cells.
     {
         EventStore store;
-        store.add("2026-07-01", {.start = "", .title = "a"});
-        store.add("2026-07-01", {.start = "10:00", .title = "b"});
-        store.add("2026-07-31", {.start = "", .title = "c"});
-        store.add("2026-08-15", {.start = "", .title = "d"});
-        store.add("2025-07-04", {.start = "", .title = "e"});
+        store.add("2026-07-01", CalendarEvent{.start = "", .title = "a", .repeat = Repeat::None, .until = ""});
+        store.add("2026-07-01", CalendarEvent{.start = "10:00", .title = "b", .repeat = Repeat::None, .until = ""});
+        store.add("2026-07-31", CalendarEvent{.start = "", .title = "c", .repeat = Repeat::None, .until = ""});
+        store.add("2026-08-15", CalendarEvent{.start = "", .title = "d", .repeat = Repeat::None, .until = ""});
+        store.add("2025-07-04", CalendarEvent{.start = "", .title = "e", .repeat = Repeat::None, .until = ""});
 
         const auto july = store.counts_in_month(2026, 7);
         check_eq(july.size(), std::size_t{2}, "July has two days with anything on them");
@@ -2007,16 +2179,16 @@ void test_calendar_notes() {
         fs::remove(path, ec);
 
         EventStore store;
-        store.add("2026-07-31", {.start = "09:00", .title = "Standup"});
-        store.add("2026-08-02", {.start = "", .title = "Dentist"});
+        store.add("2026-07-31", CalendarEvent{.start = "09:00", .title = "Standup", .repeat = Repeat::None, .until = ""});
+        store.add("2026-08-02", CalendarEvent{.start = "", .title = "Dentist", .repeat = Repeat::None, .until = ""});
         check(store.save(path), "the calendar saves");
 
         const auto reloaded = EventStore::load(path);
         check_eq(reloaded.dates().size(), std::size_t{2}, "both days come back");
         if (!reloaded.on("2026-07-31").empty()) {
-            check_eq(reloaded.on("2026-07-31")[0].start, std::string("09:00"),
+            check_eq(reloaded.on("2026-07-31")[0].event.start, std::string("09:00"),
                      "with the time intact");
-            check_eq(reloaded.on("2026-07-31")[0].title, std::string("Standup"),
+            check_eq(reloaded.on("2026-07-31")[0].event.title, std::string("Standup"),
                      "and the title");
         }
 
@@ -2030,9 +2202,9 @@ void test_calendar_notes() {
         check_eq(old_format.on("2026-07-31").size(), std::size_t{1},
                  "an entry in the old format still loads");
         if (!old_format.on("2026-07-31").empty()) {
-            check_eq(old_format.on("2026-07-31")[0].title, std::string("Bins out"),
+            check_eq(old_format.on("2026-07-31")[0].event.title, std::string("Bins out"),
                      "with its text");
-            check(old_format.on("2026-07-31")[0].start.empty(),
+            check(old_format.on("2026-07-31")[0].event.start.empty(),
                   "as an all-day event, since it never had a time");
         }
 
@@ -2059,6 +2231,168 @@ void test_calendar_notes() {
 
         check(EventStore::load(fs::temp_directory_path() / "auspex-no-such.json").empty(),
               "a missing file is an empty calendar, not a failure");
+
+        fs::remove(path, ec);
+    }
+
+    // Recurrence. A repeating event is stored once and asked about, so these are the
+    // rules the whole feature rests on.
+    {
+        // Weekly: 2026-07-31 is a Friday.
+        check(repeats_on("2026-07-31", Repeat::Weekly, "", "2026-08-07"),
+              "weekly reaches the next week");
+        check(repeats_on("2026-07-31", Repeat::Weekly, "", "2027-01-01"),
+              "and keeps going into the next year");
+        check(!repeats_on("2026-07-31", Repeat::Weekly, "", "2026-08-06"),
+              "but not a Thursday");
+
+        check(repeats_on("2026-07-31", Repeat::Daily, "", "2026-08-01"), "daily is daily");
+        check(!repeats_on("2026-07-31", Repeat::Daily, "", "2026-07-30"),
+              "and never before it started");
+        check(!repeats_on("2026-07-31", Repeat::None, "", "2026-08-01"),
+              "a one-off does not repeat");
+
+        // Monthly on the 31st SKIPS short months rather than clamping. Clamping
+        // would silently move the event to a day nobody chose.
+        check(repeats_on("2026-01-31", Repeat::Monthly, "", "2026-03-31"),
+              "monthly on the 31st reaches March");
+        check(!repeats_on("2026-01-31", Repeat::Monthly, "", "2026-02-28"),
+              "but does not land on the 28th of February");
+        check(!repeats_on("2026-01-31", Repeat::Monthly, "", "2026-04-30"),
+              "nor on the 30th of April");
+        check(repeats_on("2026-01-15", Repeat::Monthly, "", "2026-02-15"),
+              "an ordinary day of the month is every month");
+
+        // Yearly on the 29th of February happens in leap years only, for the same
+        // reason and with no special case.
+        check(repeats_on("2024-02-29", Repeat::Yearly, "", "2028-02-29"),
+              "a leap day recurs in the next leap year");
+        check(!repeats_on("2024-02-29", Repeat::Yearly, "", "2025-02-28"),
+              "and not in a common year");
+        check(repeats_on("2026-07-04", Repeat::Yearly, "", "2030-07-04"),
+              "an ordinary day is every year");
+        check(!repeats_on("2026-07-04", Repeat::Yearly, "", "2030-07-05"),
+              "on its own date only");
+
+        // An end date stops it.
+        check(repeats_on("2026-07-31", Repeat::Weekly, "2026-08-31", "2026-08-07"),
+              "an event repeats up to its end");
+        check(!repeats_on("2026-07-31", Repeat::Weekly, "2026-08-31", "2026-09-04"),
+              "and stops after it");
+        check(!repeats_on("nonsense", Repeat::Daily, "", "2026-08-01"),
+              "an unreal start never repeats");
+    }
+
+    // The store merging repeats into a day.
+    {
+        EventStore store;
+        CalendarEvent weekly;
+        weekly.start = "07:00";
+        weekly.title = "Bins out";
+        weekly.repeat = Repeat::Weekly;
+        check(store.add("2026-07-31", weekly), "a weekly event is added");
+
+        CalendarEvent once;
+        once.start = "09:00";
+        once.title = "Standup";
+        check(store.add("2026-08-07", once), "and a one-off a week later");
+
+        // The day the repeat reaches shows both, in time order, even though only one
+        // of them is stored there.
+        const auto day = store.on("2026-08-07");
+        check_eq(day.size(), std::size_t{2}, "both are on that day");
+        if (day.size() == 2) {
+            check_eq(day[0].event.title, std::string("Bins out"), "the earlier first");
+            check(day[0].repeating, "and it is marked as a repeat");
+            check_eq(day[0].origin, std::string("2026-07-31"),
+                     "carrying the date it is actually stored on");
+            check_eq(day[1].event.title, std::string("Standup"), "then the one-off");
+            check(!day[1].repeating, "which is not a repeat");
+            check_eq(day[1].origin, std::string("2026-08-07"), "stored on the day itself");
+        }
+
+        check_eq(store.on("2026-08-14").size(), std::size_t{1},
+                 "a later week has only the repeat");
+        check(store.on("2026-07-24").empty(), "and nothing before it started");
+
+        // Counting a month must see repeats from an earlier month, which is why it
+        // asks day by day rather than scanning the month's own keys.
+        const auto august = store.counts_in_month(2026, 8);
+        check_eq(august.count(7), std::size_t{1}, "the 7th has something");
+        check_eq(august.at(7), 2, "two things, in fact");
+        check_eq(august.at(14), 1, "and later Fridays have the repeat");
+        check_eq(august.size(), std::size_t{4}, "every Friday in August");
+
+        // Removing a repeat removes the series: it was never copied, so there is
+        // nothing else it could mean. The occurrence knows where the entry lives.
+        const auto seen = store.on("2026-08-14");
+        check_eq(seen.size(), std::size_t{1}, "one occurrence to remove");
+        if (!seen.empty()) {
+            check(store.remove(seen[0].origin, seen[0].index),
+                  "removed through its origin, not the day it was seen on");
+        }
+        check(store.on("2026-08-14").empty(), "the later occurrence is gone");
+        check(store.on("2026-07-31").empty(), "and so is the original");
+    }
+
+    // An end before the beginning is an event that never happens.
+    {
+        EventStore store;
+        CalendarEvent event;
+        event.title = "Impossible";
+        event.repeat = Repeat::Daily;
+        event.until = "2026-01-01";
+        check(!store.add("2026-07-31", event), "an end before the start is refused");
+
+        // A one-off never keeps an end date, which would be a field meaning nothing.
+        CalendarEvent plain;
+        plain.title = "Once";
+        plain.until = "2026-12-31";
+        check(store.add("2026-07-31", plain), "a one-off with a stray end is accepted");
+        check(store.on("2026-07-31")[0].event.until.empty(),
+              "and the end is dropped, since nothing repeats");
+    }
+
+    // Recurrence survives the file.
+    {
+        const fs::path path = fs::temp_directory_path() / "auspex-selftest-repeat.json";
+        std::error_code ec;
+        fs::remove(path, ec);
+
+        EventStore store;
+        CalendarEvent event;
+        event.start = "07:00";
+        event.title = "Bins out";
+        event.repeat = Repeat::Weekly;
+        event.until = "2026-12-31";
+        store.add("2026-07-31", event);
+        check(store.save(path), "a repeating event saves");
+
+        const auto reloaded = EventStore::load(path);
+        const auto day = reloaded.on("2026-08-07");
+        check_eq(day.size(), std::size_t{1}, "and still repeats after loading");
+        if (!day.empty()) {
+            check(day[0].event.repeat == Repeat::Weekly, "with its rule");
+            check_eq(day[0].event.until, std::string("2026-12-31"), "and its end");
+        }
+
+        // A rule we do not understand becomes a one-off rather than a different
+        // rule -- the file is hand-editable and a typo must not invent a schedule.
+        {
+            std::ofstream out(path, std::ios::trunc);
+            out << R"({"2026-07-31":[{"start":"","title":"x","repeat":"fortnightly"}]})";
+        }
+        const auto odd = EventStore::load(path);
+        check(!odd.on("2026-07-31").empty(), "the event still loads");
+        if (!odd.on("2026-07-31").empty()) {
+            check(odd.on("2026-07-31")[0].event.repeat == Repeat::None,
+                  "with an unrecognised rule read as no rule at all");
+        }
+        check(odd.on("2026-08-07").empty(), "so it does not repeat");
+
+        check_eq(repeat_to_string(Repeat::Weekly), std::string("weekly"), "rules serialise");
+        check(repeat_from_string("weekly") == Repeat::Weekly, "and parse back");
+        check(repeat_from_string("") == Repeat::None, "empty is no rule");
 
         fs::remove(path, ec);
     }
@@ -3122,6 +3456,7 @@ int main(int argc, char** argv) {
     test_monitors_current();
     test_minimize();
     test_crew();
+    test_notifications_and_pins();
     test_calendar_notes();
     test_timekeeping();
     test_volume_and_network();

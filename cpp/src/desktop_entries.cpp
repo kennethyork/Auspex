@@ -173,4 +173,61 @@ bool entry_matches(const DesktopEntry& entry, std::string_view query) {
            lower(entry.comment).find(needle) != std::string::npos;
 }
 
+
+std::filesystem::path xfce_panel_launcher_dir() {
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        return std::filesystem::path(home) / ".config" / "xfce4" / "panel";
+    }
+    return {};
+}
+
+std::vector<DesktopEntry> import_xfce_launchers(const std::filesystem::path& dir) {
+    std::vector<DesktopEntry> pinned;
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return pinned;
+
+    // Sorted, because the directory order is arbitrary and the panel's order is
+    // launcher-1, launcher-2 ... Sorting by name reproduces it closely enough to be
+    // recognisable, which is the whole point of importing.
+    std::vector<std::filesystem::path> launchers;
+    for (const auto& item : std::filesystem::directory_iterator(dir, ec)) {
+        if (!item.is_directory()) continue;
+        const std::string name = item.path().filename().string();
+        if (name.rfind("launcher-", 0) != 0) continue;
+        launchers.push_back(item.path());
+    }
+    std::sort(launchers.begin(), launchers.end());
+
+    for (const auto& launcher : launchers) {
+        std::vector<std::filesystem::path> files;
+        for (const auto& item : std::filesystem::directory_iterator(launcher, ec)) {
+            if (item.path().extension() == ".desktop") files.push_back(item.path());
+        }
+        if (files.empty()) continue;
+        std::sort(files.begin(), files.end());
+
+        // The first file only -- see the header. The rest are right-click actions.
+        std::ifstream in(files.front());
+        if (!in) continue;
+        std::stringstream buffer;
+        buffer << in.rdbuf();
+
+        if (auto entry = parse_desktop_entry(buffer.str(),
+                                             files.front().filename().string())) {
+            pinned.push_back(std::move(*entry));
+        }
+    }
+
+    return pinned;
+}
+
+std::optional<DesktopEntry> find_desktop_entry(const std::string& id) {
+    if (id.empty()) return std::nullopt;
+    for (auto& entry : load_desktop_entries()) {
+        if (entry.id == id) return entry;
+    }
+    return std::nullopt;
+}
+
 }  // namespace auspex

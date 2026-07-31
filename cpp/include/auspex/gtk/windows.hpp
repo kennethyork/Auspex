@@ -18,6 +18,7 @@
 #include <gtkmm/checkbutton.h>
 #include <gtkmm/dropdown.h>
 #include <gtkmm/entry.h>
+#include <gtkmm/dropdown.h>
 #include <gtkmm/grid.h>
 #include <gtkmm/label.h>
 #include <gtkmm/listbox.h>
@@ -136,6 +137,13 @@ private:
     Gtk::Entry          title_entry_;
     Gtk::Button         add_{"Add"};
 
+    // Repetition, on its own row: it applies to what is being added, and putting it
+    // beside the title would make a one-line entry look like a form.
+    Gtk::Box            repeat_row_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::DropDown       repeat_;
+    Gtk::Entry          until_entry_;
+    std::vector<Repeat> repeat_values_;
+
     // One button per grid cell, kept so the month can be redrawn without rebuilding
     // the widgets -- 42 cells rebuilt on every page turn is a visible flicker.
     struct Cell {
@@ -202,6 +210,15 @@ private:
     Gtk::CheckButton enable_ai_{"Enable AI features"};
     Gtk::CheckButton autostart_{"Start Auspex when I log in"};
     Gtk::CheckButton clock_24_{"Use a 24-hour clock"};
+
+    // Pinned applications. Imported rather than hand-listed: the point is to stop
+    // replacing xfce4-panel from costing someone the row of icons they have had one
+    // click away for years.
+    void import_pins();
+    Gtk::Box    pins_row_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Label  pins_summary_;
+    Gtk::Button import_pins_{"Import from xfce4-panel"};
+    std::vector<std::string> pinned_;
 
     // Date and time. Applied immediately on their own controls rather than on Save,
     // because they do not live in config.json -- they are system state behind a
