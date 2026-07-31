@@ -264,7 +264,8 @@ SystemMonitorWidget::SystemMonitorWidget() : Gtk::Box(Gtk::Orientation::HORIZONT
 // ---------------------------------------------------------------------------
 // Clock
 // ---------------------------------------------------------------------------
-Clock::Clock(const Config& config) : config_(config) {
+Clock::Clock(const Config& config)
+    : config_(config), clock_24_hour_(config.clock_24_hour) {
     add_css_class("clock-label");
     add_css_class("flat");
     set_has_frame(false);
@@ -296,7 +297,23 @@ Clock::Clock(const Config& config) : config_(config) {
         1000);
 }
 
+void Clock::refresh_format() {
+    // Same shape as the theme watcher: compare the modification time and only read
+    // the file when it has moved. Saving Settings rewrites config.json, so this is
+    // what makes the checkbox take effect without restarting the shell.
+    std::error_code ec;
+    const auto mtime = std::filesystem::last_write_time(Config::default_path(), ec);
+    // Missing or half-written is expected while something else is saving it; try
+    // again on the next tick rather than reporting anything.
+    if (ec || mtime == config_mtime_) return;
+    config_mtime_ = mtime;
+
+    clock_24_hour_ = Config::load().clock_24_hour;
+}
+
 void Clock::tick() {
+    refresh_format();
+
     const std::time_t now = std::time(nullptr);
     std::tm local{};
     if (!localtime_r(&now, &local)) return;
@@ -304,8 +321,8 @@ void Clock::tick() {
     // %I is the 12-hour hour and %p the AM/PM marker; both come from the C library
     // rather than being assembled here, so a locale that writes "p.m." gets its own
     // spelling instead of an English one.
-    const char* format = config_.clock_24_hour ? "%Y-%m-%d %H:%M:%S"
-                                               : "%Y-%m-%d %I:%M:%S %p";
+    const char* format = clock_24_hour_ ? "%Y-%m-%d %H:%M:%S"
+                                        : "%Y-%m-%d %I:%M:%S %p";
 
     char buffer[64];
     if (std::strftime(buffer, sizeof(buffer), format, &local) > 0) {

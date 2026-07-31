@@ -11,6 +11,7 @@
 // plain widgets, and Box::append does not take ownership.
 #pragma once
 
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
@@ -183,7 +184,23 @@ public:
 private:
     void tick();
 
+    // Whether config.json changed since the last look, checked on the tick the
+    // clock already runs. One stat a second, and a reparse only when the file has
+    // actually been written.
+    void refresh_format();
+
     const Config& config_;
+
+    // The clock keeps its OWN copy of the format rather than reading the shared
+    // Config live.
+    //
+    // The shell loads that Config once and hands out const references to it,
+    // including to the voice worker thread. Reloading it in place to pick up a
+    // setting would be rewriting strings another thread is reading -- a data race
+    // for the sake of a checkbox. Copying one bool costs nothing and races with
+    // nothing.
+    bool clock_24_hour_ = true;
+    std::filesystem::file_time_type config_mtime_{};
 
     Gtk::Label    label_;
     Gtk::Popover  popover_;
