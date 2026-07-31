@@ -59,6 +59,31 @@ window,
     color: $panel_fg;
 }
 
+/* Panels are translucent, so the canvas and the wallpaper show through them.
+ *
+ * Scoped to .auspex-panel deliberately: the rules above paint every window,
+ * and applying alpha there would also make the settings, chat and launcher
+ * windows see-through -- which is unreadable over a photograph rather than
+ * stylish. Only the two bars opt in.
+ *
+ * The inner `box` selectors are not redundant. The generic `box` rule below
+ * paints an opaque background over the whole panel interior, so making only the
+ * window translucent would change nothing visible; these override it at higher
+ * specificity.
+ *
+ * Requires a compositor. Without one the alpha is ignored and the panels are
+ * simply opaque, which is a fine thing to degrade to.
+ *
+ * 0.95 is not a taste call: it is xfce4-panel's own default background-alpha of
+ * 95, so the bars sit at the same weight as the panel they replace instead of
+ * announcing themselves as something new. */
+window.auspex-panel,
+window.auspex-panel > box,
+window.auspex-panel box,
+window.auspex-panel .background {
+    background-color: alpha($panel_bg, 0.95);
+}
+
 box {
     background-color: $panel_bg;
 }

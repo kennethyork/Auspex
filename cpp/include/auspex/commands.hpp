@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "auspex/config.hpp"
+#include "auspex/canvas.hpp"
 #include "auspex/desktop.hpp"
 
 namespace auspex {
@@ -39,6 +40,15 @@ enum class ActionKind {
     SetVolume,        // set the default sink to `number` percent
     OpenUrl,          // open an http/https URL in the browser
     WebSearch,        // search the web for `target`
+    OpenTerminal,     // spawn a terminal onto the canvas
+    OpenAgent,        // open a coding agent CLI on the canvas; `target` names it
+    RunCrew,          // hand a task to the ollamadev crew; `target` is the USER's words
+    CrewAccept,       // apply held changeset `number`
+    CrewDiscard,      // bin held changeset `number`
+    CrewSteer,        // talk to coder `number`; `target` is the USER's words
+    ShowBoard,        // show what the crew is holding
+    CrewResume,       // finish an interrupted crew run
+    PanCanvas,        // pan the canvas viewport; `target` is a direction
 };
 
 std::string_view to_string(ActionKind kind);
@@ -62,11 +72,28 @@ struct CommandContext {
     // Copied from Config so execute_action() needs no separate Config argument.
     std::string browser;
     std::string search_url;
+    std::string terminal;
+
+    // Canvas state lives in the host process (the shell or the server), not in the
+    // command layer, so it is borrowed here. Null means no canvas is running and the
+    // canvas verbs report that rather than silently doing nothing.
+    Canvas* canvas = nullptr;
+    Rect    monitor{};
 
     // Recent (question, answer) turns, oldest first. Replayed into the prompt so
     // follow-ups like "what about the second one?" resolve. voice_assistant.py had
     // this; Auspex was stateless until now.
     std::vector<std::pair<std::string, std::string>> history;
+
+    // What the user actually said, verbatim from the transcript.
+    //
+    // Load-bearing for run_crew and for nothing else. The crew takes a free-text
+    // task, and that text becomes an argument to a subprocess -- so it must be the
+    // human's own words, NOT something the model wrote. The model's only job for
+    // this verb is deciding that it IS a crew request; the payload never passes
+    // through it. Every other verb takes either no argument or one validated
+    // against reality, and this keeps run_crew in the same posture.
+    std::string utterance;
 };
 
 CommandContext gather_context(const Config& config);
@@ -84,6 +111,15 @@ struct ParseResult {
 // Extracts the first balanced JSON object from `model_output` (a reasoning model
 // may wrap it in prose), then validates it against the whitelist and `context`.
 ParseResult parse_action(const std::string& model_output, const CommandContext& context);
+
+// Strips the phrasing people wrap a crew request in, leaving the task itself.
+//
+// "have the crew add rate limiting to the api"  ->  "add rate limiting to the api"
+// "ask the crew to write tests for canvas"      ->  "write tests for canvas"
+//
+// Exposed because it is the whole of the argument construction for run_crew, and
+// the one place a bad result would send nonsense to a tool that edits files.
+std::string crew_task_from_utterance(std::string_view utterance);
 
 struct ExecResult {
     bool        ok = false;

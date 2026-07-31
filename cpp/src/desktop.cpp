@@ -1,10 +1,14 @@
 #include "auspex/desktop.hpp"
 
 #include <charconv>
+#include <cstdio>
 #include <chrono>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <sstream>
 
+#include "auspex/display.hpp"
 #include "auspex/process.hpp"
 
 namespace auspex {
@@ -18,6 +22,43 @@ std::optional<int> to_int(std::string_view s) {
     const auto result = std::from_chars(begin, end, value);
     if (result.ec != std::errc{} || result.ptr != end) return std::nullopt;
     return value;
+}
+
+// A value plus how recently it was fetched. Deliberately tiny and local: the point
+// is to stop two widgets on the same one-second timer asking the same expensive
+// question twice, not to build a caching layer.
+template <typename T>
+struct TimedCache {
+    std::mutex                            lock;
+    T                                     value{};
+    std::chrono::steady_clock::time_point fetched{};
+    bool                                  valid = false;
+
+    template <typename Fetch>
+    T get(std::chrono::milliseconds ttl, Fetch&& fetch) {
+        const std::scoped_lock guard(lock);
+        const auto now = std::chrono::steady_clock::now();
+        if (valid && now - fetched < ttl) return value;
+        value   = fetch();
+        fetched = now;
+        valid   = true;
+        return value;
+    }
+
+    void invalidate() {
+        const std::scoped_lock guard(lock);
+        valid = false;
+    }
+};
+
+TimedCache<std::vector<MonitorInfo>>& monitor_cache() {
+    static TimedCache<std::vector<MonitorInfo>> cache;
+    return cache;
+}
+
+TimedCache<std::vector<std::string>>& visible_cache() {
+    static TimedCache<std::vector<std::string>> cache;
+    return cache;
 }
 
 }  // namespace
@@ -94,6 +135,163 @@ std::vector<WindowEntry> parse_windows(const std::string& output) {
     return result;
 }
 
+std::vector<PlacedWindow> parse_placed_windows(const std::string& output) {
+    std::vector<PlacedWindow> result;
+
+    // `wmctrl -lG` is `wmctrl -l` with four geometry columns spliced in between the
+    // workspace and the hostname:
+    //
+    //   0x02a0000c  0 10 90 950 472 hostname OllamaDev ADE — Linux-Mint-AI
+    //
+    // The title is everything after the hostname and may contain spaces, so it is
+    // taken with getline rather than by tokenising.
+    for (const auto& line : split_lines(output)) {
+        std::istringstream fields(line);
+        std::string id;
+        std::string workspace_token;
+        if (!(fields >> id >> workspace_token)) continue;
+
+        const auto workspace = to_int(workspace_token);
+        if (!workspace) continue;
+
+        std::string x, y, width, height;
+        if (!(fields >> x >> y >> width >> height)) continue;
+
+        const auto px = to_int(x);
+        const auto py = to_int(y);
+        const auto pw = to_int(width);
+        const auto ph = to_int(height);
+        if (!px || !py || !pw || !ph) continue;
+
+        std::string host;
+        if (!(fields >> host)) continue;
+
+        std::string rest;
+        std::getline(fields, rest);
+        rest = trim(std::move(rest));
+
+        PlacedWindow placed;
+        placed.window.id        = id;
+        placed.window.workspace = *workspace;
+        placed.window.title     = rest.empty() ? host : rest;
+        placed.bounds = Rect{.x = *px, .y = *py, .width = *pw, .height = *ph};
+
+        result.push_back(std::move(placed));
+    }
+
+    return result;
+}
+
+std::vector<PlacedWindow> list_placed_windows() {
+    return display().windows_with_geometry();
+}
+
+std::string canonical_window_id(std::string_view id) {
+    const std::string text = trim(std::string(id));
+    if (text.empty()) return {};
+
+    const bool hex = text.starts_with("0x") || text.starts_with("0X");
+    const std::string digits = hex ? text.substr(2) : text;
+    if (digits.empty()) return {};
+
+    // Reject rather than let strtoul stop at the first bad character: a partly
+    // parsed id is a different window, which is far worse than no id at all.
+    for (const char c : digits) {
+        const bool ok = hex ? std::isxdigit(static_cast<unsigned char>(c)) != 0
+                            : std::isdigit(static_cast<unsigned char>(c)) != 0;
+        if (!ok) return {};
+    }
+
+    unsigned long value = 0;
+    try {
+        value = std::stoul(digits, nullptr, hex ? 16 : 10);
+    } catch (const std::exception&) {
+        return {};
+    }
+
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "0x%08lx", value);
+    return buffer;
+}
+
+FrameExtents parse_frame_extents(const std::string& output) {
+    // _NET_FRAME_EXTENTS(CARDINAL) = 5, 5, 29, 5
+    const std::size_t eq = output.find('=');
+    if (eq == std::string::npos) return {};
+
+    std::vector<int> values;
+    std::string token;
+    for (std::size_t i = eq + 1; i <= output.size(); ++i) {
+        const char c = i < output.size() ? output[i] : ',';
+        if (c == ',' || c == '\n') {
+            if (const auto value = to_int(trim(token))) values.push_back(*value);
+            token.clear();
+            if (c == '\n') break;
+        } else if (!std::isspace(static_cast<unsigned char>(c))) {
+            token.push_back(c);
+        }
+    }
+    if (values.size() < 4) return {};
+    return FrameExtents{values[0], values[1], values[2], values[3]};
+}
+
+std::optional<FrameExtents> frame_extents(std::string_view window_id) {
+    // Cached per window for ten seconds. apply_positions() needs these on every
+    // move, which happens on every frame of a drag; an xprop per window per frame
+    // would cost more than the panning does. Decoration changes only when a window
+    // manager is reconfigured or a window toggles its own decorations, so a stale
+    // answer for a few seconds is invisible.
+    static std::mutex lock;
+    static std::map<std::string, std::pair<FrameExtents,
+                                           std::chrono::steady_clock::time_point>> cache;
+
+    const std::string id(window_id);
+    if (id.empty()) return std::nullopt;
+
+    {
+        const std::scoped_lock guard(lock);
+        const auto it = cache.find(id);
+        if (it != cache.end() &&
+            std::chrono::steady_clock::now() - it->second.second <
+                std::chrono::seconds(10)) {
+            return it->second.first;
+        }
+    }
+
+    const auto fresh = display().frame_extents(window_id);
+    if (!fresh) return std::nullopt;
+
+    const std::scoped_lock guard(lock);
+    cache[id] = {*fresh, std::chrono::steady_clock::now()};
+    return fresh;
+}
+
+std::vector<std::string> list_visible_windows() {
+    // 400ms: shorter than the one-second poll, so the panel and the canvas each see
+    // fresh data on their own tick, but the two of them landing in the same tick
+    // share one 23ms call instead of making two.
+    return visible_cache().get(std::chrono::milliseconds(400),
+                               [] { return display().visible_windows(); });
+}
+
+bool minimize_window(std::string_view window_id) {
+    return display().minimize_window(window_id);
+}
+
+bool restore_window(std::string_view window_id) {
+    return display().restore_window(window_id);
+}
+
+bool maximize_window(std::string_view window_id) {
+    return display().maximize_window(window_id);
+}
+
+bool close_window(std::string_view window_id) {
+    return display().close_window(window_id);
+}
+
+std::optional<std::string> focused_window_id() { return display().focused_window_id(); }
+
 // `xrandr --listmonitors` lines look like:
 //    0: +*DP-2 1920/698x1080/393+0+0  DP-2
 //       ^^     ^^^^     ^^^^  ^^ ^^
@@ -149,10 +347,106 @@ std::vector<MonitorInfo> parse_monitors(const std::string& output) {
     return result;
 }
 
+// `xprop -root _NET_WORKAREA` output:
+//   _NET_WORKAREA(CARDINAL) = 0, 32, 1920, 1016, 0, 32, 1920, 1016, ...
+// One quadruple per workspace; they are almost always identical, and the current
+// workspace's area is what matters, so the first is taken.
+std::optional<Rect> parse_workarea(const std::string& output) {
+    const auto eq = output.find('=');
+    if (eq == std::string::npos) return std::nullopt;
+
+    std::istringstream values(output.substr(eq + 1));
+    std::vector<int> numbers;
+    std::string token;
+    while (std::getline(values, token, ',') && numbers.size() < 4) {
+        const auto parsed = to_int(trim(token));
+        if (!parsed) return std::nullopt;
+        numbers.push_back(*parsed);
+    }
+    if (numbers.size() < 4 || numbers[2] <= 0 || numbers[3] <= 0) return std::nullopt;
+
+    return Rect{.x = numbers[0], .y = numbers[1], .width = numbers[2], .height = numbers[3]};
+}
+
+// `xwininfo -id 0x...` output, the four lines that matter among ~20:
+//   Absolute upper-left X:  100
+//   Absolute upper-left Y:  132
+//   Width: 640
+//   Height: 480
+// from_chars is deliberately not checked for trailing input: several xwininfo
+// values carry a suffix, and only the leading integer is wanted.
+std::optional<Rect> parse_window_geometry(const std::string& output) {
+    Rect rect;
+    bool have_x = false, have_y = false, have_w = false, have_h = false;
+
+    for (const auto& line : split_lines(output)) {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        const std::string key   = trim(line.substr(0, colon));
+        const std::string value = trim(line.substr(colon + 1));
+
+        int parsed = 0;
+        const auto* begin = value.data();
+        const auto* end   = value.data() + value.size();
+        if (std::from_chars(begin, end, parsed).ec != std::errc{}) continue;
+
+        if (key == "Absolute upper-left X")      { rect.x = parsed;      have_x = true; }
+        else if (key == "Absolute upper-left Y") { rect.y = parsed;      have_y = true; }
+        else if (key == "Width")                 { rect.width = parsed;  have_w = true; }
+        else if (key == "Height")                { rect.height = parsed; have_h = true; }
+    }
+
+    if (!(have_x && have_y && have_w && have_h)) return std::nullopt;
+    return rect;
+}
+
+void invalidate_desktop_caches() {
+    monitor_cache().invalidate();
+    visible_cache().invalidate();
+}
+
+std::vector<MonitorInfo> parse_monitors_current(const std::string& output) {
+    std::vector<MonitorInfo> result;
+    int index = 0;
+
+    for (const auto& line : split_lines(output)) {
+        std::istringstream fields(line);
+        std::string connector, state;
+        if (!(fields >> connector >> state)) continue;
+        if (state != "connected") continue;   // also skips the "Screen 0:" header
+
+        // "primary" is optional and sits between the state and the geometry.
+        std::string token;
+        if (!(fields >> token)) continue;
+
+        MonitorInfo monitor;
+        monitor.primary = (token == "primary");
+        if (monitor.primary && !(fields >> token)) continue;
+
+        // token is now WxH+X+Y. A connected-but-unmapped output has no geometry
+        // here at all and lands on "(normal" instead, which parses to nothing.
+        int width = 0, height = 0, x = 0, y = 0;
+        if (std::sscanf(token.c_str(), "%dx%d+%d+%d", &width, &height, &x, &y) != 4) {
+            continue;
+        }
+        if (width <= 0 || height <= 0) continue;
+
+        monitor.index     = index++;
+        monitor.connector = connector;
+        monitor.bounds    = Rect{.x = x, .y = y, .width = width, .height = height};
+        result.push_back(std::move(monitor));
+    }
+
+    return result;
+}
+
 std::vector<MonitorInfo> list_monitors() {
-    const auto result = run({"xrandr", "--listmonitors"});
-    if (!result.ok) return {};
-    return parse_monitors(result.out);
+    // Five seconds. Hot-plugging a monitor is the only thing that changes this, and
+    // waiting up to five seconds for the panel to notice is not something anyone
+    // will perceive -- whereas 333ms twice a second very much is.
+    return monitor_cache().get(std::chrono::seconds(5),
+                               [] { return display().monitors(); });
 }
 
 std::optional<MonitorInfo> primary_monitor() {
@@ -171,9 +465,7 @@ std::optional<MonitorInfo> primary_monitor() {
 }
 
 std::vector<Workspace> list_workspaces() {
-    const auto result = run({"wmctrl", "-d"});
-    if (!result.ok) return {};
-    return parse_workspaces(result.out);
+    return display().workspaces();
 }
 
 std::optional<int> current_workspace() {
@@ -185,19 +477,18 @@ std::optional<int> current_workspace() {
 
 bool switch_workspace(int index) {
     if (index < 0) return false;
-    const std::string target = std::to_string(index);
+    if (!display().set_workspace(index)) return false;
 
-    // wmctrl is authoritative; xdotool is kept as a second attempt because some
-    // window managers only honour one of the two.
-    const bool via_wmctrl  = run({"wmctrl", "-s", target}, false).ok;
-    const bool via_xdotool = run({"xdotool", "set_desktop", target}, false).ok;
-    if (!via_wmctrl && !via_xdotool) return false;
-
-    // The switch is asynchronous: wmctrl returns as soon as the WM has the request,
-    // and _NET_CURRENT_DESKTOP updates a beat later. Measured on xfwm4, a read
-    // immediately after still reports the old desktop and only agrees ~1s later, so
-    // a single check reported failure on a switch that had actually worked. Poll
-    // instead of sleeping a fixed amount, so the common fast case stays fast.
+    // The switch is asynchronous: the request is accepted as soon as the window
+    // manager has it, and the active workspace updates a beat later. Measured on
+    // xfwm4, a read immediately after still reports the old desktop and only agrees
+    // ~1s later, so a single check reported failure on a switch that had actually
+    // worked. Poll instead of sleeping a fixed amount, so the common fast case
+    // stays fast.
+    //
+    // This loop stays on this side of the seam: it is a policy about confirming a
+    // request, expressed entirely in terms of current_workspace(), so a Wayland
+    // backend inherits it rather than reimplementing it.
     for (int attempt = 0; attempt < 30; ++attempt) {
         if (const auto now = current_workspace(); now && *now == index) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -205,10 +496,12 @@ bool switch_workspace(int index) {
     return false;
 }
 
+std::optional<Rect> current_workarea() {
+    return display().workarea();
+}
+
 std::vector<WindowEntry> list_windows() {
-    const auto result = run({"wmctrl", "-l"});
-    if (!result.ok) return {};
-    return parse_windows(result.out);
+    return display().windows();
 }
 
 bool is_shell_window(const WindowEntry& window) {
@@ -229,8 +522,19 @@ std::vector<WindowEntry> list_user_windows() {
 }
 
 bool activate_window(std::string_view window_id) {
-    if (window_id.empty()) return false;
-    return run({"wmctrl", "-ia", std::string(window_id)}, false).ok;
+    return display().activate_window(window_id);
+}
+
+std::optional<std::string> focused_window_title() {
+    return display().focused_window_title();
+}
+
+std::optional<std::string> selected_text() {
+    return display().primary_selection();
+}
+
+bool type_text(std::string_view text) {
+    return display().type_text(text);
 }
 
 }  // namespace auspex

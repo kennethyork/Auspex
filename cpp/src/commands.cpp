@@ -3,10 +3,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <chrono>
 #include <sstream>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
+#include "auspex/agents.hpp"
+#include "auspex/crew.hpp"
+#include "auspex/display.hpp"
 #include "auspex/process.hpp"
 
 namespace fs = std::filesystem;
@@ -15,6 +20,14 @@ using json = nlohmann::json;
 namespace auspex {
 
 namespace {
+
+std::vector<std::string> split_words(const std::string& command) {
+    std::vector<std::string> words;
+    std::istringstream in(command);
+    std::string word;
+    while (in >> word) words.push_back(word);
+    return words;
+}
 
 std::string lower(std::string_view s) {
     std::string out(s);
@@ -128,6 +141,15 @@ std::string_view to_string(ActionKind kind) {
         case ActionKind::SetVolume:       return "set_volume";
         case ActionKind::OpenUrl:         return "open_url";
         case ActionKind::WebSearch:       return "web_search";
+        case ActionKind::OpenTerminal:    return "open_terminal";
+        case ActionKind::OpenAgent:       return "open_agent";
+        case ActionKind::RunCrew:         return "run_crew";
+        case ActionKind::CrewAccept:      return "crew_accept";
+        case ActionKind::CrewDiscard:     return "crew_discard";
+        case ActionKind::CrewSteer:       return "crew_steer";
+        case ActionKind::ShowBoard:       return "show_board";
+        case ActionKind::CrewResume:      return "crew_resume";
+        case ActionKind::PanCanvas:       return "pan_canvas";
     }
     return "answer";
 }
@@ -162,20 +184,74 @@ std::optional<fs::path> resolve_path(std::string_view spoken) {
     return std::nullopt;
 }
 
+std::string crew_task_from_utterance(std::string_view utterance) {
+    std::string text = trim(std::string(utterance));
+    if (text.empty()) return {};
+
+    // Peel the request phrasing off the front, longest first so "ask the crew to"
+    // is not half-matched by "ask the crew". Only the front: the task itself is
+    // whatever remains, untouched, because it is the user's specification and
+    // rewording it would change what gets built.
+    static const std::vector<std::string> kPrefixes = {
+        "have the crew to ", "have the crew ", "ask the crew to ", "ask the crew ",
+        "tell the crew to ", "tell the crew ", "get the crew to ", "get the crew ",
+        "run the crew on ", "run the crew ", "crew, ", "crew ",
+        "use the crew to ", "use the crew ",
+    };
+
+    for (bool changed = true; changed;) {
+        changed = false;
+        const std::string lowered = lower(text);
+        for (const auto& prefix : kPrefixes) {
+            if (lowered.rfind(prefix, 0) == 0) {
+                text = trim(text.substr(prefix.size()));
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    // Trailing punctuation from dictation.
+    while (!text.empty() && (text.back() == '.' || text.back() == '?' ||
+                             text.back() == '!' || text.back() == ',')) {
+        text.pop_back();
+    }
+    text = trim(std::move(text));
+
+    // Strip dangling connectors left at the END.
+    //
+    // "ask the crew to" strips to "to": the longest matching prefix needs a space
+    // after it, so a sentence that stops there falls through to the shorter form
+    // and leaves the preposition behind. Sending "to" as a task to a tool that
+    // edits files is worse than refusing, and the same guard covers any request
+    // that simply trailed off mid-sentence.
+    static const std::vector<std::string> kDangling = {
+        "to", "on", "for", "with", "about", "the", "a", "an", "and", "please",
+    };
+    for (bool changed = true; changed && !text.empty();) {
+        changed = false;
+        const std::size_t space = text.find_last_of(' ');
+        const std::string last = lower(space == std::string::npos
+                                           ? text
+                                           : text.substr(space + 1));
+        if (std::find(kDangling.begin(), kDangling.end(), last) != kDangling.end()) {
+            text = trim(space == std::string::npos ? std::string{} : text.substr(0, space));
+            changed = true;
+        }
+    }
+    return text;
+}
+
 CommandContext gather_context(const Config& config) {
     CommandContext context;
     context.workspace_count = config.workspace_count > 0 ? config.workspace_count : 4;
     context.windows         = list_user_windows();
     context.browser         = config.browser;
     context.search_url      = config.search_url;
+    context.terminal        = config.terminal;
 
-    if (const auto focused = run({"xdotool", "getactivewindow", "getwindowname"});
-        focused.ok) {
-        context.focused_window = trim(focused.out);
-    }
-    if (const auto selected = run({"xclip", "-o", "-selection", "primary"}); selected.ok) {
-        context.selection = trim(selected.out);
-    }
+    if (const auto focused = focused_window_title()) context.focused_window = *focused;
+    if (const auto selected = selected_text())       context.selection = *selected;
     return context;
 }
 
@@ -193,6 +269,16 @@ std::string build_command_prompt(const std::string& utterance,
               "  {\"action\":\"set_volume\",\"number\":<0-100>}\n"
               "  {\"action\":\"open_url\",\"target\":\"<http(s) URL>\"}\n"
               "  {\"action\":\"web_search\",\"target\":\"<search terms>\"}\n"
+              "  {\"action\":\"open_terminal\"}\n"
+              "  {\"action\":\"open_agent\",\"target\":\"<agent name>\"}\n"
+              "  {\"action\":\"run_crew\"}\n"
+              "  {\"action\":\"show_board\"}\n"
+              "  {\"action\":\"crew_resume\"}\n"
+              "  {\"action\":\"crew_accept\",\"number\":<int>}\n"
+              "  {\"action\":\"crew_discard\",\"number\":<int>}\n"
+              "  {\"action\":\"crew_steer\",\"number\":<int>}\n"
+              "  {\"action\":\"pan_canvas\",\"target\":"
+              "\"left|right|up|down|home\"}\n"
               "  {\"action\":\"answer\",\"target\":\"<spoken reply>\"}\n\n"
               "Rules:\n"
               "- Use \"answer\" for questions, or when the request is not one of the "
@@ -203,6 +289,26 @@ std::string build_command_prompt(const std::string& utterance,
               "- Workspaces are numbered from 1 as the user says them.\n"
               "- For a named site use open_url with a full https:// URL. Use "
               "web_search only when there is no specific site.\n\n";
+
+    if (in_path("ollamadev")) {
+        prompt << "The crew is a parallel bench of coding agents that edits files in "
+                  "this project. Use run_crew when the user asks the CREW to do "
+                  "something -- \"have the crew add rate limiting\", \"ask the crew "
+                  "to write tests\". It takes no target: the user's own words are "
+                  "used verbatim, so do not summarise the task.\n\n";
+    }
+
+    // Naming the installed agents rather than describing them: a small model given a
+    // closed list copies from it, and given only a description invents plausible
+    // neighbours ("copilot", "chatgpt") that then fail to resolve.
+    if (const auto agents = available_agents(); !agents.empty()) {
+        prompt << "Coding agents installed (use open_agent, target must be one of "
+                  "these exactly):\n";
+        for (const auto& agent : agents) {
+            prompt << "  " << agent.key << "  (" << agent.label << ")\n";
+        }
+        prompt << "\n";
+    }
 
     prompt << "Workspaces available: 1 to " << context.workspace_count << "\n";
 
@@ -342,6 +448,133 @@ ParseResult parse_action(const std::string& model_output, const CommandContext& 
         return result;
     }
 
+    if (kind == "open_terminal") {
+        // No target to validate: the terminal comes from Config, never the model.
+        result.action = Action{ActionKind::OpenTerminal, {}, 0};
+        return result;
+    }
+
+    if (kind == "open_agent") {
+        // The single gate between model output and a process. The model supplies a
+        // NAME, which is matched against the fixed table in agents.hpp; the binary
+        // that eventually reaches execvp is a literal from that table and never
+        // anything the model wrote. An unrecognised name stops here.
+        const auto agent = resolve_agent(target);
+        if (!agent) {
+            std::string known;
+            for (const auto& tool : available_agents()) {
+                if (!known.empty()) known += ", ";
+                known += tool.label;
+            }
+            result.error = known.empty()
+                               ? "no coding agents are installed"
+                               : "I can open " + known;
+            return result;
+        }
+        if (!in_path(agent->binary)) {
+            result.error = agent->label + " is not installed";
+            return result;
+        }
+        result.action = Action{ActionKind::OpenAgent, agent->key, 0};
+        return result;
+    }
+
+    if (kind == "run_crew") {
+        if (!in_path("ollamadev")) {
+            result.error = "the crew needs ollamadev, which is not installed";
+            return result;
+        }
+
+        // Deliberately ignoring whatever the model put in "target". The crew edits
+        // files, and the description of what to edit must be the user's own words
+        // rather than a paraphrase that may have drifted. The model decided the
+        // verb; that is all it is trusted with here.
+        const std::string task = crew_task_from_utterance(context.utterance);
+        if (task.empty()) {
+            result.error = "I did not catch what the crew should work on";
+            return result;
+        }
+        result.action = Action{ActionKind::RunCrew, task, 0};
+        return result;
+    }
+
+    if (kind == "crew_resume") {
+        if (!crew_available()) {
+            result.error = "the crew needs ollamadev, which is not installed";
+            return result;
+        }
+        result.action = Action{ActionKind::CrewResume, {}, 0};
+        return result;
+    }
+
+    if (kind == "show_board") {
+        if (!crew_available()) {
+            result.error = "the crew needs ollamadev, which is not installed";
+            return result;
+        }
+        result.action = Action{ActionKind::ShowBoard, {}, 0};
+        return result;
+    }
+
+    if (kind == "crew_accept" || kind == "crew_discard" || kind == "crew_steer") {
+        if (!crew_available()) {
+            result.error = "the crew needs ollamadev, which is not installed";
+            return result;
+        }
+
+        // The number is checked against the board that actually exists. This is the
+        // same rule as focus_window never trusting a model-supplied window id: a
+        // hallucinated 7 must not apply somebody else's changeset just because the
+        // integer parsed. Accept and discard are not reversible.
+        const auto items = board_items();
+        if (items.empty()) {
+            result.error = "the crew is not holding anything right now";
+            return result;
+        }
+        const auto item = board_item(items, number);
+        if (!item) {
+            std::string held;
+            for (const auto& i : items) {
+                if (!held.empty()) held += ", ";
+                held += std::to_string(i.n);
+            }
+            result.error = "there is no change " + std::to_string(number) +
+                           " on the board; it is holding " + held;
+            return result;
+        }
+
+        if (kind == "crew_accept") {
+            result.action = Action{ActionKind::CrewAccept, item->summary, number};
+            return result;
+        }
+        if (kind == "crew_discard") {
+            result.action = Action{ActionKind::CrewDiscard, item->summary, number};
+            return result;
+        }
+
+        // Steer carries free text to a running coder. Same rule as run_crew: the
+        // words are the user's, taken from the transcript, never the model's.
+        const std::string instruction = crew_task_from_utterance(context.utterance);
+        if (instruction.empty()) {
+            result.error = "I did not catch what to tell the coder";
+            return result;
+        }
+        result.action = Action{ActionKind::CrewSteer, instruction, number};
+        return result;
+    }
+
+    if (kind == "pan_canvas") {
+        const std::string where = lower(target);
+        for (const char* allowed : {"left", "right", "up", "down", "home"}) {
+            if (where == allowed) {
+                result.action = Action{ActionKind::PanCanvas, where, 0};
+                return result;
+            }
+        }
+        result.error = "I can pan left, right, up, down or home";
+        return result;
+    }
+
     if (kind == "answer") {
         if (target.empty()) {
             result.error = "the model returned an empty answer";
@@ -381,6 +614,55 @@ bool open_in_browser(const CommandContext& context, const std::string& url) {
     // naming one. Config::resolve_commands() already put it first when present.
     const std::string opener = context.browser.empty() ? "xdg-open" : context.browser;
     return spawn_detached({opener, url});
+}
+
+// Launches argv and puts whatever window it produces onto the canvas.
+//
+// Shared by open_terminal and open_agent because the hard part is identical and
+// worth having in one place: there is no portable way to ask "which window did this
+// pid create" -- a terminal may hand the request to an already-running server
+// process, so the pid that appears is not the pid that was forked. Diffing the
+// window list before and after is the only thing that works across terminals.
+ExecResult launch_onto_canvas(const CommandContext& context,
+                              const std::vector<std::string>& argv,
+                              const std::string& placed_message,
+                              const std::string& failure_message) {
+    if (argv.empty()) return {false, failure_message};
+
+    if (!context.canvas) {
+        // Still useful without a canvas: just launch it normally.
+        if (!spawn_detached(argv)) return {false, failure_message};
+        return {true, placed_message};
+    }
+
+    std::vector<std::string> before;
+    for (const auto& window : list_user_windows()) before.push_back(window.id);
+
+    if (!spawn_detached(argv)) return {false, failure_message};
+
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        for (const auto& window : list_user_windows()) {
+            if (std::find(before.begin(), before.end(), window.id) != before.end()) {
+                continue;
+            }
+            // Canvas-mode bars are overlays. They stay usable because they are
+            // sticky/above, but they do not cut edges out of the infinite plane.
+            context.canvas->set_insets(0, 0);
+
+            // Size the slot from the window's own geometry, so a terminal that
+            // remembers a large size is not overlapped by the next one.
+            int tile_w = 640, tile_h = 420;
+            if (const auto geometry = display().window_geometry(window.id)) {
+                tile_w = std::max(200, geometry->width);
+                tile_h = std::max(150, geometry->height);
+            }
+            context.canvas->place_next(window.id, tile_w, tile_h);
+            apply_positions(context.canvas->resolve(), context.monitor);
+            return {true, placed_message};
+        }
+    }
+    return {true, placed_message};   // launched, just not seen in time
 }
 
 }  // namespace
@@ -434,6 +716,120 @@ ExecResult execute_action(const Action& action, const CommandContext& context) {
                 return {false, "I could not open the browser"};
             }
             return {true, "Searching for " + action.target};
+        }
+
+        case ActionKind::OpenTerminal: {
+            if (context.terminal.empty()) {
+                return {false, "no terminal is configured"};
+            }
+            return launch_onto_canvas(context, {context.terminal},
+                                      "Terminal placed on the canvas",
+                                      "I could not start the terminal");
+        }
+
+        case ActionKind::OpenAgent: {
+            if (context.terminal.empty()) {
+                return {false, "no terminal is configured"};
+            }
+            // action.target is a key that already survived resolve_agent() during
+            // parsing. Looking it up again rather than carrying the binary through
+            // the Action means the executable is read from the table at the point of
+            // use -- an Action built by hand, or replayed from somewhere else, still
+            // cannot smuggle a binary in.
+            const auto agent = resolve_agent(action.target);
+            if (!agent) return {false, "I do not know that agent"};
+
+            const auto argv = agent_terminal_command(context.terminal, *agent);
+            return launch_onto_canvas(context, argv,
+                                      agent->label + " opened on the canvas",
+                                      "I could not start " + agent->label);
+        }
+
+        case ActionKind::RunCrew: {
+            if (context.terminal.empty()) {
+                return {false, "no terminal is configured"};
+            }
+            // argv, not a shell string: the task is one argument however many
+            // spaces, quotes or semicolons it contains.
+            std::vector<std::string> argv = split_words(context.terminal);
+            argv.push_back("-e");
+            argv.push_back("ollamadev");
+            argv.push_back("crew");
+            argv.push_back(action.target);
+
+            return launch_onto_canvas(context, argv,
+                                      "Crew working on: " + action.target,
+                                      "I could not start the crew");
+        }
+
+        case ActionKind::CrewResume: {
+            if (context.terminal.empty()) return {false, "no terminal is configured"};
+            // On the canvas, like run_crew: resuming re-plans and re-runs coders, so
+            // it is a long job with output worth watching, not a fire-and-forget.
+            std::vector<std::string> argv = split_words(context.terminal);
+            argv.push_back("-e");
+            const auto resume = crew_resume_command();
+            argv.insert(argv.end(), resume.begin(), resume.end());
+            return launch_onto_canvas(context, argv, "Resuming the crew run",
+                                      "I could not reach the crew");
+        }
+
+        case ActionKind::ShowBoard: {
+            const auto items = board_items();
+            if (items.empty()) return {true, "The crew is not holding anything"};
+
+            std::string spoken = std::to_string(items.size()) +
+                                 (items.size() == 1 ? " change held: " : " changes held: ");
+            for (std::size_t i = 0; i < items.size(); ++i) {
+                if (i) spoken += "; ";
+                spoken += std::to_string(items[i].n) + ", " + items[i].summary;
+            }
+            return {true, spoken};
+        }
+
+        case ActionKind::CrewAccept: {
+            const auto argv = crew_accept_command(action.number);
+            if (argv.empty()) return {false, "that is not a change I can accept"};
+            if (!spawn_detached(argv)) return {false, "I could not run the crew"};
+            return {true, "Accepting change " + std::to_string(action.number)};
+        }
+
+        case ActionKind::CrewDiscard: {
+            const auto argv = crew_discard_command(action.number);
+            if (argv.empty()) return {false, "that is not a change I can discard"};
+            if (!spawn_detached(argv)) return {false, "I could not run the crew"};
+            return {true, "Discarding change " + std::to_string(action.number)};
+        }
+
+        case ActionKind::CrewSteer: {
+            const auto argv = crew_steer_command(action.number, action.target);
+            if (argv.empty()) return {false, "I need something to tell the coder"};
+            if (!spawn_detached(argv)) return {false, "I could not reach the crew"};
+            return {true, "Told coder " + std::to_string(action.number) + ": " + action.target};
+        }
+
+        case ActionKind::PanCanvas: {
+            if (!context.canvas) return {false, "the canvas is not running"};
+
+            const auto& viewport = context.canvas->viewport();
+            // Pan by three quarters of a screen: a full screen loses all context,
+            // and a small step needs too many commands to be useful by voice.
+            const int step_x = viewport.width  * 3 / 4;
+            const int step_y = viewport.height * 3 / 4;
+
+            if (action.target == "home") {
+                Viewport home = viewport;
+                home.x = 0;
+                home.y = 0;
+                context.canvas->set_viewport(home);
+            } else if (action.target == "left")  context.canvas->pan_by(-step_x, 0);
+            else if (action.target == "right")   context.canvas->pan_by(step_x, 0);
+            else if (action.target == "up")      context.canvas->pan_by(0, -step_y);
+            else if (action.target == "down")    context.canvas->pan_by(0, step_y);
+
+            apply_positions(context.canvas->resolve(), context.monitor);
+            return {true, action.target == "home" ? "Back to the origin"
+                                                  : "Panned " + action.target};
         }
 
         case ActionKind::SetVolume: {

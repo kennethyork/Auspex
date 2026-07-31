@@ -101,8 +101,20 @@ right-click it to open the chat window.
 (xfwm4, marco, openbox, i3, KWin-X11, Mutter-X11). **Wayland is not supported** —
 that would need `gtk4-layer-shell` instead.
 
-**Runtime:** `xdotool`, `wmctrl`, `xprop`, `xwininfo`, `xclip`, `xdg-utils`,
-[ollama](https://ollama.com), and `piper` or `espeak-ng`.
+**Runtime, required** — the panel cannot place or dock itself without these:
+`xrandr` (monitor geometry), `wmctrl`, `xdotool`, `xprop`, `xwininfo`.
+
+**Runtime, optional** — each one costs exactly one feature: `xclip` (reading the
+primary selection, so speak-selection and "ask about this"), `xdg-utils`
+(`open_path` / `open_url`), `pactl` **or** `wpctl` (volume), `xfconf-query` or
+`gsettings` (inheriting the desktop wallpaper onto the canvas),
+[ollama](https://ollama.com) (every AI feature), and `piper` or `espeak-ng` (speech).
+
+`bin/setup.sh` checks all of these **by binary rather than by package** and names
+what breaks for each one that is missing. Package names differ across the six
+supported package managers and only the apt set has been run on real hardware, so
+a wrong name elsewhere would otherwise surface much later as a feature that
+quietly does nothing.
 
 **GTK is optional.** Only the panel and its windows need gtkmm-4.0 and libadwaita.
 Without them `setup.sh` builds the CLI tools and the web UI, which together are a
@@ -127,6 +139,14 @@ runtime, so one config works across Xfce, GNOME, KDE, i3 and others.
 
 Leaving `terminal`, `launcher`, `settings_command` and `network_command` empty is
 recommended — they are then detected at runtime.
+
+### Infinite canvas
+
+The X11 shell turns the primary monitor into an unbounded plane. The wallpaper
+stays fixed and both panels float above the plane without reserving its edges, so
+windows can pass behind the bars while panning and reappear on the other side.
+Drag the desktop or scroll to pan, use Ctrl+scroll or the panel's −/1:1/+ controls
+to zoom, press Home to return to the origin, and press F to fit the open windows.
 
 ## The web UI
 

@@ -52,7 +52,39 @@ private:
     std::vector<DesktopEntry> entries_;
     // Parallel to the visible rows, so a selection maps back to an entry.
     std::vector<const DesktopEntry*> visible_;
-    std::vector<std::unique_ptr<Gtk::Label>> rows_;
+    // ListBoxRow, not Label. Appending a bare widget to a GtkListBox makes GTK
+    // wrap it in a row it creates itself, so the widget's parent becomes that row
+    // and NOT the list -- at which point list.remove(widget) warns "Tried to
+    // remove non-child" and does nothing. Owning the rows explicitly is what makes
+    // removal work, and removal working is what makes the search filter.
+    std::vector<std::unique_ptr<Gtk::ListBoxRow>> rows_;
+};
+
+// What the crew is holding, and the two decisions you can make about each.
+//
+// Deliberately NOT a mirror of `ollamadev board` text: the reason an Auditor held
+// something is the part you actually read before deciding, so it gets equal weight
+// to the summary rather than being a dim second line.
+class BoardWindow : public Gtk::Window {
+public:
+    BoardWindow();
+
+    // Re-reads the board. Called on open and after every decision, because
+    // accepting one changeset can release or invalidate another.
+    void refresh();
+
+private:
+    void decide(int n, bool accept);
+
+    Gtk::Box            root_{Gtk::Orientation::VERTICAL, 8};
+    Gtk::Label          heading_;
+    Gtk::ScrolledWindow scroller_;
+    Gtk::Box            list_{Gtk::Orientation::VERTICAL, 8};
+    Gtk::Box            buttons_{Gtk::Orientation::HORIZONTAL, 8};
+    Gtk::Button         refresh_{"Refresh"};
+    Gtk::Button         close_{"Close"};
+
+    std::vector<std::unique_ptr<Gtk::Widget>> rows_;
 };
 
 // Conversation window. Replaces llm_menu.py, including its per-message actions:

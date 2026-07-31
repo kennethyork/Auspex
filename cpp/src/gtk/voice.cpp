@@ -298,8 +298,7 @@ void VoiceController::handle_utterance(const std::vector<float>& pcm, Action act
         switch (action) {
             case Action::Dictate:
                 post_status("Typing: " + result->text);
-                run({"xdotool", "type", "--clearmodifiers", "--delay", "12", result->text},
-                    false);
+                type_text(result->text);
                 break;
             case Action::Command:
                 dispatch_command(result->text);
@@ -442,9 +441,7 @@ void VoiceController::do_dictate() {
     if (!text) return;
 
     post_status("Typing: " + *text);
-    // --clearmodifiers stops a still-held panel click modifier from mangling the
-    // synthesised keystrokes.
-    if (!run({"xdotool", "type", "--clearmodifiers", "--delay", "12", *text}, false).ok) {
+    if (!type_text(*text)) {
         post_status("Could not type into the focused window");
     }
 }
@@ -501,7 +498,10 @@ void VoiceController::dispatch_command(const std::string& utterance) {
     post_status("Interpreting: " + utterance);
 
     CommandContext context = gather_context(config_);
+    context.utterance = utterance;
     context.history = history_snapshot();
+    context.canvas  = canvas_;
+    context.monitor = monitor_;
     OllamaClient ollama(config_);
 
     // json + disable_thinking: the reply has to be a parseable object, and a
@@ -544,18 +544,19 @@ void VoiceController::dispatch_command(const std::string& utterance) {
 }
 
 void VoiceController::do_speak_selection() {
-    // xclip rather than Gdk::Clipboard: the panel is a dock window and never holds
-    // focus, and the async clipboard API would have to marshal back to this thread
-    // anyway. This is also exactly what panel.py's context poller already used.
-    const auto selection = run({"xclip", "-o", "-selection", "primary"});
-    if (!selection.ok || trim(selection.out).empty()) {
+    // The primary selection rather than Gdk::Clipboard: the panel is a dock window
+    // and never holds focus, and the async clipboard API would have to marshal back
+    // to this thread anyway. This is also exactly what panel.py's context poller
+    // already used.
+    const auto selection = selected_text();
+    if (!selection) {
         post_status("Nothing selected");
         return;
     }
 
     post_status("Speaking selection...");
     std::string error;
-    if (!tts_.speak(trim(selection.out), &error)) {
+    if (!tts_.speak(*selection, &error)) {
         post_status("TTS failed: " + error);
         return;
     }

@@ -96,43 +96,46 @@ case "$PM" in
     apt-get)
         PKGS=(build-essential cmake ninja-build pkg-config libcurl4-openssl-dev
               nlohmann-json3-dev libgtk-4-dev libgtkmm-4.0-dev libadwaita-1-dev
-              glslc libvulkan-dev espeak-ng xdotool wmctrl x11-utils xclip
-              xdg-utils)
+              glslc libvulkan-dev espeak-ng xdotool wmctrl x11-utils
+              x11-xserver-utils xclip xdg-utils pulseaudio-utils)
         INSTALL=(sudo apt-get install -y)
         REFRESH=(sudo apt-get update)
         ;;
     dnf)
         PKGS=(gcc-c++ cmake ninja-build pkgconf-pkg-config libcurl-devel json-devel
               gtk4-devel gtkmm4.0-devel libadwaita-devel glslc vulkan-loader-devel
-              espeak-ng xdotool wmctrl xorg-x11-utils xclip xdg-utils)
+              espeak-ng xdotool wmctrl xorg-x11-utils xrandr xclip xdg-utils
+              pulseaudio-utils)
         INSTALL=(sudo dnf install -y)
         REFRESH=(true)
         ;;
     pacman)
         PKGS=(base-devel cmake ninja pkgconf curl nlohmann-json gtk4 gtkmm-4.0
               libadwaita shaderc vulkan-icd-loader espeak-ng xdotool wmctrl
-              xorg-xprop xorg-xwininfo xclip xdg-utils)
+              xorg-xprop xorg-xwininfo xorg-xrandr xclip xdg-utils libpulse)
         INSTALL=(sudo pacman -S --needed --noconfirm)
         REFRESH=(sudo pacman -Sy)
         ;;
     zypper)
         PKGS=(gcc-c++ cmake ninja pkg-config libcurl-devel nlohmann_json-devel
               gtk4-devel gtkmm4-devel libadwaita-devel shaderc vulkan-devel
-              espeak-ng xdotool wmctrl xprop xclip xdg-utils)
+              espeak-ng xdotool wmctrl xprop xrandr xclip xdg-utils
+              pulseaudio-utils)
         INSTALL=(sudo zypper install -y)
         REFRESH=(sudo zypper refresh)
         ;;
     apk)
         PKGS=(build-base cmake samurai pkgconf curl-dev nlohmann-json gtk4.0-dev
               gtkmm4-dev libadwaita-dev shaderc vulkan-loader-dev espeak-ng xdotool
-              wmctrl xprop xclip xdg-utils)
+              wmctrl xprop xrandr xclip xdg-utils pulseaudio-utils)
         INSTALL=(sudo apk add)
         REFRESH=(sudo apk update)
         ;;
     xbps-install)
         PKGS=(base-devel cmake ninja pkg-config libcurl-devel nlohmann_json
               gtk4-devel gtkmm4-devel libadwaita-devel shaderc Vulkan-Loader-devel
-              espeak-ng xdotool wmctrl xprop xclip xdg-utils)
+              espeak-ng xdotool wmctrl xprop xrandr xclip xdg-utils
+              pulseaudio-utils)
         INSTALL=(sudo xbps-install -y)
         REFRESH=(sudo xbps-install -S)
         ;;
@@ -344,6 +347,27 @@ fi
 # Ollama
 # ---------------------------------------------------------------------------
 info "\n== Language model =="
+# qwen3.5:9b, and NOT something smaller. This was measured, not assumed.
+#
+# The command path looks like it should be easy -- return one small JSON object
+# with an action and a target -- so a 2B seems more than sufficient. It is not.
+# On five ordinary launch phrases:
+#
+#   utterance                  9b                       2b
+#   "open firefox"             launch_app firefox       open_path ~/.mozilla/firefox
+#   "launch the text editor"   launch_app gedit         launch_app "text editor"
+#   "open my downloads folder" open_path ~/Downloads    open_path /home/user/downloads
+#   "open a terminal"          open_terminal            open_terminal
+#
+# 9b got 4/5; 2b got 1/5. The failures are not JSON errors -- the shape is always
+# right -- they are grounding errors: "firefox" becomes a path into a config
+# directory, and a home directory is invented rather than read. The validation
+# layer catches all of it and fails closed, so nothing dangerous happens; the
+# feature simply stops working.
+#
+# The knowledge needed to map "firefox" to a binary and "downloads" to ~/Downloads
+# is exactly what gets quantised away first. Do not shrink this to save power: the
+# model is idle between utterances and costs nothing at rest.
 OLLAMA_MODEL="qwen3.5:9b"
 if command -v ollama >/dev/null 2>&1; then
     good "ollama: $(command -v ollama)"
@@ -352,7 +376,10 @@ if command -v ollama >/dev/null 2>&1; then
         # `awk ... exit` SIGPIPEs ollama, which pipefail turns into a failed
         # assignment and set -e turns into a silent exit. Hence || true.
         FIRST=$(ollama list 2>/dev/null | awk 'NR>1 && $1 != "" {print $1; exit}' || true)
-        for candidate in qwen3.5:9b gpt-oss:latest "$FIRST"; do
+        # Capable-first. An earlier version of this list was ordered smallest-first
+        # to save power; the result was a shell that parsed every sentence into
+        # valid JSON and grounded almost none of it. See the note on OLLAMA_MODEL.
+        for candidate in qwen3.5:9b qwen3.5:27b gpt-oss:latest "$FIRST"; do
             if [ -n "$candidate" ] && ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$candidate"; then
                 OLLAMA_MODEL="$candidate"; break
             fi
@@ -456,6 +483,59 @@ else
 fi
 
 [ -n "$TTS_COMMAND" ] && good "TTS  : configured" || warn "TTS  : not configured"
+
+# ---------------------------------------------------------------------------
+# Runtime tools
+# ---------------------------------------------------------------------------
+# Checked by BINARY, not by package. Package names differ across the six managers
+# above and only the apt set has been run on real hardware, so a wrong name there
+# would otherwise fail silently and show up later as a feature that quietly does
+# nothing. Asking "is the binary on PATH" is the same question on every
+# distribution and cannot be got wrong.
+info "\n== Runtime tools =="
+
+MISSING_REQUIRED=()
+MISSING_OPTIONAL=()
+
+check_tool() {
+    # $1 binary, $2 required|optional, $3 what breaks without it
+    if command -v "$1" >/dev/null 2>&1; then
+        good "  $1"
+    elif [ "$2" = "required" ]; then
+        fail "  $1 — MISSING: $3"
+        MISSING_REQUIRED+=("$1")
+    else
+        warn "  $1 — missing: $3"
+        MISSING_OPTIONAL+=("$1")
+    fi
+}
+
+check_tool xrandr   required "no monitor geometry, so the panel cannot place or dock itself"
+check_tool wmctrl   required "no window or workspace list"
+check_tool xdotool  required "windows cannot be moved, resized or minimised; no dictation"
+check_tool xprop    required "panels cannot claim the dock layer, desktop cannot claim its own"
+check_tool xwininfo required "no window geometry, so the canvas cannot place anything"
+
+check_tool xclip    optional "speak-selection and \"ask about this\" read nothing"
+check_tool xdg-open optional "open_path and open_url cannot open anything"
+check_tool ollama   optional "no language model, so voice commands and chat are inert"
+
+if command -v pactl >/dev/null 2>&1 || command -v wpctl >/dev/null 2>&1; then
+    good "  pactl/wpctl"
+else
+    warn "  pactl/wpctl — missing: the set_volume command cannot change the volume"
+    MISSING_OPTIONAL+=("pulseaudio-utils or wireplumber")
+fi
+
+if [ ${#MISSING_REQUIRED[@]} -gt 0 ]; then
+    fail "\nThe panel will not work without: ${MISSING_REQUIRED[*]}"
+    fail "Install them and re-run. On Debian/Ubuntu these come from"
+    fail "x11-xserver-utils, wmctrl, xdotool and x11-utils."
+elif [ ${#MISSING_OPTIONAL[@]} -gt 0 ]; then
+    warn "\nUsable, with the gaps listed above: ${MISSING_OPTIONAL[*]}"
+else
+    good "\nAll runtime tools present."
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

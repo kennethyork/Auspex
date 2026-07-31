@@ -40,7 +40,10 @@ int main(int argc, char** argv) {
         std::string utterance = args[1];
         for (std::size_t i = 2; i < args.size(); ++i) utterance += " " + args[i];
 
-        const auspex::CommandContext context = auspex::gather_context(cfg);
+        auspex::CommandContext context = auspex::gather_context(cfg);
+        // run_crew takes the user's own words as its argument, never the
+        // model's paraphrase, so the transcript has to reach execute_action.
+        context.utterance = utterance;
         const auto reply = ollama.generate(
             cfg.ollama_model, auspex::build_command_prompt(utterance, context),
             auspex::GenerateOptions{.num_predict = 200,

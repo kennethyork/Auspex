@@ -13,7 +13,10 @@
 #include <adwaita.h>
 #include <gtkmm/application.h>
 
+#include "auspex/canvas.hpp"
 #include "auspex/config.hpp"
+#include "auspex/desktop.hpp"
+#include "auspex/gtk/desktop_window.hpp"
 #include "auspex/gtk/panel.hpp"
 #include "auspex/gtk/theming.hpp"
 #include "auspex/gtk/voice.hpp"
@@ -43,10 +46,12 @@ int main(int argc, char** argv) {
     // panels and the voice worker.
     const auspex::Config config = auspex::Config::load();
 
-    std::unique_ptr<auspex::gtk::ThemeManager>    theme;
-    std::unique_ptr<auspex::gtk::VoiceController> voice;
-    std::unique_ptr<auspex::gtk::Panel>           top;
-    std::unique_ptr<auspex::gtk::Panel>           bottom;
+    std::unique_ptr<auspex::Canvas>                canvas;
+    std::unique_ptr<auspex::gtk::ThemeManager>     theme;
+    std::unique_ptr<auspex::gtk::VoiceController>  voice;
+    std::unique_ptr<auspex::gtk::DesktopWindow>    desktop;
+    std::unique_ptr<auspex::gtk::Panel>            top;
+    std::unique_ptr<auspex::gtk::Panel>            bottom;
 
     app->signal_activate().connect([&] {
         // activate can fire more than once (a second launch of a non-unique app
@@ -62,9 +67,49 @@ int main(int argc, char** argv) {
 
         voice = std::make_unique<auspex::gtk::VoiceController>(config);
 
+        const auto monitor = auspex::primary_monitor();
+        const auspex::Rect bounds =
+            monitor ? monitor->bounds : auspex::Rect{0, 0, 1920, 1080};
+
+        // The infinite canvas over real windows. The viewport is the primary
+        // monitor; the panels and desktop substrate are never adopted, so the
+        // wallpaper and both bars stay put no matter how far it pans.
+        canvas = std::make_unique<auspex::Canvas>();
+        canvas->set_viewport({.x = 0, .y = 0, .width = bounds.width,
+                              .height = bounds.height});
+        voice->set_canvas(canvas.get(), bounds);
+
+        desktop =
+            std::make_unique<auspex::gtk::DesktopWindow>(config, *canvas, bounds);
+        desktop->set_monitor_changed_handler(
+            [&](const auspex::Rect& changed) {
+                voice->set_canvas(canvas.get(), changed);
+            });
+
+        app->add_window(*desktop);
+        desktop->present();
+
         top = std::make_unique<auspex::gtk::Panel>(config, auspex::PanelPosition::Top, *voice);
         bottom =
             std::make_unique<auspex::gtk::Panel>(config, auspex::PanelPosition::Bottom, *voice);
+
+        // The panel's zoom buttons drive the same canvas the desktop surface does,
+        // so the two controls cannot disagree about the current zoom.
+        top->set_zoom_handler([&](double factor) {
+            if (factor <= 0.0) desktop->reset_zoom();
+            else               desktop->zoom_by(factor);
+        });
+        top->set_grid_handler([&] { desktop->fit_all(); });
+        top->set_window_restore_handler(
+            [&](const std::string& id) { desktop->restore_managed_window(id); });
+        top->set_window_full_handler(
+            [&](const std::string& id) { desktop->full_managed_window(id); });
+
+        const auto panel_geometry = [&](auspex::PanelPosition position, int height) {
+            desktop->set_panel_height(position, height);
+        };
+        top->set_geometry_handler(panel_geometry);
+        bottom->set_geometry_handler(panel_geometry);
 
         app->add_window(*top);
         app->add_window(*bottom);
@@ -78,6 +123,9 @@ int main(int argc, char** argv) {
     top.reset();
     bottom.reset();
     voice.reset();
+    // The desktop window borrows the canvas, so it goes first.
+    desktop.reset();
+    canvas.reset();
     theme.reset();
     return status;
 }

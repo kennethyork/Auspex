@@ -287,6 +287,7 @@ WebUi::WebUi(Config config)
         const std::string text = body.value("text", std::string{});
 
         CommandContext context = gather_context(config_);
+        context.utterance = text;
         context.history = impl_->snapshot();
 
         OllamaClient ollama(config_);

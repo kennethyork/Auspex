@@ -20,6 +20,9 @@
 #include <gtkmm/applicationwindow.h>
 #include <gtkmm/box.h>
 #include <gtkmm/button.h>
+#include <gtkmm/popover.h>
+#include <gtkmm/separator.h>
+#include <gtkmm/alertdialog.h>
 #include <gtkmm/image.h>
 #include <gtkmm/label.h>
 #include <gtkmm/gestureclick.h>
@@ -52,14 +55,46 @@ class WindowList : public Gtk::Box {
 public:
     WindowList();
 
+    void set_restore_handler(sigc::slot<void(const std::string&)> handler) {
+        on_restore_ = std::move(handler);
+    }
+    void set_full_handler(sigc::slot<void(const std::string&)> handler) {
+        on_full_ = std::move(handler);
+    }
+
 private:
     void poll();
+
+    // Clicking a task button does what xfce4-panel's does: it toggles. Clicking the
+    // window you are already in minimises it; clicking any other one brings it up,
+    // de-iconifying if it was minimised. One button, both directions -- which is the
+    // only way a task list is usable without a separate minimise control.
+    void toggle(const std::string& window_id);
+
+    // Right-click a task button for the things a click cannot express: closing it,
+    // and minimising one that is not currently focused. Without this there is no
+    // way to close an application from inside Auspex at all -- you had to go to the
+    // window's own titlebar, which the canvas may have moved off screen.
+    void show_window_menu(const std::string& window_id, Gtk::Widget& anchor);
 
     struct Entry {
         std::unique_ptr<Gtk::Button> button;
         std::string title;
+        // Tracked so the label and styling are only touched when they change:
+        // rewriting them every second forces a relayout of the whole panel.
+        bool minimized = false;
+        bool active    = false;
     };
     std::map<std::string, Entry> entries_;
+
+    // One popover reused for every button rather than one per window: the task list
+    // churns as windows open and close, and a popover per entry would be built and
+    // destroyed with them.
+    Gtk::Popover menu_;
+    Gtk::Box     menu_box_{Gtk::Orientation::VERTICAL, 4};
+    std::string  menu_target_;
+    sigc::slot<void(const std::string&)> on_restore_;
+    sigc::slot<void(const std::string&)> on_full_;
 };
 
 // CPU/RAM/GPU/VRAM readout.
@@ -105,7 +140,39 @@ private:
     void show_launcher();
     void show_settings();
     void show_chat();
+    void show_board();
+
+public:
+    // Wired by the shell to the DesktopWindow, which owns the canvas view. A
+    // factor of 0 means "back to life size".
+    void set_zoom_handler(sigc::slot<void(double)> handler) {
+        on_zoom_ = std::move(handler);
+    }
+    void set_grid_handler(sigc::slot<void()> handler) {
+        on_grid_ = std::move(handler);
+    }
+    void set_window_restore_handler(sigc::slot<void(const std::string&)> handler) {
+        if (windows_) windows_->set_restore_handler(std::move(handler));
+    }
+    void set_window_full_handler(sigc::slot<void(const std::string&)> handler) {
+        if (windows_) windows_->set_full_handler(std::move(handler));
+    }
+    void set_geometry_handler(sigc::slot<void(PanelPosition, int)> handler) {
+        on_geometry_ = std::move(handler);
+    }
+
+private:
+    sigc::slot<void(double)> on_zoom_;
+    sigc::slot<void()>       on_grid_;
+    sigc::slot<void(PanelPosition, int)> on_geometry_;
     void install_status_handler();
+
+    // Right-click menu. A panel with no way to close it is a panel you have to go
+    // to a terminal to get rid of, which is not something a desktop should ask of
+    // anyone -- and quitting must be a choice you make, never something a stray
+    // click does, hence a menu rather than a close button.
+    void show_panel_menu(double x, double y);
+    void confirm_quit();
     void dock();
     void refresh_geometry();
 
@@ -119,8 +186,23 @@ private:
 
     Gtk::Box box_{Gtk::Orientation::HORIZONTAL, 2};
 
+    Gtk::Popover menu_;
+    Gtk::Box     menu_box_{Gtk::Orientation::VERTICAL, 4};
+
     // Top
     Gtk::Button                          launcher_;
+
+    // Zoom controls live on the PANEL, not only on the desktop surface.
+    //
+    // Ctrl+scroll on the canvas works, but only where no window covers it -- and
+    // once auto-fit has laid windows out to fill the screen there is almost no bare
+    // desktop left to aim at. A control you can only reach when the canvas is
+    // nearly empty is not a control.
+    Gtk::Box                             zoom_box_{Gtk::Orientation::HORIZONTAL, 1};
+    Gtk::Button                          zoom_out_{"\u2212"};
+    Gtk::Button                          zoom_reset_{"1:1"};
+    Gtk::Button                          zoom_in_{"+"};
+    Gtk::Button                          grid_{"Grid"};
     std::unique_ptr<WorkspaceSwitcher>   workspaces_;
     std::unique_ptr<WindowList>          windows_;
     std::unique_ptr<SystemMonitorWidget> sysmon_;
@@ -152,6 +234,7 @@ private:
     std::unique_ptr<LauncherWindow> launcher_window_;
     std::unique_ptr<SettingsWindow> settings_window_;
     std::unique_ptr<ChatWindow>     chat_window_;
+    std::unique_ptr<BoardWindow>    board_window_;
 
     bool                       watching_geometry_ = false;
     std::optional<std::string> window_id_;

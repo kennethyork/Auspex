@@ -7,18 +7,26 @@
 //   auspex-selftest              run all checks
 //   auspex-selftest --css NAME   print a theme's stylesheet
 //   auspex-selftest --themes     list theme names
+#include <cstdlib>
 #include <iostream>
 #include <filesystem>
 #include <fstream>
 #include <locale>
+#include <memory>
 #include <ostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include "auspex/agents.hpp"
+#include "auspex/canvas.hpp"
 #include "auspex/commands.hpp"
+#include "auspex/crew.hpp"
 #include "auspex/desktop.hpp"
+#include "auspex/display.hpp"
 #include "auspex/desktop_entries.hpp"
 #include "auspex/panel_dock.hpp"
+#include "auspex/session.hpp"
 #include "auspex/sysmon.hpp"
 #include "auspex/voice_gate.hpp"
 #include "auspex/theme.hpp"
@@ -84,6 +92,15 @@ void test_css() {
     // The libadwaita selectors are the only way to reach those widgets from C++,
     // since libadwaitamm is not packaged. Losing them would silently unstyle the
     // settings window.
+    // Panel translucency is scoped to .auspex-panel. If that scoping were ever lost
+    // the rule would apply to `window` generally and every dialog would go
+    // see-through, so both halves are asserted: the class is present, and the alpha
+    // only ever appears alongside it.
+    check(css.find("window.auspex-panel") != std::string::npos,
+          "panel translucency is scoped to the panels");
+    check(css.find("alpha(#1a1b26, 0.95)") != std::string::npos,
+          "panels use xfce4-panel's own 95% background alpha");
+
     for (const char* selector : {"preferencespage", "preferencesgroup", "actionrow",
                                  ".navigationview", ".launcher-button", ".active-workspace",
                                  ".clock-label", ".recording", ".code-block"}) {
@@ -179,6 +196,12 @@ void test_layout() {
     const auto real = auspex::layout_for_height(monitor, 42, auspex::PanelPosition::Top);
     check_eq(real.bounds.height, 42, "layout_for_height uses the given pixel height");
     check(real.strut_partial.find("42") != std::string::npos, "strut reserves 42px");
+
+    const auto overlay = auspex::overlay_panel_layout(real);
+    check_eq(overlay.bounds, real.bounds, "overlay bar keeps its on-screen geometry");
+    check_eq(overlay.strut_partial,
+             std::string("0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0"),
+             "overlay bar reserves no edge, so the canvas continues behind it");
 }
 
 void test_desktop_parsing() {
@@ -248,6 +271,380 @@ void test_desktop_parsing() {
 
     check(auspex::parse_workspaces("").empty(), "empty input yields no workspaces");
     check(auspex::parse_windows("garbage\n").empty(), "unparseable lines are skipped");
+
+    // _NET_WORKAREA, one quadruple per workspace. Only the first is used.
+    const auto area = auspex::parse_workarea(
+        "_NET_WORKAREA(CARDINAL) = 0, 32, 1920, 1016, 0, 32, 1920, 1016\n");
+    check(area.has_value(), "workarea parsed");
+    if (area) {
+        check_eq(*area, (auspex::Rect{0, 32, 1920, 1016}),
+                 "workarea is the first quadruple, not the concatenation");
+    }
+    check(!auspex::parse_workarea("").has_value(), "empty workarea input yields nothing");
+    check(!auspex::parse_workarea("_NET_WORKAREA(CARDINAL) = 0, 32\n").has_value(),
+          "a truncated workarea is rejected rather than half-read");
+    check(!auspex::parse_workarea("_NET_WORKAREA(CARDINAL) = 0, 32, 0, 0\n").has_value(),
+          "a zero-sized workarea is rejected");
+
+    // xwininfo -id, trimmed to the four fields that matter plus noise around them.
+    const std::string xwininfo =
+        "xwininfo: Window id: 0x3400007 \"Firefox\"\n"
+        "\n"
+        "  Absolute upper-left X:  1920\n"
+        "  Absolute upper-left Y:  132\n"
+        "  Relative upper-left X:  0\n"
+        "  Width: 1280\n"
+        "  Height: 800\n"
+        "  Depth: 24\n"
+        "  -geometry 1280x800+1920+132\n";
+
+    const auto geometry = auspex::parse_window_geometry(xwininfo);
+    check(geometry.has_value(), "window geometry parsed");
+    if (geometry) {
+        check_eq(*geometry, (auspex::Rect{1920, 132, 1280, 800}),
+                 "absolute position and size extracted, relative ignored");
+    }
+    check(!auspex::parse_window_geometry("xwininfo: no such window\n").has_value(),
+          "geometry with no fields yields nothing");
+    check(!auspex::parse_window_geometry("  Width: 640\n  Height: 480\n").has_value(),
+          "geometry missing its position is rejected, not defaulted to 0,0");
+}
+
+// A DisplayServer that records what it was asked to do and answers from canned
+// values. This is what the seam bought: window placement, workspace switching and
+// panel docking can now be checked exactly, with no display server involved and no
+// risk of shoving the developer's real windows around while the tests run.
+class RecordingDisplay final : public auspex::DisplayServer {
+public:
+    std::vector<std::string>                       unmaximized;
+    std::vector<std::string>                       maximized;
+    std::vector<std::tuple<std::string, int, int>> moves;
+    std::vector<std::tuple<std::string, int, int>> resizes;
+    std::vector<std::pair<std::string, auspex::Rect>> desktop_placements;
+    std::optional<std::string>                     canned_wallpaper;
+    std::vector<auspex::PlacedWindow>              canned_placed;
+    std::vector<std::string>                       canned_visible;
+    std::optional<std::string>                     canned_focus_id;
+    std::vector<std::string>                       minimized;
+    std::vector<std::string>                       restored;
+    std::vector<std::string>                       closed;
+    std::optional<auspex::FrameExtents>            canned_extents;
+    std::vector<auspex::Workspace>                 canned_workspaces;
+    std::optional<auspex::Rect>                    canned_geometry;
+    int  workspace_requests = 0;
+    int  last_workspace_requested = -1;
+    bool accept_workspace = true;
+    bool honour_workspace = true;   // whether workspaces() reflects the request
+
+    std::string_view name() const override { return "recording"; }
+    bool available() const override { return true; }
+
+    std::vector<auspex::MonitorInfo> monitors() override { return {}; }
+
+    std::vector<auspex::Workspace> workspaces() override { return canned_workspaces; }
+
+    bool set_workspace(int index) override {
+        ++workspace_requests;
+        last_workspace_requested = index;
+        if (accept_workspace && honour_workspace) {
+            for (auto& workspace : canned_workspaces) {
+                workspace.active = (workspace.index == index);
+            }
+        }
+        return accept_workspace;
+    }
+
+    std::optional<auspex::Rect> workarea() override { return std::nullopt; }
+
+    std::vector<auspex::WindowEntry> windows() override { return {}; }
+    std::vector<auspex::PlacedWindow> windows_with_geometry() override {
+        return canned_placed;
+    }
+    bool activate_window(std::string_view) override { return true; }
+
+    std::optional<auspex::Rect> window_geometry(std::string_view) override {
+        return canned_geometry;
+    }
+
+    bool move_window(std::string_view id, int x, int y) override {
+        moves.emplace_back(std::string(id), x, y);
+        return true;
+    }
+    bool resize_window(std::string_view id, int width, int height) override {
+        resizes.emplace_back(std::string(id), width, height);
+        return true;
+    }
+
+    bool maximize_window(std::string_view id) override {
+        maximized.emplace_back(id);
+        return true;
+    }
+
+    bool minimize_window(std::string_view id) override {
+        minimized.emplace_back(id);
+        return true;
+    }
+    bool restore_window(std::string_view id) override {
+        restored.emplace_back(id);
+        return true;
+    }
+    bool close_window(std::string_view id) override {
+        closed.emplace_back(id);
+        return true;
+    }
+    std::optional<auspex::FrameExtents> frame_extents(std::string_view) override {
+        return canned_extents;
+    }
+    std::vector<std::string> visible_windows() override { return canned_visible; }
+    std::optional<std::string> focused_window_id() override { return canned_focus_id; }
+
+    bool unmaximize_window(std::string_view id) override {
+        unmaximized.emplace_back(id);
+        return true;
+    }
+    bool window_is_maximized(std::string_view) override { return false; }
+
+    std::optional<std::string> focused_window_title() override { return std::nullopt; }
+    std::optional<std::string> find_own_window(std::string_view) override {
+        return std::nullopt;
+    }
+    bool dock_panel(std::string_view, const auspex::PanelLayout&) override { return true; }
+
+    bool place_desktop_window(std::string_view id, const auspex::Rect& bounds) override {
+        desktop_placements.emplace_back(std::string(id), bounds);
+        return true;
+    }
+
+    std::optional<std::string> current_wallpaper() override { return canned_wallpaper; }
+
+    bool type_text(std::string_view) override { return true; }
+    std::optional<std::string> primary_selection() override { return std::nullopt; }
+};
+
+void test_display_seam() {
+    std::cout << "display seam\n";
+
+    // The null backend: every query empty, every command false, nothing crashes.
+    // This is what a pure Wayland session gets until a Wayland backend exists.
+    {
+        auspex::set_display_server(auspex::make_null_display());
+        check_eq(std::string(auspex::display().name()), std::string("none"),
+                 "null backend reports its name");
+        check(!auspex::display().available(), "null backend is not available");
+        check(auspex::list_windows().empty(), "no windows without a display server");
+        check(auspex::list_workspaces().empty(), "no workspaces without a display server");
+        check(!auspex::current_workarea().has_value(), "no workarea without a display server");
+        check(!auspex::activate_window("0x1"), "activate fails softly");
+        check(!auspex::switch_workspace(2), "workspace switch fails softly");
+        check(!auspex::type_text("hello"), "typing fails softly");
+        check(!auspex::selected_text().has_value(), "no selection without a display server");
+        check(!auspex::focused_window_title().has_value(), "no focused title");
+    }
+
+    // apply_positions: the canvas-to-screen arithmetic, now checkable exactly.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        auspex::set_display_server(std::move(recorder));
+
+        const auspex::Rect monitor{100, 50, 1920, 1080};
+        const std::vector<auspex::ScreenPosition> positions{
+            {.id = "0xA", .x = 10, .y = 20, .visible = true},
+            {.id = "0xB", .x = -2500, .y = 1200, .visible = false},
+        };
+        check(auspex::apply_positions(positions, monitor), "apply_positions succeeds");
+
+        check_eq(rec->moves.size(), std::size_t{2}, "both windows were moved");
+        check_eq(rec->unmaximized.size(), std::size_t{0},
+                 "panning does not cancel a window's full/maximised state");
+        if (rec->moves.size() == 2) {
+            check(rec->moves[0] == std::make_tuple(std::string("0xA"), 110, 70),
+                  "a visible window is offset by the monitor origin");
+            check(rec->moves[1] == std::make_tuple(std::string("0xB"), -2400, 1250),
+                  "an off-viewport window keeps following its canvas coordinates");
+        }
+    }
+
+    // switch_workspace's confirm-poll: the policy that stayed above the seam.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        rec->canned_workspaces = {{.index = 0, .active = true, .name = "One"},
+                                  {.index = 1, .active = false, .name = "Two"}};
+        auspex::set_display_server(std::move(recorder));
+
+        check(auspex::switch_workspace(1), "a switch the backend honours is confirmed");
+        check_eq(rec->last_workspace_requested, 1, "the requested index reached the backend");
+        check_eq(auspex::current_workspace().value_or(-1), 1, "the switch is observable");
+
+        check(!auspex::switch_workspace(-1), "a negative workspace is refused");
+        check_eq(rec->workspace_requests, 1,
+                 "a negative workspace never reaches the backend");
+    }
+
+    // A backend that accepts the request but never actually switches must be
+    // reported as a failure, not silently believed.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        rec->canned_workspaces = {{.index = 0, .active = true, .name = "One"},
+                                  {.index = 1, .active = false, .name = "Two"}};
+        rec->honour_workspace  = false;
+        auspex::set_display_server(std::move(recorder));
+
+        check(!auspex::switch_workspace(1),
+              "a request that is accepted but never takes effect reports failure");
+    }
+
+    // A backend that refuses outright fails immediately, without the poll.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        rec->accept_workspace = false;
+        auspex::set_display_server(std::move(recorder));
+
+        check(!auspex::switch_workspace(1), "a refused request fails");
+        check_eq(rec->workspace_requests, 1, "and is attempted exactly once");
+    }
+
+    // Detection. DISPLAY wins even alongside WAYLAND_DISPLAY, because that pair is
+    // XWayland, where the X11 helpers do work.
+    {
+        const char* saved_display = std::getenv("DISPLAY");
+        const char* saved_wayland = std::getenv("WAYLAND_DISPLAY");
+        const std::string display_value = saved_display ? saved_display : "";
+        const std::string wayland_value = saved_wayland ? saved_wayland : "";
+
+        ::setenv("DISPLAY", ":0", 1);
+        ::unsetenv("WAYLAND_DISPLAY");
+        check_eq(std::string(auspex::detect_display_server()->name()), std::string("x11"),
+                 "DISPLAY alone selects the X11 backend");
+
+        ::setenv("WAYLAND_DISPLAY", "wayland-0", 1);
+        check_eq(std::string(auspex::detect_display_server()->name()), std::string("x11"),
+                 "DISPLAY plus WAYLAND_DISPLAY is XWayland, so X11 still wins");
+
+        ::unsetenv("DISPLAY");
+        check_eq(std::string(auspex::detect_display_server()->name()), std::string("none"),
+                 "pure Wayland gets the null backend, not a doomed X11 one");
+
+        ::unsetenv("WAYLAND_DISPLAY");
+        check_eq(std::string(auspex::detect_display_server()->name()), std::string("none"),
+                 "no display at all gets the null backend");
+
+        if (saved_display) ::setenv("DISPLAY", display_value.c_str(), 1);
+        if (saved_wayland) ::setenv("WAYLAND_DISPLAY", wayland_value.c_str(), 1);
+    }
+
+    // Hand the process back its real backend, so the live checks that follow (and
+    // --desktop / --monitors) talk to the session again.
+    auspex::set_display_server(nullptr);
+    check(auspex::display().name() != std::string_view("recording"),
+          "the real backend is restored after the seam tests");
+}
+
+void test_session() {
+    std::cout << "session supervision\n";
+
+    const auspex::RestartPolicy policy;   // 5 crashes / 300s, 3s apart, 300s cooldown
+
+    // An isolated crash restarts promptly.
+    {
+        std::vector<std::int64_t> crashes;
+        const auto plan = auspex::plan_restart(crashes, 1000, policy);
+        check(plan.restart, "a single crash restarts");
+        check(!plan.exhausted, "and is not treated as a loop");
+        check_eq(plan.delay_seconds, 3, "with the ordinary backoff");
+    }
+
+    // Five rapid crashes is a loop: the fifth waits out the cooldown.
+    {
+        std::vector<std::int64_t> crashes;
+        auspex::RestartPlan plan;
+        for (int i = 0; i < 5; ++i) plan = auspex::plan_restart(crashes, 1000 + i, policy);
+        check(plan.restart, "the fifth rapid crash still restarts");
+        check_eq(plan.delay_seconds, 300, "but only after the cooldown");
+        check(!plan.exhausted, "the shell is not abandoned yet");
+
+        // A sixth inside the same window means the cooldown did not help.
+        plan = auspex::plan_restart(crashes, 1006, policy);
+        check(plan.exhausted, "a crash after the cooldown abandons the shell");
+        check(!plan.restart, "and stops restarting it");
+    }
+
+    // Crashes spread beyond the window are not a loop. start.sh got this wrong: it
+    // reset the counter only when the LAST crash was old, so four crashes spread
+    // over an hour still counted as four the moment a fifth arrived.
+    {
+        std::vector<std::int64_t> crashes;
+        auspex::RestartPlan plan;
+        for (int i = 0; i < 4; ++i) {
+            plan = auspex::plan_restart(crashes, 1000 + i * 1000, policy);   // ~17min apart
+        }
+        check_eq(plan.delay_seconds, 3, "crashes spread over hours are not a loop");
+        check(!plan.exhausted, "and never abandon the shell");
+        check_eq(crashes.size(), std::size_t{1},
+                 "stale crashes are dropped from the history, not merely ignored");
+    }
+
+    // Four rapid crashes, then a long quiet period, then another burst. The history
+    // must have aged out, so the second burst gets the full allowance again.
+    {
+        std::vector<std::int64_t> crashes;
+        for (int i = 0; i < 4; ++i) auspex::plan_restart(crashes, 1000 + i, policy);
+        const auto plan = auspex::plan_restart(crashes, 1000 + 4000, policy);
+        check_eq(plan.delay_seconds, 3, "a burst is forgiven after the window passes");
+        check_eq(crashes.size(), std::size_t{1}, "only the recent crash is retained");
+    }
+
+    // Candidate lists: the ordering is a decision, so pin the head of each.
+    {
+        check_eq(auspex::window_manager_candidates().front(), std::string("xfwm4"),
+                 "xfwm4 is the preferred WM -- what the panel was developed against");
+        check(!auspex::compositor_candidates().empty(), "compositors are listed");
+        check(!auspex::polkit_agent_candidates().empty(), "polkit agents are listed");
+        check(!auspex::xsettings_daemon_candidates().empty(), "xsettings daemons listed");
+
+        // i3 tiles, which fights the canvas, so it must never be preferred.
+        const auto& wms = auspex::window_manager_candidates();
+        check(wms.back() == "i3", "i3 is the last resort, not a default");
+    }
+
+    // Wallpaper argv: each tool spells "scale to fill" differently and a wrong flag
+    // silently tiles or letterboxes rather than failing.
+    {
+        check(auspex::wallpaper_command("feh", "/a.png") ==
+                  std::vector<std::string>{"feh", "--bg-fill", "/a.png"},
+              "feh uses --bg-fill");
+        check(auspex::wallpaper_command("xwallpaper", "/a.png") ==
+                  std::vector<std::string>{"xwallpaper", "--zoom", "/a.png"},
+              "xwallpaper uses --zoom");
+        check(auspex::wallpaper_command("hsetroot", "/a.png") ==
+                  std::vector<std::string>{"hsetroot", "-fill", "/a.png"},
+              "hsetroot uses -fill");
+        check(auspex::wallpaper_command("nitrogen", "/a.png").empty(),
+              "an unrecognised tool yields no command rather than a guess");
+        check(auspex::wallpaper_command("feh", "").empty(),
+              "no image yields no command");
+        check(auspex::wallpaper_command("", "/a.png").empty(),
+              "no tool yields no command");
+    }
+
+    // Detection against the real PATH. This machine is Mint/Xfce, so a WM must
+    // resolve; the rest are allowed to be absent.
+    {
+        const auto components = auspex::detect_components();
+        check(!components.window_manager.empty(),
+              "a window manager resolves on this machine");
+        std::cout << "        wm=" << components.window_manager
+                  << " xsettings=" << (components.xsettings_daemon.empty()
+                                           ? "-" : components.xsettings_daemon)
+                  << " compositor=" << (components.compositor.empty()
+                                            ? "-" : components.compositor)
+                  << " wallpaper=" << (components.wallpaper_tool.empty()
+                                           ? "-" : components.wallpaper_tool)
+                  << "\n";
+    }
 }
 
 void test_commands() {
@@ -635,6 +1032,771 @@ void test_desktop_entries() {
     }
 }
 
+void test_canvas() {
+    std::cout << "infinite canvas\n";
+    using auspex::Canvas;
+    using auspex::CanvasPlacement;
+    using auspex::Viewport;
+
+    // At the origin viewport, canvas space and screen space coincide.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        canvas.place("0x1", {100, 200});
+        const auto resolved = canvas.resolve();
+        check_eq(resolved.size(), std::size_t{1}, "one managed window resolves");
+        if (!resolved.empty()) {
+            check_eq(resolved[0].x, 100, "origin viewport: screen x == canvas x");
+            check_eq(resolved[0].y, 200, "origin viewport: screen y == canvas y");
+            check(resolved[0].visible, "window inside the viewport is visible");
+        }
+    }
+
+    // Panning right moves the viewport right, so windows slide left on screen.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        canvas.place("0x1", {100, 100});
+        canvas.pan_by(500, 0);
+        const auto resolved = canvas.resolve();
+        check(!resolved.empty() && resolved[0].x == -400,
+              "pan right by 500 puts the window at screen x -400");
+    }
+
+    // A window scrolled far off the canvas parks (visible=false) instead of
+    // lingering half on screen.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 800});
+        canvas.place("0x1", {0, 0});
+        canvas.pan_by(2500, 0);
+        const auto resolved = canvas.resolve();
+        check(!resolved.empty() && !resolved[0].visible,
+              "window two screens away is parked");
+        canvas.pan_by(-2500, 0);
+        check(canvas.resolve()[0].visible, "panning back restores visibility");
+    }
+
+    // The drag fix: a user move must survive the next pan. Without
+    // note_screen_move, resolve() would snap the window back.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 300, .y = 0, .width = 1920, .height = 1080});
+        canvas.place("0x1", {400, 100});          // on screen at x=100
+        canvas.note_screen_move("0x1", 700, 350); // user dragged it
+        const auto placement = canvas.placement_of("0x1");
+        check(placement && placement->x == 1000 && placement->y == 350,
+              "screen drag converts back into canvas space");
+        canvas.pan_by(100, 0);
+        const auto resolved = canvas.resolve();
+        check(!resolved.empty() && resolved[0].x == 600,
+              "the drag survives a subsequent pan");
+    }
+
+    // place_next respects the panel insets and never stacks two tiles.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        canvas.set_insets(42, 42);   // what the bars actually reserve here
+        const auto first  = canvas.place_next("0x1", 640, 420);
+        const auto second = canvas.place_next("0x2", 640, 420);
+        check(first.y >= 42, "first tile starts below the top bar");
+        check(!(first == second), "second tile gets a different slot");
+        // 1080 - 84 usable = 996 -> 2 rows of 420; 3 columns of 640. 6 per page.
+        Canvas paging;
+        paging.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        paging.set_insets(42, 42);
+        CanvasPlacement seventh{};
+        for (int i = 0; i < 7; ++i) {
+            seventh = paging.place_next("0x" + std::to_string(i + 10), 640, 420);
+        }
+        check(seventh.x >= 1920, "the seventh tile overflows onto the next page right");
+    }
+
+    // focus_on centres the viewport on the window.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 800});
+        canvas.place("0x1", {5000, 4000});
+        check(canvas.focus_on("0x1", 600, 400), "focus_on finds the window");
+        const auto resolved = canvas.resolve();
+        check(!resolved.empty() && resolved[0].x == 200 && resolved[0].y == 200,
+              "focused window is centred in the viewport");
+        check(!canvas.focus_on("0xdead", 1, 1), "focus_on rejects an unknown id");
+    }
+
+    // Bounds cover everything managed.
+    {
+        Canvas canvas;
+        check(!canvas.content_bounds(100, 100).has_value(), "empty canvas has no bounds");
+        canvas.place("0x1", {0, 0});
+        canvas.place("0x2", {900, 500});
+        const auto bounds = canvas.content_bounds(100, 100);
+        check(bounds && bounds->width == 1000 && bounds->height == 600,
+              "bounds span all placements plus tile size");
+    }
+
+    // forget() releases a window from management.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        canvas.place("0x1", {0, 0});
+        canvas.forget("0x1");
+        check(!canvas.manages("0x1"), "forgotten window is unmanaged");
+        check(canvas.resolve().empty(), "and no longer resolves");
+    }
+
+    // --- adoption: the canvas is the desktop, so it takes every window ---------
+    using auspex::plan_canvas_sync;
+    using auspex::apply_canvas_sync;
+    using auspex::WindowEntry;
+
+    // An empty canvas adopts everything live, in the order given.
+    {
+        Canvas canvas;
+        const std::vector<WindowEntry> live{
+            {.id = "0xA", .workspace = 0, .title = "Firefox"},
+            {.id = "0xB", .workspace = 0, .title = "Terminal"},
+        };
+        const auto sync = plan_canvas_sync(live, canvas);
+        check_eq(sync.adopt.size(), std::size_t{2}, "both live windows are adopted");
+        check(sync.forget.empty(), "nothing to forget on an empty canvas");
+        check(sync.adopt[0] == "0xA" && sync.adopt[1] == "0xB",
+              "adoption order follows the live list, so tile slots stay stable");
+    }
+
+    // A steady state produces no work at all -- this is what stops the one-second
+    // reconcile timer from moving every window on the screen once a second.
+    {
+        Canvas canvas;
+        canvas.place("0xA", {0, 0});
+        canvas.place("0xB", {100, 0});
+        const std::vector<WindowEntry> live{
+            {.id = "0xA", .workspace = 0, .title = "Firefox"},
+            {.id = "0xB", .workspace = 0, .title = "Terminal"},
+        };
+        check(plan_canvas_sync(live, canvas).empty(),
+              "an unchanged window list is a no-op, not a reshuffle");
+    }
+
+    // A closed window is dropped.
+    {
+        Canvas canvas;
+        canvas.place("0xA", {0, 0});
+        canvas.place("0xGONE", {500, 0});
+        const std::vector<WindowEntry> live{{.id = "0xA", .workspace = 0, .title = "Firefox"}};
+        const auto sync = plan_canvas_sync(live, canvas);
+        check(sync.adopt.empty(), "nothing new to adopt");
+        check_eq(sync.forget.size(), std::size_t{1}, "the closed window is forgotten");
+        check(sync.forget[0] == "0xGONE", "and it is the right one");
+    }
+
+    // Adopt and forget in the same pass.
+    {
+        Canvas canvas;
+        canvas.place("0xOLD", {0, 0});
+        const std::vector<WindowEntry> live{{.id = "0xNEW", .workspace = 0, .title = "Editor"}};
+        const auto sync = plan_canvas_sync(live, canvas);
+        check(sync.adopt.size() == 1 && sync.adopt[0] == "0xNEW",
+              "the new window is adopted");
+        check(sync.forget.size() == 1 && sync.forget[0] == "0xOLD",
+              "and the gone one is released in the same pass");
+
+        apply_canvas_sync(canvas, sync, 100, 100);
+        check(canvas.manages("0xNEW") && !canvas.manages("0xOLD"),
+              "applying the sync leaves exactly the live set managed");
+    }
+
+    // A window with no id cannot be acted on, so it is not adopted -- otherwise it
+    // would be adopted every pass forever, since it can never appear as managed.
+    {
+        Canvas canvas;
+        const std::vector<WindowEntry> live{
+            {.id = "", .workspace = 0, .title = "unparseable"},
+            {.id = "0xA", .workspace = 0, .title = "Firefox"},
+        };
+        const auto sync = plan_canvas_sync(live, canvas);
+        check(sync.adopt.size() == 1 && sync.adopt[0] == "0xA",
+              "an id-less window is skipped rather than adopted every second");
+    }
+
+    // Closing and reopening must not walk the canvas rightwards forever: the freed
+    // slot is reused because apply_canvas_sync forgets before it places.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        apply_canvas_sync(canvas, plan_canvas_sync({{.id = "0xA", .title = "t"}}, canvas),
+                          960, 540);
+        const auto first = canvas.placement_of("0xA");
+
+        apply_canvas_sync(canvas, plan_canvas_sync({}, canvas), 960, 540);
+        apply_canvas_sync(canvas, plan_canvas_sync({{.id = "0xB", .title = "t"}}, canvas),
+                          960, 540);
+        const auto second = canvas.placement_of("0xB");
+
+        check(first && second && *first == *second,
+              "a reopened window reuses the freed slot rather than marching off-canvas");
+    }
+
+    // is_shell_window is what keeps the canvas from adopting its own surfaces. The
+    // desktop window would be the worst case: the canvas would try to pan itself.
+    {
+        check(auspex::is_shell_window({.id = "0x1", .title = "Auspex Desktop"}),
+              "the desktop window is a shell window, so the canvas never adopts itself");
+        check(auspex::is_shell_window({.id = "0x2", .title = "Auspex Panel (top)"}),
+              "neither panel is adopted, so a pan cannot drag a bar off screen");
+        check(!auspex::is_shell_window({.id = "0x3", .title = "Firefox"}),
+              "an ordinary window still is adopted");
+    }
+}
+
+void test_fit_and_geometry() {
+    std::cout << "fit-to-screen and batch geometry\n";
+    using auspex::Canvas;
+    using auspex::compute_fit_layout;
+
+    // One window takes the whole usable area.
+    {
+        const auto fit = compute_fit_layout(1, 1920, 1000);
+        check(fit.columns == 1 && fit.rows == 1, "one window, one cell");
+        check(fit.tile_width == 1920 && fit.tile_height == 1000,
+              "and it gets the whole screen");
+    }
+
+    // Four windows on a 16:9 screen should go 2x2, not 4x1 or 1x4.
+    {
+        const auto fit = compute_fit_layout(4, 1920, 1000);
+        check(fit.columns == 2 && fit.rows == 2, "four windows tile 2x2");
+        check(fit.tile_width == 960 && fit.tile_height == 500, "each gets a quarter");
+    }
+
+    // Three windows: 2 columns beats 3, because 3x1 gives thin 640px slivers while
+    // 2x2 gives 960x500 tiles. This is the case ceil(sqrt(n)) gets wrong.
+    {
+        const auto fit = compute_fit_layout(3, 1920, 1000);
+        check(fit.columns == 2,
+              "three windows use two columns -- wider tiles beat fewer rows");
+        const double aspect = double(fit.tile_width) / fit.tile_height;
+        check(aspect > 1.5 && aspect < 2.5,
+              "and the tiles come out roughly screen-shaped, not letterboxed");
+    }
+
+    // Past the minimum, tiles stop shrinking and the grid overflows on purpose.
+    {
+        const auto fit = compute_fit_layout(60, 1920, 1000);
+        check(fit.tile_width >= 280 && fit.tile_height >= 200,
+              "tiles never shrink below a readable floor");
+        // Overflow is vertical, not horizontal: the aspect objective keeps tiles
+        // screen-shaped, so the grid grows downward and the canvas scrolls to it.
+        check(fit.rows * fit.tile_height > 1000,
+              "so sixty windows overflow the viewport instead of becoming slivers");
+    }
+
+    check(compute_fit_layout(0, 1920, 1000).tile_width == 0, "no windows, no layout");
+    check(compute_fit_layout(4, 0, 0).tile_width == 0, "no viewport, no layout");
+
+    // fit_all lays managed windows out row-major and is stable across calls.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        canvas.set_insets(40, 40);
+        for (const char* id : {"0x1", "0x2", "0x3", "0x4"}) canvas.place(id, {9999, 9999});
+
+        const auto fit = canvas.fit_all();
+        check(fit.columns == 2 && fit.rows == 2, "four managed windows fit 2x2");
+
+        const auto first = canvas.placement_of("0x1");
+        check(first && first->x == 0 && first->y == 40,
+              "the first cell starts below the top inset, never under the panel");
+
+        const auto before = canvas.placement_of("0x4");
+        canvas.fit_all();
+        check(before && canvas.placement_of("0x4") == before,
+              "fitting twice is stable -- windows do not shuffle under the user");
+    }
+
+    // Resolve carries no size unless a fit asked for one: panning must never
+    // silently resize the user's windows.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        canvas.place("0x1", {0, 0});
+        const auto positions = canvas.resolve();
+        check(positions.size() == 1 && positions[0].width == 0 &&
+                  positions[0].height == 0,
+              "a plain resolve requests no resize");
+    }
+
+    // wmctrl -lG parsing: the batch query that makes a per-second reconcile cheap.
+    {
+        const std::string output =
+            "0x02a0000c  0 10   90   950  472  hostname OllamaDev ADE \xE2\x80\x94 Mint\n"
+            "0x00e00003 -1 3840 0    1024 33   hostname xfce4-panel\n"
+            "0x04400006  0 -710 32   1200 838  hostname gaomontablet\n";
+        const auto placed = auspex::parse_placed_windows(output);
+        check_eq(placed.size(), std::size_t{3}, "three windows parsed");
+        if (placed.size() == 3) {
+            check(placed[0].window.id == "0x02a0000c", "id column");
+            check(placed[0].bounds == auspex::Rect{10, 90, 950, 472}, "geometry columns");
+            check(placed[0].window.title == "OllamaDev ADE \xE2\x80\x94 Mint",
+                  "a title with spaces and UTF-8 survives intact");
+            check(placed[1].window.workspace == -1, "a sticky window keeps workspace -1");
+            check(placed[2].bounds.x == -710,
+                  "a negative x parses -- windows the canvas panned off-screen have one");
+        }
+    }
+    check(auspex::parse_placed_windows("").empty(), "empty output parses to nothing");
+    check(auspex::parse_placed_windows("garbage without columns\n").empty(),
+          "a malformed line is skipped, not half-parsed");
+}
+
+void test_monitors_current() {
+    std::cout << "monitor parsing (xrandr -q --current)\n";
+    // Captured verbatim from a 4-output NVIDIA machine, disconnected outputs and all.
+    const std::string output =
+        "Screen 0: minimum 8 x 8, current 6784 x 1080, maximum 32767 x 32767\n"
+        "HDMI-0 connected 1024x600+3840+0 (normal left inverted right x axis y axis) 476mm x 268mm\n"
+        "   1024x600      60.00*+\n"
+        "DP-0 connected primary 1920x1080+1920+0 (normal left inverted right x axis y axis) 698mm x 393mm\n"
+        "DP-1 disconnected (normal left inverted right x axis y axis)\n"
+        "DP-2 connected 1920x1080+0+0 (normal left inverted right x axis y axis) 698mm x 393mm\n"
+        "DP-3 disconnected (normal left inverted right x axis y axis)\n"
+        "DP-5 connected 1920x1080+4864+0 (normal left inverted right x axis y axis) 256mm x 144mm\n";
+
+    const auto monitors = auspex::parse_monitors_current(output);
+    check_eq(monitors.size(), std::size_t{4},
+             "four connected outputs; the three disconnected ones are skipped");
+    if (monitors.size() == 4) {
+        check(monitors[0].connector == "HDMI-0", "connector name");
+        check(monitors[0].bounds == auspex::Rect{3840, 0, 1024, 600}, "offset geometry");
+        check(!monitors[0].primary, "a non-primary output is not marked primary");
+        check(monitors[1].connector == "DP-0" && monitors[1].primary,
+              "\"primary\" between the state and the geometry is recognised");
+        check(monitors[1].bounds == auspex::Rect{1920, 0, 1920, 1080},
+              "and the geometry after it still parses");
+        check(monitors[2].bounds == auspex::Rect{0, 0, 1920, 1080}, "origin monitor");
+    }
+
+    // The mode lines under each output start with whitespace and must never be
+    // mistaken for outputs; nor must the "Screen 0:" header.
+    check(auspex::parse_monitors_current("Screen 0: minimum 8 x 8\n").empty(),
+          "the Screen header alone yields no monitors");
+    check(auspex::parse_monitors_current(
+              "DP-0 connected (normal left inverted right x axis y axis)\n").empty(),
+          "a connected output with no geometry is skipped, not parsed as 0x0");
+    check(auspex::parse_monitors_current("").empty(), "empty output, no monitors");
+
+    // primary_monitor() picks the primary out of this, which is the whole point.
+    {
+        const auto monitors = auspex::parse_monitors_current(output);
+        const auto* primary = static_cast<const auspex::MonitorInfo*>(nullptr);
+        for (const auto& m : monitors) if (m.primary) primary = &m;
+        check(primary && primary->connector == "DP-0",
+              "the primary output is findable, which is what the panel docks to");
+    }
+}
+
+void test_minimize() {
+    std::cout << "minimise / restore\n";
+    using auspex::canonical_window_id;
+    using auspex::Canvas;
+
+    // The whole feature turns on these two spellings being one value. wmctrl says
+    // 0x04400006; xdotool says 71303174. If these disagree the minimised set comes
+    // back containing everything, and the canvas stops placing any window at all --
+    // a total failure that produces no error message anywhere.
+    check_eq(canonical_window_id("0x04400006"), std::string("0x04400006"),
+             "wmctrl's spelling is the canonical one");
+    check_eq(canonical_window_id("71303174"), std::string("0x04400006"),
+             "xdotool's decimal is the SAME window as wmctrl's hex");
+    check_eq(canonical_window_id("0x4400006"), std::string("0x04400006"),
+             "unpadded hex is padded to match");
+    check_eq(canonical_window_id("0X4400006"), std::string("0x04400006"),
+             "uppercase 0X is accepted, output is lower case");
+    check_eq(canonical_window_id("  0x04400006  "), std::string("0x04400006"),
+             "surrounding whitespace is stripped");
+
+    check(canonical_window_id("").empty(), "empty id stays empty");
+    check(canonical_window_id("0x").empty(), "a bare prefix is not an id");
+    check(canonical_window_id("nonsense").empty(), "a non-number is rejected");
+    // Partial parsing would silently name a DIFFERENT window, which is worse than
+    // returning nothing.
+    check(canonical_window_id("123abc").empty(),
+          "a decimal with trailing garbage is rejected, not truncated to 123");
+    check(canonical_window_id("0x12zz").empty(),
+          "hex with non-hex digits is rejected, not truncated to 0x12");
+
+    // A minimised window keeps its place but is not touched.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        canvas.place("0x1", {0, 0});
+        canvas.place("0x2", {500, 0});
+
+        canvas.set_hidden({"0x2"});
+        check(canvas.is_hidden("0x2"), "the hidden set is remembered");
+        check(canvas.manages("0x2"),
+              "a minimised window stays MANAGED -- restoring it must put it back "
+              "where it was, not file it somewhere new");
+
+        const auto positions = canvas.resolve();
+        check_eq(positions.size(), std::size_t{1},
+                 "a minimised window is absent from resolve(), not merely invisible");
+        check(positions.size() == 1 && positions[0].id == "0x1",
+              "and it is the visible one that remains");
+        check(canvas.placement_of("0x2") == auspex::CanvasPlacement{500, 0},
+              "its canvas position survives being minimised");
+    }
+
+    // Fitting ignores minimised windows, so they leave no gap in the grid.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1000});
+        for (const char* id : {"0x1", "0x2", "0x3", "0x4"}) canvas.place(id, {0, 0});
+
+        canvas.set_hidden({"0x3", "0x4"});
+        const auto fit = canvas.fit_all();
+        check(fit.columns == 2 && fit.rows == 1,
+              "four windows with two minimised fit as two, not as four with holes");
+        check(fit.tile_width == 960,
+              "and the two showing share the whole screen between them");
+        check(canvas.placement_of("0x3") == auspex::CanvasPlacement{0, 0},
+              "a minimised window is not moved by a fit");
+    }
+
+    // Un-minimising restores it to the layout.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1000});
+        canvas.place("0x1", {0, 0});
+        canvas.place("0x2", {0, 0});
+        canvas.set_hidden({"0x2"});
+        check_eq(canvas.resolve().size(), std::size_t{1}, "one showing while hidden");
+        canvas.set_hidden({});
+        check_eq(canvas.resolve().size(), std::size_t{2},
+                 "and both again once it is restored");
+    }
+}
+
+void test_crew() {
+    std::cout << "crew\n";
+    using auspex::crew_task_from_utterance;
+
+    // The phrasing comes off; the task itself is left completely alone.
+    check_eq(crew_task_from_utterance("have the crew add rate limiting to the api"),
+             std::string("add rate limiting to the api"), "\"have the crew ...\"");
+    check_eq(crew_task_from_utterance("ask the crew to write tests for canvas"),
+             std::string("write tests for canvas"), "\"ask the crew to ...\"");
+    check_eq(crew_task_from_utterance("Tell the crew to fix the launcher."),
+             std::string("fix the launcher"), "capitals and a full stop");
+    check_eq(crew_task_from_utterance("crew, document the display seam"),
+             std::string("document the display seam"), "\"crew, ...\"");
+    check_eq(crew_task_from_utterance("run the crew on the minimize bug"),
+             std::string("the minimize bug"), "\"run the crew on ...\"");
+
+    // A bare task with no phrasing is already the task.
+    check_eq(crew_task_from_utterance("refactor the canvas fit code"),
+             std::string("refactor the canvas fit code"), "no prefix, unchanged");
+
+    // Nothing left to do is refused rather than sent as an empty task, which the
+    // crew would otherwise have to interpret.
+    check(crew_task_from_utterance("").empty(), "empty utterance yields no task");
+    check(crew_task_from_utterance("   ").empty(), "whitespace yields no task");
+    check(crew_task_from_utterance("ask the crew to").empty(),
+          "phrasing with no task yields nothing, not a stray \"to\"");
+
+    // The task is ONE argv element, so punctuation inside it is data. This is the
+    // property that makes passing free text safe: it is never a command line.
+    const std::string tricky =
+        crew_task_from_utterance("have the crew fix `foo`; rm -rf ~ && echo done");
+    check_eq(tricky, std::string("fix `foo`; rm -rf ~ && echo done"),
+             "metacharacters survive verbatim -- they are one argument, not a shell line");
+
+    // The whole point of the design: the model does NOT supply this text.
+    check(std::string(auspex::to_string(auspex::ActionKind::RunCrew)) == "run_crew",
+          "run_crew round-trips its name");
+}
+
+void test_frame_extents() {
+    std::cout << "frame extents\n";
+    using auspex::parse_frame_extents;
+    using auspex::FrameExtents;
+
+    check(parse_frame_extents("_NET_FRAME_EXTENTS(CARDINAL) = 5, 5, 29, 5\n") ==
+              FrameExtents{5, 5, 29, 5},
+          "xfwm4's real output parses to left/right/top/bottom");
+    check(parse_frame_extents("_NET_FRAME_EXTENTS(CARDINAL) = 0, 0, 0, 0\n") ==
+              FrameExtents{0, 0, 0, 0},
+          "an undecorated window reports zeros");
+    check(parse_frame_extents("_NET_FRAME_EXTENTS:  not found.\n") == FrameExtents{},
+          "a missing property is zeros, not garbage -- an undecorated window has "
+          "no frame, so zero is the correct answer rather than an error");
+    check(parse_frame_extents("") == FrameExtents{}, "empty output is zeros");
+    check(parse_frame_extents("_NET_FRAME_EXTENTS(CARDINAL) = 5, 5\n") == FrameExtents{},
+          "a short list is refused rather than partly applied");
+
+    // The behaviour that matters: a window asked to occupy a tile must have its
+    // CLIENT sized smaller by the frame, or it overhangs.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        rec->canned_extents = FrameExtents{5, 5, 29, 5};
+        auspex::set_display_server(std::move(recorder));
+
+        const auspex::Rect monitor{0, 0, 1920, 1080};
+        const std::vector<auspex::ScreenPosition> positions{
+            {.id = "0xA", .x = 0, .y = 0, .visible = true,
+             .width = 1000, .height = 500},
+        };
+        auspex::apply_positions(positions, monitor);
+
+        check(rec->resizes.size() == 1, "one resize requested");
+        check(rec->moves.size() == 1 &&
+                  rec->moves[0] == std::make_tuple(std::string("0xA"), 0, 0),
+              "frame extents never shift the requested outer-frame position");
+        if (rec->resizes.size() == 1) {
+            // 1000 - 5 - 5 = 990 ; 500 - 29 - 5 = 466
+            check(rec->resizes[0] == std::make_tuple(std::string("0xA"), 990, 466),
+                  "the client is shrunk by the frame, so the WINDOW occupies the "
+                  "1000x500 it was asked to");
+        }
+        auspex::set_display_server(nullptr);
+    }
+}
+
+void test_zoom() {
+    std::cout << "canvas zoom\n";
+    using auspex::Canvas;
+
+    // Zoom scales both position and size, measured from the canvas origin.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 1000});
+        canvas.place("0x1", {.x = 100, .y = 200, .width = 400, .height = 300});
+
+        check(canvas.zoom() == 1.0, "starts at life size");
+        auto at_one = canvas.resolve();
+        check(at_one.size() == 1 && at_one[0].x == 100 && at_one[0].y == 200,
+              "at 1.0 the screen position is the canvas position");
+        check(at_one[0].width == 0 && at_one[0].height == 0,
+              "and NO resize is requested -- zoom 1.0 must leave sizes alone");
+
+        canvas.set_zoom(0.5);
+        auto at_half = canvas.resolve();
+        check(at_half[0].x == 50 && at_half[0].y == 100, "position halves");
+        check(at_half[0].width == 200 && at_half[0].height == 150, "size halves too");
+
+        canvas.reset_zoom();
+        check(canvas.resolve()[0].width == 0,
+              "ordinary resolves at 1.0 do not resize during pans");
+        const auto restored = canvas.resolve(/*include_life_size=*/true);
+        check(restored[0].width == 400 && restored[0].height == 300,
+              "an explicit 1.0 zoom restores the real window's natural size");
+    }
+
+    // Zoom must NOT move the viewport. Scaling happens toward the origin, so the
+    // occupied area only shrinks -- a canvas that owns one monitor can then never
+    // push a window past an edge by zooming.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 40, .y = 60, .width = 1000, .height = 1000});
+        canvas.zoom_by(0.5);
+        const auto v = canvas.viewport();
+        check(v.x == 40 && v.y == 60,
+              "zooming leaves the viewport alone -- the compensating shift is what "
+              "used to walk windows off the monitor");
+    }
+
+    // Limits, and that they clamp rather than wrap or invert.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 1000});
+        for (int i = 0; i < 40; ++i) canvas.zoom_by(0.5);
+        check(canvas.zoom() >= 0.33, "cannot zoom out past the floor");
+        for (int i = 0; i < 40; ++i) canvas.zoom_by(2.0);
+        check(canvas.zoom() <= 1.0,
+              "cannot zoom in past LIFE SIZE -- beyond it a window is bigger than "
+              "the monitor and no layout can keep it off the next one");
+        canvas.zoom_by(0.0);
+        check(canvas.zoom() <= 1.0 && canvas.zoom() > 0, "a zero factor is ignored");
+        canvas.zoom_by(-1.0);
+        check(canvas.zoom() > 0, "a negative factor is ignored, not applied");
+    }
+
+    // A pan must cover the same amount of SCREEN at any zoom, or dragging feels
+    // like the canvas is sticking when zoomed out.
+    {
+        Canvas a, b;
+        a.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 1000});
+        b.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 1000});
+        b.set_zoom(0.5);
+
+        a.pan_by(100, 0);
+        b.pan_by(100, 0);
+        check(a.viewport().x == 100, "at 1.0, 100 screen px is 100 canvas units");
+        check(b.viewport().x == 200,
+              "at 0.5, the same 100 screen px is 200 canvas units -- the hand and "
+              "the content stay together");
+    }
+
+    // A drag recorded while zoomed must land where the user dropped it.
+    {
+        Canvas canvas;
+        canvas.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 1000});
+        canvas.place("0x1", {.x = 0, .y = 0, .width = 100, .height = 100});
+        canvas.set_zoom(0.5);
+        canvas.note_screen_move("0x1", 300, 400);
+        const auto placement = canvas.placement_of("0x1");
+        check(placement && placement->x == 600 && placement->y == 800,
+              "screen 300,400 at 0.5 zoom is canvas 600,800 -- the zoom is undone "
+              "as well as the pan");
+        check(placement && placement->width == 100,
+              "and the natural size is not overwritten by a move");
+    }
+}
+
+void test_board() {
+    std::cout << "crew board\n";
+    using auspex::parse_board;
+    using auspex::board_item;
+
+    // Shape produced by `ollamadev board --json`: the number, reason and file list
+    // live under "data", not at the top level.
+    const std::string output = R"([
+      {"id":"a1","kind":"changeset","summary":"add rate limiting",
+       "data":{"n":2,"reason":"touches auth outside its subtask","files":["a.cpp","b.h"]}},
+      {"id":"a2","kind":"changeset","summary":"document the api",
+       "data":{"n":1,"reason":"held for review","files":["README.md"]}}
+    ])";
+
+    const auto items = parse_board(output);
+    check_eq(items.size(), std::size_t{2}, "two held changesets parsed");
+    if (items.size() == 2) {
+        // Sorted by the number the user says, not the order the crew emitted them.
+        check(items[0].n == 1 && items[1].n == 2, "sorted by number, not by emission order");
+        check(items[0].summary == "document the api", "summary read");
+        check(items[1].reason == "touches auth outside its subtask", "hold reason read");
+        check(items[1].files == 2, "file count comes from the array length");
+    }
+
+    // An item with no number cannot be named, so it cannot be accepted or
+    // discarded -- listing it would offer a decision that cannot be made.
+    check(parse_board(R"([{"id":"x","summary":"no number","data":{}}])").empty(),
+          "an item without a number is dropped, not listed as undecidable");
+
+    check(parse_board("nothing pending\n").empty(),
+          "the human-readable output is not mistaken for JSON");
+    check(parse_board("").empty(), "empty output parses to nothing");
+    check(parse_board("{\"not\":\"an array\"}").empty(), "a non-array is refused");
+    check(parse_board("[{\"id\":").empty(), "truncated JSON yields nothing, not half a board");
+
+    // The validation that matters: accept/discard are not reversible.
+    {
+        const auto board = parse_board(output);
+        check(board_item(board, 1).has_value(), "number on the board resolves");
+        check(board_item(board, 2).has_value(), "and so does the other");
+        check(!board_item(board, 7).has_value(),
+              "a number NOT on the board is refused -- it must never apply "
+              "somebody else's changeset just because the integer parsed");
+        check(!board_item(board, 0).has_value(), "zero is not a change");
+        check(!board_item(board, -1).has_value(), "nor is a negative");
+        check(!board_item({}, 1).has_value(), "an empty board resolves nothing");
+    }
+
+    // Commands are argv vectors; the steer text is one element however it reads.
+    check(auspex::crew_accept_command(2) ==
+              std::vector<std::string>{"ollamadev", "crew", "accept", "2"},
+          "accept argv");
+    check(auspex::crew_discard_command(3) ==
+              std::vector<std::string>{"ollamadev", "crew", "discard", "3"},
+          "discard argv");
+    check(auspex::crew_steer_command(1, "use the existing logger") ==
+              std::vector<std::string>{"ollamadev", "crew", "steer", "1",
+                                       "use the existing logger"},
+          "steer passes the instruction as ONE argument");
+    check(auspex::crew_steer_command(1, "").empty(), "steer with nothing to say is refused");
+    check(auspex::crew_accept_command(0).empty(), "accept 0 is not a command");
+    check(auspex::crew_accept_command(-2).empty(), "nor is a negative index");
+
+    // resume takes no id: `crew resume` alone picks the most recent run, which is
+    // what a person means. Naming an id is a terminal thing, not a voice thing.
+    check(auspex::crew_resume_command() ==
+              std::vector<std::string>{"ollamadev", "crew", "resume"},
+          "resume argv takes no id");
+    check(std::string(auspex::to_string(auspex::ActionKind::CrewResume)) == "crew_resume",
+          "crew_resume round-trips its name");
+}
+
+void test_agents() {
+    std::cout << "coding agents\n";
+    using auspex::resolve_agent;
+    using auspex::normalise_agent_name;
+    using auspex::agent_terminal_command;
+
+    // The names as they actually arrive from speech.
+    check(resolve_agent("claude")->key == "claude", "\"claude\"");
+    check(resolve_agent("Claude Code")->key == "claude", "\"Claude Code\"");
+    check(resolve_agent("a claude code agent")->key == "claude",
+          "\"a claude code agent\" -- filler words are stripped");
+    check(resolve_agent("claude-code")->key == "claude", "hyphenated");
+    check(resolve_agent("open a codex agent")->key == "codex", "\"open a codex agent\"");
+    check(resolve_agent("OpenAI Codex")->key == "codex", "\"OpenAI Codex\"");
+    check(resolve_agent("the gemini cli")->key == "gemini", "\"the gemini cli\"");
+    check(resolve_agent("cursor agent")->key == "cursor", "\"cursor agent\"");
+    check(resolve_agent("open code")->key == "opencode",
+          "\"open code\" as two words still finds opencode");
+    check(resolve_agent("qwen coder")->key == "qwen", "\"qwen coder\"");
+
+    // Mis-hearings that a speech recogniser really produces.
+    check(resolve_agent("clod")->key == "claude", "a mis-heard \"claude\" still lands");
+    check(resolve_agent("jiminy")->key == "gemini", "a mis-heard \"gemini\" still lands");
+
+    // The gate. Nothing outside the table resolves, and in particular nothing that
+    // would be interesting to smuggle through.
+    check(!resolve_agent("").has_value(), "empty name resolves to nothing");
+    check(!resolve_agent("agent").has_value(),
+          "a name that is only filler resolves to nothing, not to the first entry");
+    check(!resolve_agent("rm").has_value(), "an arbitrary binary name does not resolve");
+    check(!resolve_agent("bash").has_value(), "nor does a shell");
+    check(!resolve_agent("claude; rm -rf /").has_value(),
+          "a command line does not resolve -- punctuation becomes spaces, and "
+          "\"claude rm rf\" matches no alias");
+    check(!resolve_agent("../../bin/sh").has_value(), "nor does a path");
+    check(!resolve_agent("copilot").has_value(),
+          "a plausible agent that is not in the table is refused, not guessed at");
+
+    // Normalisation is what makes all of the above one comparison.
+    check_eq(normalise_agent_name("a Claude-Code Agent!"), std::string("claude code"),
+             "normalisation lowercases, unpunctuates and drops filler");
+    check_eq(normalise_agent_name("claude; rm -rf /"), std::string("claude rm rf"),
+             "every metacharacter becomes a space, so none can survive to a shell");
+
+    // Terminal invocation. Getting the flag wrong opens an empty terminal, which
+    // reads as the agent crashing instantly.
+    const auto claude = *resolve_agent("claude");
+    check(agent_terminal_command("xfce4-terminal", claude) ==
+              std::vector<std::string>{"xfce4-terminal", "-e", "claude"},
+          "xfce4-terminal takes -e");
+    check(agent_terminal_command("gnome-terminal", claude) ==
+              std::vector<std::string>{"gnome-terminal", "--", "claude"},
+          "gnome-terminal wants -- (it deprecated -e and ignores it)");
+    check(agent_terminal_command("kitty", claude) ==
+              std::vector<std::string>{"kitty", "claude"},
+          "kitty takes the command bare");
+    check(agent_terminal_command("/usr/bin/gnome-terminal", claude) ==
+              std::vector<std::string>{"/usr/bin/gnome-terminal", "--", "claude"},
+          "the rule matches on basename, so an absolute terminal path still works");
+    check(agent_terminal_command("", claude).empty(), "no terminal, no command");
+
+    // Every alias in the table must resolve to its own entry -- a duplicate alias
+    // between two agents would silently make one of them unreachable by voice.
+    for (const auto& tool : auspex::known_agents()) {
+        const auto round_trip = resolve_agent(tool.key);
+        check(round_trip && round_trip->key == tool.key,
+              "each agent's own key resolves back to it: " + tool.key);
+    }
+}
+
 void test_sysmon() {
     std::cout << "system monitor\n";
     auspex::SystemMonitor monitor;
@@ -708,10 +1870,21 @@ int main(int argc, char** argv) {
     test_css();
     test_layout();
     test_desktop_parsing();
+    test_display_seam();
+    test_session();
     test_commands();
     test_browser_commands();
     test_voice_gate();
     test_desktop_entries();
+    test_canvas();
+    test_fit_and_geometry();
+    test_monitors_current();
+    test_minimize();
+    test_crew();
+    test_frame_extents();
+    test_zoom();
+    test_board();
+    test_agents();
     test_sysmon();
 
     std::cout << "\n" << (checks - failures) << "/" << checks << " checks passed\n";

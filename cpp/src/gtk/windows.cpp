@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include "auspex/audio.hpp"
+#include "auspex/crew.hpp"
 #include "auspex/gtk/voice.hpp"
 #include "auspex/ollama_client.hpp"
 #include "auspex/process.hpp"
@@ -44,7 +45,20 @@ std::vector<std::string> split_words(const std::string& command) {
 LauncherWindow::LauncherWindow(const Config& config) : config_(config) {
     set_title("Auspex Launcher");
     set_default_size(520, 560);
-    set_modal(true);
+
+    // NOT modal. A modal window needs a transient parent to mean anything, and the
+    // only parent available is the panel -- which is a _NET_WM_WINDOW_TYPE_DOCK
+    // window that never takes focus. Declaring modality against a parent that
+    // cannot hold focus left the launcher in a state where the window manager gave
+    // it focus, immediately took it back, and the window closed itself about two
+    // seconds later without the user touching anything.
+    set_modal(false);
+
+    // Hidden rather than destroyed on close, and re-shown on the next open. The
+    // 148 desktop files are then parsed once per session instead of once per
+    // launcher open, and a stray close request cannot take the object out from
+    // under the panel's unique_ptr.
+    set_hide_on_close(true);
 
     search_.set_placeholder_text("Search applications...");
     search_.signal_changed().connect([this] { refilter(); });
@@ -53,6 +67,10 @@ LauncherWindow::LauncherWindow(const Config& config) : config_(config) {
     search_.signal_activate().connect([this] { launch_selected(); });
 
     list_.set_selection_mode(Gtk::SelectionMode::SINGLE);
+    // One click launches. Stated explicitly rather than relying on the default,
+    // because "click the app and nothing happens" is indistinguishable from the
+    // launcher being broken.
+    list_.set_activate_on_single_click(true);
     list_.signal_row_activated().connect(
         [this](Gtk::ListBoxRow*) { launch_selected(); });
 
@@ -81,7 +99,25 @@ LauncherWindow::LauncherWindow(const Config& config) : config_(config) {
 
     entries_ = load_desktop_entries();
     refilter();
-    search_.grab_focus();
+
+    // Focus the search box on MAP, not here.
+    //
+    // grab_focus() on a widget whose window has not been realised does nothing at
+    // all -- it does not queue, it does not warn, it silently fails. Called from
+    // the constructor, as it was, the entry never held focus, so typing went to
+    // whatever the window manager thought was focused instead and the list never
+    // filtered. The window looked completely normal; the search simply did not
+    // respond.
+    //
+    // signal_map fires once the window is on screen, which is the first moment
+    // focus can actually be taken.
+    signal_map().connect([this] {
+        search_.grab_focus();
+        // Re-focus and clear on every re-open, since the window is now hidden
+        // rather than destroyed and would otherwise come back with the last
+        // search still in it.
+        search_.set_text("");
+    });
 }
 
 void LauncherWindow::refilter() {
@@ -103,16 +139,21 @@ void LauncherWindow::refilter() {
             markup += "\n<small>" + Glib::Markup::escape_text(entry.comment) + "</small>";
         }
 
-        auto label = std::make_unique<Gtk::Label>();
+        // Managed: the row owns the label, so destroying the row destroys both and
+        // there is no second lifetime to get wrong.
+        auto* label = Gtk::make_managed<Gtk::Label>();
         label->set_markup(markup);
         label->set_xalign(0.0f);
         label->set_margin(6);
         label->set_wrap(false);
         label->set_ellipsize(Pango::EllipsizeMode::END);
 
-        list_.append(*label);
+        auto row = std::make_unique<Gtk::ListBoxRow>();
+        row->set_child(*label);
+
+        list_.append(*row);
         visible_.push_back(&entry);
-        rows_.push_back(std::move(label));
+        rows_.push_back(std::move(row));
 
         if (visible_.size() >= 300) break;   // keep the list responsive
     }
@@ -143,6 +184,110 @@ void LauncherWindow::launch_selected() {
 
     spawn_detached(argv);
     close();
+}
+
+// ---------------------------------------------------------------------------
+// BoardWindow
+// ---------------------------------------------------------------------------
+BoardWindow::BoardWindow() {
+    set_title("Auspex Crew Board");
+    set_default_size(680, 560);
+    set_hide_on_close(true);
+
+    heading_.set_xalign(0.0f);
+    heading_.add_css_class("subtitle");
+
+    scroller_.set_child(list_);
+    scroller_.set_vexpand(true);
+    scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+
+    refresh_.signal_clicked().connect([this] { refresh(); });
+    close_.signal_clicked().connect([this] { close(); });
+    buttons_.set_halign(Gtk::Align::END);
+    buttons_.append(refresh_);
+    buttons_.append(close_);
+
+    root_.set_margin(12);
+    root_.append(heading_);
+    root_.append(scroller_);
+    root_.append(buttons_);
+    set_child(root_);
+
+    signal_map().connect([this] { refresh(); });
+    refresh();
+}
+
+void BoardWindow::refresh() {
+    for (auto& row : rows_) list_.remove(*row);
+    rows_.clear();
+
+    const auto items = board_items();
+    if (items.empty()) {
+        heading_.set_text(crew_available()
+                              ? "The crew is not holding anything."
+                              : "ollamadev is not installed, so there is no crew.");
+        return;
+    }
+    heading_.set_text(std::to_string(items.size()) +
+                      (items.size() == 1 ? " change held for review"
+                                         : " changes held for review"));
+
+    for (const auto& item : items) {
+        auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 4);
+        row->add_css_class("code-block");
+
+        auto* title = Gtk::make_managed<Gtk::Label>();
+        title->set_markup("<b>#" + std::to_string(item.n) + "  " +
+                          Glib::Markup::escape_text(item.summary) + "</b>");
+        title->set_xalign(0.0f);
+        title->set_wrap(true);
+        row->append(*title);
+
+        // The hold reason, given equal weight. This is the sentence that decides
+        // whether you accept, and burying it would make the buttons a coin flip.
+        if (!item.reason.empty()) {
+            auto* reason = Gtk::make_managed<Gtk::Label>();
+            reason->set_markup("<i>" + Glib::Markup::escape_text(item.reason) + "</i>");
+            reason->set_xalign(0.0f);
+            reason->set_wrap(true);
+            row->append(*reason);
+        }
+
+        auto* files = Gtk::make_managed<Gtk::Label>(
+            std::to_string(item.files) + (item.files == 1 ? " file" : " files"));
+        files->set_xalign(0.0f);
+        files->add_css_class("subtitle");
+        row->append(*files);
+
+        auto* actions = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
+        actions->set_halign(Gtk::Align::END);
+
+        auto* accept = Gtk::make_managed<Gtk::Button>("Accept");
+        accept->add_css_class("suggested-action");
+        const int n = item.n;
+        accept->signal_clicked().connect([this, n] { decide(n, true); });
+
+        auto* discard = Gtk::make_managed<Gtk::Button>("Discard");
+        discard->signal_clicked().connect([this, n] { decide(n, false); });
+
+        actions->append(*discard);
+        actions->append(*accept);
+        row->append(*actions);
+
+        list_.append(*row);
+        rows_.push_back(std::move(row));
+    }
+}
+
+void BoardWindow::decide(int n, bool accept) {
+    const auto argv = accept ? crew_accept_command(n) : crew_discard_command(n);
+    if (argv.empty()) return;
+    spawn_detached(argv);
+
+    // Re-read shortly after rather than immediately: the decision is applied by a
+    // separate process, and reading the board before it has written would show the
+    // change still pending and invite a second click on something already actioned.
+    Glib::signal_timeout().connect_once([this] { refresh(); }, 1200);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,8 +455,22 @@ SettingsWindow::SettingsWindow(Config config) : config_(std::move(config)) {
 
     // ---- ollama model ----
     {
+        // Two seconds, not the default ten: this runs on the GTK thread while the
+        // window is being built, so the timeout is exactly how long the whole shell
+        // freezes for when ollama is not running. Two is long enough for a loopback
+        // request and short enough not to read as a hang.
         OllamaClient ollama(config_);
-        model_names_ = ollama.list_models();
+        model_names_ = ollama.list_models(std::chrono::seconds(2));
+
+        // The configured model always appears, even if ollama is unreachable or the
+        // model was deleted. Without this the dropdown would land on whatever
+        // happened to be first and saving would silently switch models -- the user
+        // opened this window to change the theme and left with a different LLM.
+        if (!config_.ollama_model.empty() &&
+            std::find(model_names_.begin(), model_names_.end(), config_.ollama_model) ==
+                model_names_.end()) {
+            model_names_.insert(model_names_.begin(), config_.ollama_model);
+        }
         if (model_names_.empty()) model_names_.push_back(config_.ollama_model);
 
         std::vector<Glib::ustring> names;

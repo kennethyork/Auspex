@@ -1,11 +1,6 @@
 #include "auspex/panel_dock.hpp"
 
-#include <sstream>
 #include <string>
-
-#include <unistd.h>
-
-#include "auspex/process.hpp"
 
 namespace auspex {
 
@@ -61,84 +56,9 @@ PanelLayout layout_for_height(const Rect& monitor, int height, PanelPosition pos
     return layout;
 }
 
-namespace dock {
-
-std::optional<std::string> find_window_id(std::string_view title) {
-    const std::string wanted(title);
-
-    // Preferred: our own PID's windows, confirmed by title. GTK4 windows report
-    // class Gtk4Window under X11.
-    const auto by_pid = run({"xdotool", "search", "--pid", std::to_string(::getpid()),
-                             "--class", "Gtk4Window"},
-                            true);
-    if (by_pid.ok) {
-        for (const auto& candidate : split_lines(by_pid.out)) {
-            const std::string wid = trim(candidate);
-            if (wid.empty()) continue;
-            const auto info = run({"xwininfo", "-id", wid}, true);
-            if (info.ok && info.out.find(wanted) != std::string::npos) return wid;
-        }
-    }
-
-    // Fallback: scan the window list by title.
-    const auto listing = run({"wmctrl", "-l"}, true);
-    if (listing.ok) {
-        for (const auto& line : split_lines(listing.out)) {
-            if (line.find(wanted) == std::string::npos) continue;
-            std::istringstream fields(line);
-            std::string wid;
-            if (fields >> wid && !wid.empty()) return wid;
-        }
-    }
-
-    return std::nullopt;
+PanelLayout overlay_panel_layout(PanelLayout layout) {
+    layout.strut_partial = "0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0";
+    return layout;
 }
-
-bool set_dock_window_type(std::string_view window_id) {
-    return run({"xprop", "-id", std::string(window_id),
-                "-f", "_NET_WM_WINDOW_TYPE", "32a",
-                "-set", "_NET_WM_WINDOW_TYPE", "_NET_WM_WINDOW_TYPE_DOCK"},
-               false)
-        .ok;
-}
-
-bool set_strut_partial(std::string_view window_id, const std::string& strut) {
-    return run({"xprop", "-id", std::string(window_id),
-                "-f", "_NET_WM_STRUT_PARTIAL", "32c",
-                "-set", "_NET_WM_STRUT_PARTIAL", strut},
-               false)
-        .ok;
-}
-
-bool move_resize(std::string_view window_id, const Rect& bounds) {
-    const std::string wid(window_id);
-    const bool moved = run({"xdotool", "windowmove", wid,
-                            std::to_string(bounds.x), std::to_string(bounds.y)},
-                           false)
-                           .ok;
-    const bool sized = run({"xdotool", "windowsize", wid,
-                            std::to_string(bounds.width), std::to_string(bounds.height)},
-                           false)
-                           .ok;
-    return moved && sized;
-}
-
-bool set_sticky_above(std::string_view window_id) {
-    return run({"wmctrl", "-i", "-r", std::string(window_id), "-b", "add,sticky,above"},
-               false)
-        .ok;
-}
-
-bool apply(std::string_view window_id, const PanelLayout& layout) {
-    // Order matters: the type hint must be set before the WM computes the frame,
-    // and struts are only honoured once the window has its final geometry.
-    bool ok = set_dock_window_type(window_id);
-    ok = move_resize(window_id, layout.bounds) && ok;
-    ok = set_strut_partial(window_id, layout.strut_partial) && ok;
-    ok = set_sticky_above(window_id) && ok;
-    return ok;
-}
-
-}  // namespace dock
 
 }  // namespace auspex

@@ -1,0 +1,11 @@
+{
+    "backend": "ollama",
+    "created": 1785465961,
+    "cwd": "/home/kennethhy/Documents/Linux-Mint-AI",
+    "id": "session_1785465961_57d8f0d7",
+    "messages": [
+    ],
+    "model": "gpt-oss:20b-cloud",
+    "title": "Session 2026-07-30 22:46",
+    "updated": 1785465961
+}

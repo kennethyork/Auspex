@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Auspex
+Comment=A local AI desktop
+Exec=auspex-session
+TryExec=auspex-session
+Type=Application
+DesktopNames=Auspex
+Keywords=session;desktop;ai;
+X-LightDM-DesktopName=Auspex

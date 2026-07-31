@@ -78,7 +78,13 @@ public:
     std::optional<std::string> version();
 
     // GET /api/tags — model names currently pulled. Empty on failure.
-    std::vector<std::string> list_models();
+    //
+    // The timeout is a parameter because the two callers want opposite things. A
+    // batch caller can afford to wait; the settings window calls this on the GTK
+    // thread while building its widgets, so a long timeout there is a frozen
+    // desktop for the whole duration whenever ollama happens to be down.
+    std::vector<std::string> list_models(
+        std::chrono::seconds timeout = std::chrono::seconds(10));
 
     // POST /api/generate with "stream": false. nullopt on transport/HTTP error
     // or unparseable body; a populated result otherwise (possibly with empty

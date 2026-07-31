@@ -29,6 +29,7 @@
 #include <glibmm/dispatcher.h>
 
 #include "auspex/asr.hpp"
+#include "auspex/canvas.hpp"
 #include "auspex/config.hpp"
 #include "auspex/ollama_client.hpp"
 #include "auspex/tts.hpp"
@@ -77,6 +78,13 @@ public:
     // Cleared by the settings window when the conversation should start fresh.
     void clear_history();
 
+    // Borrowed canvas state for the open_terminal / pan_canvas verbs. The shell
+    // owns the Canvas; null (the default) makes those verbs degrade gracefully.
+    void set_canvas(Canvas* canvas, const Rect& monitor) {
+        canvas_  = canvas;
+        monitor_ = monitor;
+    }
+
     // Text chat: asks the model on the worker thread and delivers the reply on the
     // GTK thread via on_reply. Used by ChatWindow, which must not block the UI for
     // the seconds a generation takes.
@@ -124,6 +132,8 @@ private:
 
     Config config_;
     Tts    tts_;
+    Canvas* canvas_ = nullptr;
+    Rect    monitor_{};
     std::optional<Asr> asr_;
     bool   asr_load_failed_ = false;
 

@@ -1,0 +1,13 @@
+{
+    "models": {
+        "gpt-oss:20b-cloud": {
+            "eval": 2535,
+            "prompt": 57855,
+            "turns": 15
+        }
+    },
+    "total_eval": 2535,
+    "total_prompt": 57855,
+    "turns": 15,
+    "updated_at": "2026-07-31T00:14:09"
+}

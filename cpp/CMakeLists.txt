@@ -229,11 +229,17 @@ add_library(auspex-core STATIC
     src/process.cpp
     src/desktop.cpp
     src/sysmon.cpp
+    src/agents.cpp
     src/commands.cpp
+    src/crew.cpp
     src/vad.cpp
     src/voice_gate.cpp
     src/desktop_entries.cpp
     src/webui.cpp
+    src/canvas.cpp
+    src/display.cpp
+    src/display_x11.cpp
+    src/session.cpp
 )
 target_include_directories(auspex-core PUBLIC include)
 target_compile_options(auspex-core PRIVATE ${AUSPEX_WARNINGS})
@@ -247,7 +253,10 @@ target_link_libraries(auspex-core PUBLIC
 # ---------------------------------------------------------------------------
 # CLI tools
 # ---------------------------------------------------------------------------
-foreach(tool probe listen say selftest serve)
+# auspex-session links no GTK -- it only supervises the shell -- so it belongs with
+# the CLI tools and is built even in the GTK-free configuration. Without a shell to
+# start it is useless, which `auspex-session --check` reports rather than hiding.
+foreach(tool probe listen say selftest serve session)
     add_executable(auspex-${tool} apps/${tool}/main.cpp)
     target_compile_options(auspex-${tool} PRIVATE ${AUSPEX_WARNINGS})
     target_link_libraries(auspex-${tool} PRIVATE auspex-core)
@@ -267,6 +276,7 @@ if(AUSPEX_BUILD_SHELL)
     add_executable(auspex-shell
         apps/shell/main.cpp
         src/gtk/theming.cpp
+        src/gtk/desktop_window.cpp
         src/gtk/panel.cpp
         src/gtk/voice.cpp
         src/gtk/windows.cpp

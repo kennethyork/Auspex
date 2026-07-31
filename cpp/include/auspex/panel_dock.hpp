@@ -1,14 +1,17 @@
-// Panel geometry and X11 dock integration.
+// Panel geometry: where a panel sits and how much screen it reserves.
 //
-// Port of the window-management half of src/magi_shell/core/panel.py. Kept free
-// of GTK so the strut arithmetic is unit-testable and auspex-core stays linkable
+// Port of the window-management half of src/magi_shell/core/panel.py. Kept free of
+// GTK so the strut arithmetic is unit-testable and auspex-core stays linkable
 // without the GTK4 dev packages. The caller supplies the monitor rectangle it got
-// from GDK; nothing here talks to a display server directly.
+// from GDK; nothing here talks to a display server.
 //
-// Docking is done exactly as upstream did -- _NET_WM_WINDOW_TYPE_DOCK plus
-// _NET_WM_STRUT_PARTIAL via xprop, position via xdotool, stacking via wmctrl.
-// That is what makes the panel desktop-agnostic: xfwm4 honours these the same way
-// marco did, which is why this port needs no Xfce-specific code.
+// This file is pure arithmetic. Actually applying a PanelLayout to a window is
+// DisplayServer::dock_panel() in display.hpp -- under X11 that means
+// _NET_WM_WINDOW_TYPE_DOCK plus _NET_WM_STRUT_PARTIAL, which is what makes the
+// panel desktop-agnostic across xfwm4, marco and the rest; under Wayland it will
+// mean wlr-layer-shell. The strut_partial string below is X11's encoding of the
+// reserved space and is computed here because it is 12 integers of arithmetic that
+// deserve a test, not because this layer knows about X11.
 #pragma once
 
 #include <optional>
@@ -55,23 +58,9 @@ PanelLayout compute_panel_layout(const Rect& monitor, int scale_factor,
 PanelLayout layout_for_height(const Rect& monitor, int actual_height,
                              PanelPosition position);
 
-// Thin wrappers over the X11 utilities. Each returns false if the helper is
-// missing or exits non-zero.
-namespace dock {
-
-// Locates the panel's X window. Tries `xdotool search --pid` filtered by title
-// via xwininfo, then falls back to scanning `wmctrl -l`, as upstream did.
-std::optional<std::string> find_window_id(std::string_view title);
-
-bool set_dock_window_type(std::string_view window_id);
-bool set_strut_partial(std::string_view window_id, const std::string& strut);
-bool move_resize(std::string_view window_id, const Rect& bounds);
-bool set_sticky_above(std::string_view window_id);
-
-// Applies the whole sequence in the order the window manager expects: type,
-// then geometry, then struts, then stacking hints.
-bool apply(std::string_view window_id, const PanelLayout& layout);
-
-}  // namespace dock
+// Keeps the panel at the same edge and size but publishes a zero strut. Infinite
+// canvas mode uses this so the bars float above the plane instead of cutting
+// permanent top and bottom boundaries into it.
+PanelLayout overlay_panel_layout(PanelLayout layout);
 
 }  // namespace auspex

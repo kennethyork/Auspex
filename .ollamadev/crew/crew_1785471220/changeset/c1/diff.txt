@@ -1,0 +1,11 @@
+diff --git a/cpp/src/crew.cpp b/cpp/src/crew.cpp
+--- a/cpp/src/crew.cpp
++++ b/cpp/src/crew.cpp
+@@ -64,6 +64,7 @@
+     return items;
+ }
+ 
++// Checks if the 'ollamadev' crew is available in the current path
+ bool crew_available() { return in_path("ollamadev"); }
+ 
+ std::vector<BoardItem> board_items() {

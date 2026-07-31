@@ -1,5 +1,7 @@
 #include "auspex/gtk/panel.hpp"
 
+#include <set>
+
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -7,6 +9,8 @@
 
 #include <glibmm/main.h>
 
+#include "auspex/crew.hpp"
+#include "auspex/display.hpp"
 #include "auspex/gtk/voice.hpp"
 #include "auspex/process.hpp"
 
@@ -36,6 +40,14 @@ std::string elide(const std::string& text, std::size_t limit = 30) {
     std::size_t cut = limit;
     while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) --cut;
     return text.substr(0, cut) + "...";
+}
+
+// A task button's caption. Minimised windows are bracketed, which is what
+// xfce4-panel does and what makes the list readable at a glance. Elision happens
+// before the brackets are added, so a long title cannot push them off the button.
+std::string label_for(const std::string& title, bool minimized) {
+    const std::string shown = elide(title, minimized ? 28 : 30);
+    return minimized ? "[" + shown + "]" : shown;
 }
 
 }  // namespace
@@ -86,6 +98,11 @@ void WorkspaceSwitcher::poll() {
 WindowList::WindowList() : Gtk::Box(Gtk::Orientation::HORIZONTAL, 1) {
     set_hexpand(true);
 
+    menu_.set_parent(*this);
+    menu_.set_child(menu_box_);
+    menu_.set_has_arrow(false);
+    menu_box_.set_margin(6);
+
     poll();
     Glib::signal_timeout().connect(
         [this] {
@@ -95,27 +112,126 @@ WindowList::WindowList() : Gtk::Box(Gtk::Orientation::HORIZONTAL, 1) {
         1000);
 }
 
+void WindowList::toggle(const std::string& window_id) {
+    // Minimise only what is already focused. Anything else gets raised, which also
+    // de-iconifies it -- so one click always does the thing you can see is missing.
+    if (const auto focused = focused_window_id();
+        focused && canonical_window_id(*focused) == canonical_window_id(window_id)) {
+        minimize_window(window_id);
+        return;
+    }
+    if (on_restore_) on_restore_(window_id);
+    else             restore_window(window_id);
+}
+
+void WindowList::show_window_menu(const std::string& window_id, Gtk::Widget& anchor) {
+    menu_target_ = window_id;
+
+    while (Gtk::Widget* child = menu_box_.get_first_child()) menu_box_.remove(*child);
+
+    const auto add = [this](const std::string& label, sigc::slot<void()> action) {
+        auto* button = Gtk::make_managed<Gtk::Button>(label);
+        button->set_has_frame(false);
+        if (auto* text = dynamic_cast<Gtk::Label*>(button->get_child())) {
+            text->set_xalign(0.0f);
+        }
+        button->signal_clicked().connect([this, action] {
+            menu_.popdown();
+            action();
+        });
+        menu_box_.append(*button);
+    };
+
+    const std::string id = window_id;
+    add("Bring to front", [this, id] {
+        if (on_restore_) on_restore_(id);
+        else             restore_window(id);
+    });
+    add("Full window",    [this, id] {
+        if (on_full_) on_full_(id);
+        else {
+            restore_window(id);
+            maximize_window(id);
+        }
+    });
+    add("Minimise",       [id] { minimize_window(id); });
+
+    auto* separator = Gtk::make_managed<Gtk::Separator>(Gtk::Orientation::HORIZONTAL);
+    menu_box_.append(*separator);
+
+    // Close, not kill. wmctrl -c sends WM_DELETE_WINDOW, so the application gets to
+    // prompt about unsaved work. A task list that force-killed processes would
+    // eventually cost somebody a document.
+    add("Close", [id] { close_window(id); });
+
+    // Anchored to the button that was right-clicked, so the menu appears where the
+    // pointer is rather than wherever the popover was last used.
+    Gtk::Widget* parent = menu_.get_parent();
+    if (parent != nullptr) {
+        double x = 0, y = 0;
+        if (anchor.translate_coordinates(*parent, 0, 0, x, y)) {
+            menu_.set_pointing_to(Gdk::Rectangle(
+                static_cast<int>(x), static_cast<int>(y),
+                anchor.get_width(), anchor.get_height()));
+        }
+    }
+    menu_.popup();
+}
+
 void WindowList::poll() {
     const auto windows = list_user_windows();
+
+    // Two calls for the whole list rather than two per window.
+    std::set<std::string> visible;
+    for (const auto& id : list_visible_windows()) visible.insert(id);
+    const auto focused = focused_window_id();
+    const std::string focused_id = focused ? canonical_window_id(*focused) : std::string{};
 
     std::map<std::string, bool> seen;
     for (const auto& window : windows) {
         seen[window.id] = true;
 
+        const std::string canonical = canonical_window_id(window.id);
+        const bool minimized = visible.count(canonical) == 0;
+        const bool active    = !focused_id.empty() && canonical == focused_id;
+
         auto it = entries_.find(window.id);
         if (it == entries_.end()) {
             Entry entry;
-            entry.title  = window.title;
-            entry.button = std::make_unique<Gtk::Button>(elide(window.title));
+            entry.title     = window.title;
+            entry.minimized = minimized;
+            entry.active    = active;
+            entry.button = std::make_unique<Gtk::Button>(label_for(window.title, minimized));
             const std::string id = window.id;
-            entry.button->signal_clicked().connect([id] { activate_window(id); });
+            entry.button->signal_clicked().connect([this, id] { toggle(id); });
+
+            auto right_click = Gtk::GestureClick::create();
+            right_click->set_button(GDK_BUTTON_SECONDARY);
+            Gtk::Button* button_ptr = entry.button.get();
+            right_click->signal_pressed().connect(
+                [this, id, button_ptr](int, double, double) {
+                    show_window_menu(id, *button_ptr);
+                });
+            entry.button->add_controller(right_click);
+            if (active) entry.button->add_css_class("active-workspace");
             append(*entry.button);
             entries_.emplace(window.id, std::move(entry));
-        } else if (it->second.title != window.title) {
-            // Only touch the label when the title actually changed; setting it
-            // every second forces a needless relayout of the whole panel.
-            it->second.title = window.title;
-            it->second.button->set_label(elide(window.title));
+            continue;
+        }
+
+        Entry& entry = it->second;
+        if (entry.title != window.title || entry.minimized != minimized) {
+            entry.title     = window.title;
+            entry.minimized = minimized;
+            // Minimised windows are shown in brackets, as xfce4-panel does. Without
+            // some mark, a minimised window and an open one look identical and the
+            // task list stops telling you anything.
+            entry.button->set_label(label_for(window.title, minimized));
+        }
+        if (entry.active != active) {
+            entry.active = active;
+            if (active) entry.button->add_css_class("active-workspace");
+            else        entry.button->remove_css_class("active-workspace");
         }
     }
 
@@ -194,18 +310,17 @@ LlmContextButton::LlmContextButton(const Config& config, VoiceController& voice)
 }
 
 void LlmContextButton::poll() {
-    const auto active = run({"xdotool", "getactivewindow", "getwindowname"});
-    if (!active.ok) return;
+    const auto active = focused_window_title();
+    if (!active) return;
 
-    const std::string name = trim(active.out);
+    const std::string name = *active;
     // Skip our own windows, or the context would describe the panel itself.
-    if (name.empty() || name.find("Auspex") != std::string::npos ||
+    if (name.find("Auspex") != std::string::npos ||
         name.find("MAGI") != std::string::npos) {
         return;
     }
 
-    const auto selection = run({"xclip", "-o", "-selection", "primary"});
-    const std::string selected = selection.ok ? trim(selection.out) : std::string{};
+    const std::string selected = selected_text().value_or(std::string{});
 
     if (name == window_name_ && selected == selection_) return;
     window_name_ = name;
@@ -236,6 +351,11 @@ Panel::Panel(const Config& config, PanelPosition position, VoiceController& voic
     set_decorated(false);
     set_resizable(false);
 
+    // Opts this window into the translucency rules in theme.cpp. Only the panels
+    // carry it -- the settings, chat and launcher windows keep the opaque
+    // background, since text over a photograph is hard to read.
+    add_css_class("auspex-panel");
+
     const auto monitor = primary_monitor();
     last_monitor_ = monitor ? monitor->bounds : Rect{0, 0, 1920, 1080};
     last_layout_  = compute_panel_layout(last_monitor_, 1, config_.panel_height, position_);
@@ -245,6 +365,23 @@ Panel::Panel(const Config& config, PanelPosition position, VoiceController& voic
     box_.set_margin_start(2);
     box_.set_margin_end(2);
     set_child(box_);
+
+    // Right-click anywhere on the panel opens the menu. Attached to the window
+    // rather than to box_ so it fires on empty panel space too -- the gap between
+    // the clock and the edge is where people actually right-click.
+    //
+    // Button 3 explicitly: the default GestureClick button is 1, and left-click has
+    // to keep reaching the buttons underneath.
+    menu_.set_parent(*this);
+    menu_.set_child(menu_box_);
+    menu_.set_has_arrow(false);
+    menu_box_.set_margin(6);
+
+    auto right_click = Gtk::GestureClick::create();
+    right_click->set_button(GDK_BUTTON_SECONDARY);
+    right_click->signal_pressed().connect(
+        [this](int /*n_press*/, double x, double y) { show_panel_menu(x, y); });
+    add_controller(right_click);
 
     if (position_ == PanelPosition::Top) build_top();
     else build_bottom();
@@ -271,6 +408,21 @@ void Panel::build_top() {
 
     workspaces_ = std::make_unique<WorkspaceSwitcher>(config_.workspace_count);
     box_.append(*workspaces_);
+
+    zoom_out_.set_tooltip_text("Zoom the canvas out");
+    zoom_reset_.set_tooltip_text("Back to life size");
+    zoom_in_.set_tooltip_text("Zoom the canvas in");
+    zoom_out_.signal_clicked().connect([this]   { if (on_zoom_) on_zoom_(1.0 / 1.25); });
+    zoom_reset_.signal_clicked().connect([this] { if (on_zoom_) on_zoom_(0.0); });
+    zoom_in_.signal_clicked().connect([this]    { if (on_zoom_) on_zoom_(1.25); });
+    zoom_box_.append(zoom_out_);
+    zoom_box_.append(zoom_reset_);
+    zoom_box_.append(zoom_in_);
+    box_.append(zoom_box_);
+
+    grid_.set_tooltip_text("Arrange all open windows in a grid");
+    grid_.signal_clicked().connect([this] { if (on_grid_) on_grid_(); });
+    box_.append(grid_);
 
     windows_ = std::make_unique<WindowList>();
     box_.append(*windows_);
@@ -395,20 +547,93 @@ void Panel::install_status_handler() {
     };
 }
 
+void Panel::show_panel_menu(double x, double y) {
+    // Rebuilt each time so the menu never holds stale buttons, and because it is
+    // three widgets -- cheaper than reasoning about when to refresh it.
+    while (Gtk::Widget* child = menu_box_.get_first_child()) menu_box_.remove(*child);
+
+    const auto add = [this](const std::string& label, sigc::slot<void()> action) {
+        auto* button = Gtk::make_managed<Gtk::Button>(label);
+        button->set_has_frame(false);
+        button->set_halign(Gtk::Align::FILL);
+        // The child label, not the button, carries the alignment: a Button's own
+        // halign positions the button in its parent, not its text inside itself.
+        if (auto* text = dynamic_cast<Gtk::Label*>(button->get_child())) {
+            text->set_xalign(0.0f);
+        }
+        button->signal_clicked().connect([this, action] {
+            menu_.popdown();
+            action();
+        });
+        menu_box_.append(*button);
+    };
+
+    add("Settings", [this] { show_settings(); });
+    // Only when ollamadev is installed: a menu entry that always explains it
+    // cannot work is worse than no entry.
+    if (crew_available()) add("Crew board", [this] { show_board(); });
+    add("Open a terminal", [this] {
+        if (!config_.terminal.empty()) launch(config_.terminal);
+    });
+
+    auto* separator = Gtk::make_managed<Gtk::Separator>(Gtk::Orientation::HORIZONTAL);
+    menu_box_.append(*separator);
+
+    add("Quit Auspex", [this] { confirm_quit(); });
+
+    menu_.set_pointing_to(Gdk::Rectangle(static_cast<int>(x), static_cast<int>(y), 1, 1));
+    menu_.popup();
+}
+
+void Panel::confirm_quit() {
+    // A second, deliberate step. Quitting takes down both panels, the desktop and
+    // the canvas at once, and there is no undo -- so it is worth one more click,
+    // and worth saying plainly what goes away.
+    auto dialog = Gtk::AlertDialog::create();
+    dialog->set_message("Quit Auspex?");
+    dialog->set_detail(
+        "Both panels, the desktop canvas and voice control will close. Your open "
+        "windows stay where they are.");
+    dialog->set_buttons({"Cancel", "Quit"});
+    dialog->set_cancel_button(0);
+    dialog->set_default_button(0);
+
+    dialog->choose(*this, [this, dialog](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        int choice = 0;
+        try {
+            choice = dialog->choose_finish(result);
+        } catch (const Glib::Error&) {
+            return;   // dismissed with Escape or the window manager
+        }
+        if (choice != 1) return;
+
+        // quit() rather than close(): closing one panel would leave the other,
+        // the desktop window and the voice worker running.
+        if (auto app = get_application()) app->quit();
+    });
+}
+
+void Panel::show_board() {
+    if (board_window_) {
+        board_window_->refresh();
+        board_window_->present();
+        return;
+    }
+    board_window_ = std::make_unique<BoardWindow>();
+    board_window_->present();
+}
+
 void Panel::show_launcher() {
     if (launcher_window_) {
         launcher_window_->present();
         return;
     }
+    // No close handler, deliberately. LauncherWindow sets hide_on_close, so closing
+    // it hides it and present() brings the same window back. The previous version
+    // destroyed the window from an idle callback on every close request -- which
+    // was fine when only the user closed it, and fatal once anything else sent a
+    // close request, because the object went away underneath this pointer.
     launcher_window_ = std::make_unique<LauncherWindow>(config_);
-    launcher_window_->signal_close_request().connect(
-        [this] {
-            // Destroyed from an idle callback: deleting the window from inside its
-            // own close handler would free the object still on the stack.
-            Glib::signal_idle().connect_once([this] { launcher_window_.reset(); });
-            return false;
-        },
-        false);
     launcher_window_->present();
 }
 
@@ -451,7 +676,7 @@ void Panel::show_chat() {
 
 void Panel::dock() {
     if (!window_id_) {
-        window_id_ = dock::find_window_id(title_);
+        window_id_ = display().find_own_window(title_);
         if (!window_id_) return;
     }
 
@@ -463,13 +688,29 @@ void Panel::dock() {
         last_layout_ = layout_for_height(last_monitor_, actual, position_);
     }
 
-    dock::apply(*window_id_, last_layout_);
+    display().dock_panel(*window_id_, overlay_panel_layout(last_layout_));
+    if (on_geometry_) {
+        // GTK reports the content allocation here (39px on the current theme),
+        // while Xfwm's actual undecorated panel window is 42px. Full-window layout
+        // needs the outer X11 edge or it starts three pixels under the top bar and
+        // stops three pixels short of the bottom one.
+        const auto outer = display().window_geometry(*window_id_);
+        on_geometry_(position_, outer ? outer->height : last_layout_.bounds.height);
+    }
 
-    // Re-check the monitor once a second. Rect has value equality, so this only
-    // acts on real changes -- panel.py compared Gdk.Rectangle objects, which never
+    // Re-check the monitor periodically. Rect has value equality, so this only acts
+    // on real changes -- panel.py compared Gdk.Rectangle objects, which never
     // compared equal, and so re-ran three subprocesses every second forever.
     // Per-instance, not static: a static flag here would let only the first of the
     // two panels ever install a watcher.
+    //
+    // Five seconds, not one. Measured on a 4-output NVIDIA box, the underlying
+    // `xrandr --listmonitors` costs 333ms -- so two panels asking once a second
+    // each spent two thirds of a core establishing that the monitors had not
+    // changed. list_monitors() also caches for 5s now, so the two panels share one
+    // call rather than making two. Between them that is ~666ms/s of work reduced to
+    // ~66ms/10s. The cost is that hot-plugging a monitor takes up to five seconds
+    // to be reflected, which nobody will notice.
     if (!watching_geometry_) {
         watching_geometry_ = true;
         Glib::signal_timeout().connect(
@@ -477,7 +718,7 @@ void Panel::dock() {
                 refresh_geometry();
                 return true;
             },
-            1000);
+            5000);
     }
 }
 
@@ -490,7 +731,14 @@ void Panel::refresh_geometry() {
     last_layout_     = layout_for_height(last_monitor_, height, position_);
     set_default_size(last_layout_.bounds.width, last_layout_.bounds.height);
 
-    if (window_id_) dock::apply(*window_id_, last_layout_);
+    if (window_id_) {
+        display().dock_panel(*window_id_, overlay_panel_layout(last_layout_));
+    }
+    if (on_geometry_) {
+        const auto outer = window_id_ ? display().window_geometry(*window_id_)
+                                      : std::optional<Rect>{};
+        on_geometry_(position_, outer ? outer->height : last_layout_.bounds.height);
+    }
 }
 
 void Panel::launch(const std::string& command) {

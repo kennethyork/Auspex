@@ -123,9 +123,9 @@ std::optional<std::string> OllamaClient::version() {
     return j["version"].get<std::string>();
 }
 
-std::vector<std::string> OllamaClient::list_models() {
+std::vector<std::string> OllamaClient::list_models(std::chrono::seconds timeout) {
     std::vector<std::string> names;
-    const auto res = get("/api/tags", std::chrono::seconds(10));
+    const auto res = get("/api/tags", timeout);
     if (!res.ok) return names;
 
     const json j = json::parse(res.body, nullptr, false);
