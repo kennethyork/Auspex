@@ -220,6 +220,7 @@ target_link_libraries(auspex-miniaudio PUBLIC Threads::Threads ${CMAKE_DL_LIBS} 
 # ---------------------------------------------------------------------------
 add_library(auspex-core STATIC
     src/config.cpp
+    src/autostart.cpp
     src/ollama_client.cpp
     src/audio.cpp
     src/asr.cpp

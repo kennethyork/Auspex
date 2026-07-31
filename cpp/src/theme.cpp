@@ -61,10 +61,9 @@ window,
 
 /* Panels are translucent, so the canvas and the wallpaper show through them.
  *
- * Scoped to .auspex-panel deliberately: the rules above paint every window,
- * and applying alpha there would also make the settings, chat and launcher
- * windows see-through -- which is unreadable over a photograph rather than
- * stylish. Only the two bars opt in.
+ * Scoped to .auspex-panel rather than applied to the `window` rules above: those
+ * paint every window Auspex has, including ones full of text, and each surface
+ * needs its own alpha rather than one blanket value.
  *
  * The inner `box` selectors are not redundant. The generic `box` rule below
  * paints an opaque background over the whole panel interior, so making only the
@@ -81,6 +80,31 @@ window.auspex-panel,
 window.auspex-panel > box,
 window.auspex-panel box,
 window.auspex-panel .background {
+    background-color: alpha($panel_bg, 0.95);
+}
+
+/* Auspex's own windows -- launcher, chat, settings, board -- sit at the same
+ * weight as the bars, so the desktop reads as one surface rather than a
+ * translucent strip with opaque boxes floating over it.
+ *
+ * What is deliberately NOT translucent is everything you actually read. Entries,
+ * buttons, list rows, message bubbles and code blocks all set their own opaque
+ * background further down, and those rules win here: only the window itself and
+ * the layout boxes between the content go see-through. Text over a photograph is
+ * the failure mode this design exists to avoid, and it is avoided by choosing
+ * WHICH surfaces are glass, not by picking a timid alpha.
+ *
+ * scrolledwindow and viewport are named because GTK paints them itself; without
+ * them a scrolling list would be an opaque rectangle inside a glass window.
+ *
+ * Same 0.95 as the panels, and for the same reason -- one number for the whole
+ * shell means these windows never look like they belong to a different program. */
+window.auspex-window,
+window.auspex-window > box,
+window.auspex-window box,
+window.auspex-window scrolledwindow,
+window.auspex-window viewport,
+window.auspex-window .background {
     background-color: alpha($panel_bg, 0.95);
 }
 

@@ -183,7 +183,40 @@ std::vector<PlacedWindow> parse_placed_windows(const std::string& output) {
 }
 
 std::vector<PlacedWindow> list_placed_windows() {
-    return display().windows_with_geometry();
+    auto placed = display().windows_with_geometry();
+
+    // Converted to FRAME geometry, which is the coordinate space every other part of
+    // this project speaks. move_window writes frame coordinates, the canvas lays out
+    // in frame coordinates, and the layout compares the two -- so a read-back in any
+    // other space is not a different convention, it is a permanent error.
+    //
+    // wmctrl -lG reports a position that is neither the frame nor the client. It
+    // asks X for the client's offset INSIDE its frame and then translates that same
+    // offset to root coordinates, so the decoration is counted twice:
+    //
+    //     reported = frame + 2 x (left, top)
+    //
+    // Measured across seven windows -- decorated, undecorated and maximised. An
+    // undecorated window has zero extents and is untouched, which is why this went
+    // unnoticed for so long: the panels and the desktop substrate were always right.
+    //
+    // The consequence was not cosmetic. A titlebar 29px tall made every window read
+    // back 58px below where it had just been put, the layout took that for a drag by
+    // the user, wrote it into the canvas, and every window walked steadily down the
+    // screen -- until it no longer fitted and the canvas parked it off the edge.
+    //
+    // The size is converted too: wmctrl gives the client size, and what the layout
+    // reasons about is the space a window occupies including its decoration.
+    for (auto& entry : placed) {
+        const auto frame = frame_extents(entry.window.id);
+        if (!frame) continue;
+        entry.bounds.x      -= 2 * frame->left;
+        entry.bounds.y      -= 2 * frame->top;
+        entry.bounds.width  += frame->left + frame->right;
+        entry.bounds.height += frame->top  + frame->bottom;
+    }
+
+    return placed;
 }
 
 std::string canonical_window_id(std::string_view id) {
@@ -464,6 +497,37 @@ std::optional<MonitorInfo> primary_monitor() {
     return monitors.front();
 }
 
+std::optional<Rect> screen_bounds(const std::vector<MonitorInfo>& monitors) {
+    bool first = true;
+    int  left = 0, top = 0, right = 0, bottom = 0;
+
+    for (const auto& monitor : monitors) {
+        const Rect& bounds = monitor.bounds;
+        // A zero-sized output is a disconnected one xrandr still lists. Including it
+        // would drag the union to the origin and make everything left of the primary
+        // monitor look like screen.
+        if (bounds.width <= 0 || bounds.height <= 0) continue;
+
+        if (first) {
+            left = bounds.x;
+            top  = bounds.y;
+            right  = bounds.x + bounds.width;
+            bottom = bounds.y + bounds.height;
+            first = false;
+            continue;
+        }
+        left   = std::min(left, bounds.x);
+        top    = std::min(top, bounds.y);
+        right  = std::max(right, bounds.x + bounds.width);
+        bottom = std::max(bottom, bounds.y + bounds.height);
+    }
+
+    if (first) return std::nullopt;
+    return Rect{.x = left, .y = top, .width = right - left, .height = bottom - top};
+}
+
+std::optional<Rect> screen_bounds() { return screen_bounds(list_monitors()); }
+
 std::vector<Workspace> list_workspaces() {
     return display().workspaces();
 }
@@ -531,6 +595,10 @@ std::optional<std::string> focused_window_title() {
 
 std::optional<std::string> selected_text() {
     return display().primary_selection();
+}
+
+bool can_read_selection() {
+    return display().can_read_selection();
 }
 
 bool type_text(std::string_view text) {

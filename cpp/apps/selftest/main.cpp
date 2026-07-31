@@ -7,6 +7,7 @@
 //   auspex-selftest              run all checks
 //   auspex-selftest --css NAME   print a theme's stylesheet
 //   auspex-selftest --themes     list theme names
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <filesystem>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "auspex/agents.hpp"
+#include "auspex/autostart.hpp"
 #include "auspex/canvas.hpp"
 #include "auspex/commands.hpp"
 #include "auspex/crew.hpp"
@@ -100,6 +102,37 @@ void test_css() {
           "panel translucency is scoped to the panels");
     check(css.find("alpha(#1a1b26, 0.95)") != std::string::npos,
           "panels use xfce4-panel's own 95% background alpha");
+
+    // The shell's other windows are glass at the same weight, and by the same
+    // scoping rule: a class, never the bare `window` selector.
+    check(css.find("window.auspex-window") != std::string::npos,
+          "window translucency is scoped to Auspex's own windows");
+
+    // The alpha must never escape its two classes. If it ever appeared on a bare
+    // selector, every dialog on the desktop would go see-through -- including ones
+    // Auspex does not own.
+    for (std::size_t at = css.find("alpha(#1a1b26, 0.95)"); at != std::string::npos;
+         at = css.find("alpha(#1a1b26, 0.95)", at + 1)) {
+        const std::size_t block = css.rfind('}', at);
+        const std::string selectors =
+            css.substr(block == std::string::npos ? 0 : block,
+                       at - (block == std::string::npos ? 0 : block));
+        check(selectors.find("auspex-panel") != std::string::npos ||
+                  selectors.find("auspex-window") != std::string::npos,
+              "every 95% alpha rule is scoped to an Auspex class");
+    }
+
+    // Reading surfaces stay opaque. These are the backgrounds that sit on top of
+    // the glass, and the whole design rests on them not inheriting it.
+    for (const char* opaque : {".user-message", ".assistant-message", ".code-block",
+                               "entry {", "row {"}) {
+        const std::size_t at = css.find(opaque);
+        check(at != std::string::npos, std::string("opaque surface present: ") + opaque);
+        if (at == std::string::npos) continue;
+        const std::size_t end = css.find('}', at);
+        check(css.substr(at, end - at).find("alpha(") == std::string::npos,
+              std::string("text surface is not translucent: ") + opaque);
+    }
 
     for (const char* selector : {"preferencespage", "preferencesgroup", "actionrow",
                                  ".navigationview", ".launcher-button", ".active-workspace",
@@ -418,7 +451,11 @@ public:
     std::optional<std::string> current_wallpaper() override { return canned_wallpaper; }
 
     bool type_text(std::string_view) override { return true; }
-    std::optional<std::string> primary_selection() override { return std::nullopt; }
+    std::optional<std::string> primary_selection() override { return canned_selection; }
+    bool can_read_selection() override { return selection_readable; }
+
+    std::optional<std::string> canned_selection;
+    bool                       selection_readable = false;
 };
 
 void test_display_seam() {
@@ -438,7 +475,52 @@ void test_display_seam() {
         check(!auspex::switch_workspace(2), "workspace switch fails softly");
         check(!auspex::type_text("hello"), "typing fails softly");
         check(!auspex::selected_text().has_value(), "no selection without a display server");
+        check(!auspex::can_read_selection(),
+              "null backend admits it cannot read the selection");
         check(!auspex::focused_window_title().has_value(), "no focused title");
+    }
+
+    // The two questions must stay distinguishable. A backend that can read the
+    // selection and finds it empty is a different state from one that has no way to
+    // look, and collapsing them is what made the speak button claim nothing was
+    // selected while the user's text sat there highlighted.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        auspex::set_display_server(std::move(recorder));
+
+        rec->selection_readable = true;
+        rec->canned_selection.reset();
+        check(auspex::can_read_selection(), "readable backend says so");
+        check(!auspex::selected_text().has_value(),
+              "readable backend with an empty selection still returns nothing");
+
+        rec->canned_selection = "highlighted words";
+        check_eq(auspex::selected_text().value_or(""), std::string("highlighted words"),
+                 "a selection reads back verbatim");
+
+        rec->selection_readable = false;
+        check(!auspex::can_read_selection(), "unreadable backend says so");
+    }
+
+    // The helper flags. Both tools default to a selection we do not want, so a
+    // wrong argv here fails as a permanently empty selection rather than an error.
+    {
+        const auto xclip = auspex::selection_command("xclip");
+        check_eq(xclip.size(), std::size_t{4}, "xclip command is fully specified");
+        check(std::find(xclip.begin(), xclip.end(), "primary") != xclip.end(),
+              "xclip is asked for the primary selection, not the clipboard");
+
+        const auto xsel = auspex::selection_command("xsel");
+        check(std::find(xsel.begin(), xsel.end(), "--primary") != xsel.end(),
+              "xsel is asked for the primary selection");
+        check(std::find(xsel.begin(), xsel.end(), "--output") != xsel.end(),
+              "xsel is asked to print rather than to read stdin");
+
+        check(auspex::selection_command("wl-paste").empty(),
+              "an unknown selection tool yields no command rather than a guess");
+        check(auspex::selection_command("").empty(),
+              "no tool yields no command");
     }
 
     // apply_positions: the canvas-to-screen arithmetic, now checkable exactly.
@@ -463,6 +545,145 @@ void test_display_seam() {
             check(rec->moves[1] == std::make_tuple(std::string("0xB"), -2400, 1250),
                   "an off-viewport window keeps following its canvas coordinates");
         }
+    }
+
+    // Multi-head containment: the canvas owns ONE monitor and must not put anything
+    // on the others. This is the bug where zooming or panning pushed windows off the
+    // canvas and straight onto the screen next door, in full view.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        auspex::set_display_server(std::move(recorder));
+
+        // Kenny's actual desk: three 1920s in a row plus a small panel on the end,
+        // with the canvas on the middle one. Both neighbours are occupied, which is
+        // exactly the layout that makes "off the primary monitor" meaningless.
+        const auspex::Rect monitor{1920, 0, 1920, 1080};
+        const auspex::Rect screen{0, 0, 6784, 1080};
+
+        const std::vector<auspex::ScreenPosition> positions{
+            {.id = "0xA", .x = 10, .y = 20, .visible = true},
+            // Panned right: a negative offset, which lands on the monitor at x=0.
+            {.id = "0xLEFT", .x = -800, .y = 100, .visible = false},
+            // Zoomed in: past the right edge, onto the monitor at x=3840.
+            {.id = "0xRIGHT", .x = 2400, .y = 100, .visible = false},
+        };
+        check(auspex::apply_positions(positions, monitor, &screen),
+              "apply_positions succeeds with a screen union");
+
+        check_eq(rec->moves.size(), std::size_t{3}, "every window was placed");
+        if (rec->moves.size() == 3) {
+            check(rec->moves[0] == std::make_tuple(std::string("0xA"), 1930, 20),
+                  "a visible window still lands on the canvas's own monitor");
+
+            const auto slot = auspex::park_slot(monitor, screen);
+            check(rec->moves[1] == std::make_tuple(std::string("0xLEFT"), slot.x, slot.y),
+                  "a window panned off the left edge is parked, not dropped on the "
+                  "monitor to the left");
+            check(rec->moves[2] == std::make_tuple(std::string("0xRIGHT"), slot.x, slot.y),
+                  "a window zoomed off the right edge is parked, not dropped on the "
+                  "monitor to the right");
+
+            // The whole point: the park slot is outside every monitor.
+            check(slot.y >= screen.y + screen.height,
+                  "the park slot is below the entire screen arrangement");
+            check(slot.x >= screen.x && slot.x < screen.x + screen.width,
+                  "and horizontally inside it, so no window manager pulls it back");
+        }
+    }
+
+    // Without a union, behaviour is exactly what it was. One monitor needs no
+    // parking, and paying for a relocation there would be a regression.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        auspex::set_display_server(std::move(recorder));
+
+        const auspex::Rect monitor{0, 0, 1920, 1080};
+        const std::vector<auspex::ScreenPosition> positions{
+            {.id = "0xB", .x = -2500, .y = 1200, .visible = false},
+        };
+        check(auspex::apply_positions(positions, monitor, nullptr),
+              "apply_positions succeeds without a screen union");
+        check_eq(rec->moves.size(), std::size_t{1}, "the window was moved");
+        if (!rec->moves.empty()) {
+            check(rec->moves[0] == std::make_tuple(std::string("0xB"), -2500, 1200),
+                  "with no union, an off-viewport window follows its canvas "
+                  "coordinates as before");
+        }
+    }
+
+    // A parked window is not resized: nobody can see it, and each resize costs two
+    // 60ms settling sleeps that a zoom would otherwise pay for every hidden window.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        auspex::set_display_server(std::move(recorder));
+
+        const auspex::Rect monitor{1920, 0, 1920, 1080};
+        const auspex::Rect screen{0, 0, 6784, 1080};
+        const std::vector<auspex::ScreenPosition> positions{
+            {.id = "0xSEEN",   .x = 0,    .y = 0, .visible = true,  .width = 800, .height = 600},
+            {.id = "0xPARKED", .x = 3000, .y = 0, .visible = false, .width = 800, .height = 600},
+        };
+        check(auspex::apply_positions(positions, monitor, &screen), "sized apply succeeds");
+        check_eq(rec->resizes.size(), std::size_t{1}, "only the visible window is resized");
+        if (!rec->resizes.empty()) {
+            check(std::get<0>(rec->resizes[0]) == "0xSEEN",
+                  "and it is the one that can actually be seen");
+        }
+        check_eq(rec->unmaximized.size(), std::size_t{1},
+                 "only the resized window has its maximised state cleared");
+    }
+
+    // The union itself. Getting this wrong puts the park slot somewhere visible.
+    {
+        using auspex::MonitorInfo;
+        const std::vector<MonitorInfo> desk{
+            {.index = 0, .connector = "DP-2",   .primary = false, .bounds = {0, 0, 1920, 1080}},
+            {.index = 1, .connector = "DP-0",   .primary = true,  .bounds = {1920, 0, 1920, 1080}},
+            {.index = 2, .connector = "HDMI-0", .primary = false, .bounds = {3840, 0, 1024, 600}},
+            {.index = 3, .connector = "DP-5",   .primary = false, .bounds = {4864, 0, 1920, 1080}},
+        };
+        const auto bounds = auspex::screen_bounds(desk);
+        check(bounds.has_value(), "a populated monitor list has a union");
+        if (bounds) {
+            check_eq(bounds->x, 0, "union starts at the leftmost edge");
+            check_eq(bounds->y, 0, "union starts at the topmost edge");
+            check_eq(bounds->width, 6784, "union spans every output");
+            check_eq(bounds->height, 1080, "union is as tall as the tallest output");
+        }
+
+        // A monitor mounted above the others must not be lost: the union has to go
+        // negative, or the park slot lands in the middle of it.
+        const std::vector<MonitorInfo> stacked{
+            {.index = 0, .connector = "A", .primary = true,  .bounds = {0, 0, 1920, 1080}},
+            {.index = 1, .connector = "B", .primary = false, .bounds = {0, -1080, 1920, 1080}},
+        };
+        const auto tall = auspex::screen_bounds(stacked);
+        check(tall.has_value(), "a stacked layout has a union");
+        if (tall) {
+            check_eq(tall->y, -1080, "union reaches the monitor above the origin");
+            check_eq(tall->height, 2160, "and is as tall as both together");
+            // The slot must clear the BOTTOM of that union, not the primary's bottom.
+            const auto slot = auspex::park_slot({0, 0, 1920, 1080}, *tall);
+            check_eq(slot.y, 1080, "the park slot clears the whole arrangement");
+        }
+
+        // Disconnected outputs are listed with no size and must not drag the union.
+        const std::vector<MonitorInfo> with_dead{
+            {.index = 0, .connector = "DEAD", .primary = false, .bounds = {0, 0, 0, 0}},
+            {.index = 1, .connector = "LIVE", .primary = true,  .bounds = {1920, 0, 1920, 1080}},
+        };
+        const auto live = auspex::screen_bounds(with_dead);
+        check(live.has_value(), "a list with a dead output still has a union");
+        if (live) {
+            check_eq(live->x, 1920, "a zero-sized output does not drag the union to 0");
+            check_eq(live->width, 1920, "nor stretch it across empty space");
+        }
+
+        check(!auspex::screen_bounds(std::vector<MonitorInfo>{}).has_value(),
+              "no monitors means no union, so parking is skipped rather than guessed");
     }
 
     // switch_workspace's confirm-poll: the policy that stayed above the seam.
@@ -541,6 +762,81 @@ void test_display_seam() {
     auspex::set_display_server(nullptr);
     check(auspex::display().name() != std::string_view("recording"),
           "the real backend is restored after the seam tests");
+}
+
+void test_autostart() {
+    std::cout << "autostart\n";
+
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "auspex-selftest-autostart";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    const fs::path entry = root / "autostart" / "auspex.desktop";
+    const fs::path binary("/opt/auspex/auspex-shell");
+
+    // Nothing written yet.
+    check(!auspex::autostart_enabled(entry), "no entry means autostart is off");
+
+    // Enabling creates the directory too: ~/.config/autostart does not exist on a
+    // machine that has never had an autostart entry, and a write into a missing
+    // directory would fail for a reason the user cannot see.
+    check(auspex::set_autostart(true, entry, binary), "enabling writes the entry");
+    check(fs::exists(entry), "the entry is where we said it would be");
+    check(auspex::autostart_enabled(entry), "a written entry reads back as enabled");
+
+    {
+        std::ifstream in(entry);
+        std::ostringstream contents;
+        contents << in.rdbuf();
+        const std::string text = contents.str();
+        check(text.find("Exec=/opt/auspex/auspex-shell") != std::string::npos,
+              "Exec is the absolute path, not a bare name PATH would have to resolve");
+        check(text.find("[Desktop Entry]") == 0,
+              "the entry starts with its group header, or no session will read it");
+        check(text.find("Type=Application") != std::string::npos,
+              "the entry declares a type");
+    }
+
+    // A session editor turning it off leaves the file behind. Reporting that as on
+    // would put a tick in the box for something that will not happen at login.
+    {
+        std::ofstream out(entry, std::ios::app);
+        out << "Hidden=true\n";
+    }
+    check(!auspex::autostart_enabled(entry),
+          "Hidden=true is off, even though the file still exists");
+
+    // Re-enabling must clear it rather than append a second, contradictory key.
+    check(auspex::set_autostart(true, entry, binary), "re-enabling rewrites the entry");
+    check(auspex::autostart_enabled(entry), "re-enabling clears Hidden=true");
+
+    check(auspex::set_autostart(false, entry, binary), "disabling succeeds");
+    check(!fs::exists(entry), "disabling removes the entry");
+    check(auspex::set_autostart(false, entry, binary),
+          "disabling something already off is not a failure");
+
+    // The parse, directly. Formatting varies by whichever tool last wrote the file.
+    check(auspex::autostart_entry_is_hidden("Hidden=true\n"), "plain Hidden=true");
+    check(auspex::autostart_entry_is_hidden("Hidden = TRUE\n"), "spaced and uppercased");
+    check(auspex::autostart_entry_is_hidden("X-GNOME-Autostart-enabled=false\n"),
+          "GNOME's own disable key");
+    check(!auspex::autostart_entry_is_hidden("Hidden=false\n"), "Hidden=false is on");
+    check(!auspex::autostart_entry_is_hidden("Name=Hidden=true\n"),
+          "a value that merely contains the text is not the key");
+    check(!auspex::autostart_entry_is_hidden(auspex::autostart_entry(binary)),
+          "our own entry is not hidden");
+
+    // An Exec pointing nowhere produces a login with no panel and no message, so
+    // the write is refused instead.
+    check(!auspex::set_autostart(true, entry, fs::path{}),
+          "refuses to write an entry with no executable");
+    check(!fs::exists(entry), "and writes nothing when it refuses");
+
+    check(auspex::own_executable() == fs::path("/proc/self/exe") ||
+              fs::exists(auspex::own_executable()),
+          "own_executable resolves to a real file");
+
+    fs::remove_all(root, ec);
 }
 
 void test_session() {
@@ -1517,6 +1813,181 @@ void test_crew() {
           "run_crew round-trips its name");
 }
 
+// The invariant Kenny asked for in one sentence: whatever the canvas does, no window
+// it places may touch a monitor other than its own.
+void test_windows_stay_on_one_monitor() {
+    std::cout << "one-monitor containment\n";
+
+    using auspex::Canvas;
+    // The real desk: canvas on the middle screen, occupied neighbours on both sides.
+    const auspex::Rect monitor{1920, 0, 1920, 1080};
+    const auspex::Rect screen{0, 0, 6784, 1080};
+
+    const auto every_window_stays_home = [&](Canvas& canvas, const char* what) {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        rec->canned_extents = auspex::FrameExtents{};
+        auspex::set_display_server(std::move(recorder));
+
+        const auto resolved = canvas.resolve(/*include_life_size=*/true);
+        auspex::apply_positions(resolved, monitor, &screen);
+
+        bool all_home = true;
+        for (const auto& [id, x, y] : rec->moves) {
+            const auto* placed = &*std::find_if(
+                resolved.begin(), resolved.end(),
+                [&](const auspex::ScreenPosition& p) { return p.id == id; });
+
+            // Judged on the geometry actually SENT to the window manager, never on
+            // an internal flag. Several different decisions inside apply_positions
+            // can end in a park -- off-viewport, or a squeeze too tight for an
+            // application to honour -- and the invariant is about the outcome, not
+            // about which branch produced it.
+            //
+            // The size likewise comes from the resize that was issued, because an
+            // oversized window is capped at the monitor edge and the pre-cap number
+            // would be testing an intention rather than an effect.
+            const auto sized = std::find_if(
+                rec->resizes.begin(), rec->resizes.end(),
+                [&](const auto& r) { return std::get<0>(r) == id; });
+            const int width  = sized != rec->resizes.end()
+                                   ? std::get<1>(*sized) : std::max(1, placed->width);
+            const int height = sized != rec->resizes.end()
+                                   ? std::get<2>(*sized) : std::max(1, placed->height);
+
+            const bool parked = y >= screen.y + screen.height;
+            const bool inside = x >= monitor.x && y >= monitor.y &&
+                                x + width  <= monitor.x + monitor.width &&
+                                y + height <= monitor.y + monitor.height;
+            if (!parked && !inside) all_home = false;
+        }
+        check(all_home, std::string("nothing leaves the monitor: ") + what);
+        auspex::set_display_server(nullptr);
+    };
+
+    // Two windows fitted to the screen, then every zoom step, then panned around.
+    Canvas canvas;
+    canvas.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+    canvas.set_insets(42, 43);
+    canvas.place("0xA", {.x = 0,   .y = 42, .width = 960, .height = 995});
+    canvas.place("0xB", {.x = 960, .y = 42, .width = 960, .height = 995});
+    every_window_stays_home(canvas, "after a fit");
+
+    for (int step = 0; step < 6; ++step) {
+        canvas.zoom_by(1.0 / 1.15);
+        every_window_stays_home(canvas, "zoomed out");
+    }
+    for (int step = 0; step < 10; ++step) {
+        canvas.zoom_by(1.15);
+        every_window_stays_home(canvas, "zoomed back in");
+    }
+    canvas.reset_zoom();
+    every_window_stays_home(canvas, "back at 1:1");
+
+    // Panning in every direction, including far enough that everything is off-canvas.
+    for (const auto& [dx, dy] : std::vector<std::pair<int, int>>{
+             {480, 0}, {480, 0}, {480, 0}, {0, 400}, {0, 400},
+             {-2000, 0}, {-2000, 0}, {0, -1600}}) {
+        canvas.pan_by(dx, dy);
+        every_window_stays_home(canvas, "panned");
+    }
+
+    // A window larger than the screen must be SHOWN, capped, not swallowed.
+    {
+        Canvas big;
+        big.set_viewport({.x = 0, .y = 0, .width = 1920, .height = 1080});
+        big.place("0xHUGE", {.x = 0, .y = 0, .width = 3000, .height = 1600});
+        const auto resolved = big.resolve(/*include_life_size=*/true);
+        check(!resolved.empty() && resolved[0].visible,
+              "a window bigger than the screen is shown, not parked out of sight");
+        every_window_stays_home(big, "oversized window");
+    }
+}
+
+void test_placed_geometry_is_frame_space() {
+    std::cout << "placed geometry\n";
+
+    // wmctrl -lG reports frame + 2x(left, top): it asks X for the client's offset
+    // inside its own frame, then translates THAT offset to root coordinates, so the
+    // decoration is counted twice. Everything else in the project -- move_window,
+    // the canvas, the layout comparison -- works in frame coordinates.
+    //
+    // The numbers below are measured, not invented: an xfce4-terminal placed by the
+    // canvas at frame (1920, 42) with a 29px titlebar and 5px borders reads back
+    // from wmctrl as (1930, 100), 58px lower than where it had just been put.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        rec->canned_extents = auspex::FrameExtents{.left = 5, .right = 5,
+                                                   .top = 29, .bottom = 5};
+        rec->canned_placed = {{
+            .window = {.id = "0x03400003", .workspace = 0, .title = "Terminal"},
+            .bounds = {.x = 1930, .y = 100, .width = 1910, .height = 961},
+        }};
+        auspex::set_display_server(std::move(recorder));
+
+        const auto placed = auspex::list_placed_windows();
+        check_eq(placed.size(), std::size_t{1}, "one placed window");
+        if (!placed.empty()) {
+            check_eq(placed[0].bounds.x, 1920,
+                     "the doubled left border is removed, giving the frame x");
+            check_eq(placed[0].bounds.y, 42,
+                     "the doubled titlebar is removed, giving the frame y -- this is "
+                     "the 58px that was being mistaken for a drag every tick");
+            check_eq(placed[0].bounds.width, 1920,
+                     "width becomes the frame width, borders included");
+            check_eq(placed[0].bounds.height, 995,
+                     "height becomes the frame height, titlebar included");
+        }
+    }
+
+    // An undecorated window has no extents and must come back untouched. The panels
+    // and the desktop substrate are all undecorated, which is exactly why this bug
+    // stayed invisible in everything Auspex places for itself.
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        rec->canned_extents = auspex::FrameExtents{};
+        rec->canned_placed = {{
+            .window = {.id = "0x02a0000f", .workspace = 0, .title = "Auspex Panel"},
+            .bounds = {.x = 1920, .y = 1037, .width = 1920, .height = 43},
+        }};
+        auspex::set_display_server(std::move(recorder));
+
+        const auto placed = auspex::list_placed_windows();
+        check_eq(placed.size(), std::size_t{1}, "one undecorated window");
+        if (!placed.empty()) {
+            check_eq(placed[0].bounds.x, 1920, "undecorated x is unchanged");
+            check_eq(placed[0].bounds.y, 1037, "undecorated y is unchanged");
+            check_eq(placed[0].bounds.width, 1920, "undecorated width is unchanged");
+            check_eq(placed[0].bounds.height, 43, "undecorated height is unchanged");
+        }
+    }
+
+    // Firefox, maximised on the monitor at the origin: titlebar only, no borders.
+    // Measured as wm=(0,48) against a real frame of (0,0).
+    {
+        auto recorder = std::make_unique<RecordingDisplay>();
+        auto* rec = recorder.get();
+        rec->canned_extents = auspex::FrameExtents{.left = 0, .right = 0,
+                                                   .top = 24, .bottom = 0};
+        rec->canned_placed = {{
+            .window = {.id = "0x04400004", .workspace = 0, .title = "Firefox"},
+            .bounds = {.x = 0, .y = 48, .width = 1920, .height = 1056},
+        }};
+        auspex::set_display_server(std::move(recorder));
+
+        const auto placed = auspex::list_placed_windows();
+        if (!placed.empty()) {
+            check_eq(placed[0].bounds.x, 0, "a titlebar-only window keeps its x");
+            check_eq(placed[0].bounds.y, 0,
+                     "and lands at the top of its monitor, not 48px down it");
+        }
+    }
+
+    auspex::set_display_server(nullptr);
+}
+
 void test_frame_extents() {
     std::cout << "frame extents\n";
     using auspex::parse_frame_extents;
@@ -1568,7 +2039,7 @@ void test_zoom() {
     std::cout << "canvas zoom\n";
     using auspex::Canvas;
 
-    // Zoom scales both position and size, measured from the canvas origin.
+    // Zoom scales both position and size around the viewport centre.
     {
         Canvas canvas;
         canvas.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 1000});
@@ -1583,7 +2054,9 @@ void test_zoom() {
 
         canvas.set_zoom(0.5);
         auto at_half = canvas.resolve();
-        check(at_half[0].x == 50 && at_half[0].y == 100, "position halves");
+        check(at_half[0].x == 50 && at_half[0].y == 100,
+              "position scales from the viewport origin, so nothing acquires a "
+              "negative coordinate it would have to be parked for");
         check(at_half[0].width == 200 && at_half[0].height == 150, "size halves too");
 
         canvas.reset_zoom();
@@ -1594,17 +2067,33 @@ void test_zoom() {
               "an explicit 1.0 zoom restores the real window's natural size");
     }
 
-    // Zoom must NOT move the viewport. Scaling happens toward the origin, so the
-    // occupied area only shrinks -- a canvas that owns one monitor can then never
-    // push a window past an edge by zooming.
+    // Both zoom directions preserve the canvas point under the screen centre.
     {
         Canvas canvas;
+        // The viewport origin is the anchor. Zoom must not pan the canvas, because
+        // on a one-monitor canvas a shifted origin puts the top-left windows at
+        // negative screen coordinates -- off the side, where the only thing to hang
+        // over is another display, so they get parked and the screen empties.
         canvas.set_viewport({.x = 40, .y = 60, .width = 1000, .height = 1000});
+        canvas.place("0x1", {.x = 40, .y = 60, .width = 400, .height = 300});
+
         canvas.zoom_by(0.5);
-        const auto v = canvas.viewport();
-        check(v.x == 40 && v.y == 60,
-              "zooming leaves the viewport alone -- the compensating shift is what "
-              "used to walk windows off the monitor");
+        check(canvas.viewport().x == 40 && canvas.viewport().y == 60,
+              "zooming out does not move the viewport");
+        canvas.zoom_by(2.0);
+        check(canvas.viewport().x == 40 && canvas.viewport().y == 60,
+              "zoom-in is the inverse of zoom-out instead of panning the canvas");
+
+        // The property that actually matters: a window sitting at the viewport
+        // origin stays at screen 0,0 through every zoom step, so it can never be
+        // pushed off an edge it has nowhere to hang over.
+        for (const double factor : {1.15, 1.15, 1.15, 1.0 / 1.15, 0.5, 2.0}) {
+            canvas.zoom_by(factor);
+            const auto resolved = canvas.resolve();
+            check(!resolved.empty() && resolved[0].x == 0 && resolved[0].y == 0,
+                  "a window at the viewport origin stays at the screen origin");
+        }
+        canvas.reset_zoom();
     }
 
     // Limits, and that they clamp rather than wrap or invert.
@@ -1614,11 +2103,22 @@ void test_zoom() {
         for (int i = 0; i < 40; ++i) canvas.zoom_by(0.5);
         check(canvas.zoom() >= 0.33, "cannot zoom out past the floor");
         for (int i = 0; i < 40; ++i) canvas.zoom_by(2.0);
-        check(canvas.zoom() <= 1.0,
-              "cannot zoom in past LIFE SIZE -- beyond it a window is bigger than "
-              "the monitor and no layout can keep it off the next one");
+        check(canvas.zoom() <= 3.0, "cannot zoom in past the ceiling");
         canvas.zoom_by(0.0);
-        check(canvas.zoom() <= 1.0 && canvas.zoom() > 0, "a zero factor is ignored");
+        check(canvas.zoom() <= 3.0 && canvas.zoom() > 0, "a zero factor is ignored");
+
+        // A step that cannot move must SAY it did not move. The caller re-places
+        // every managed window on a true, and doing that at the limit is a visible
+        // hitch for no change -- which is what made "+" feel broken at 1:1.
+        check(!canvas.zoom_by(2.0), "a step at the ceiling reports no change");
+        check(!canvas.zoom_by(0.0), "a zero factor reports no change");
+        canvas.reset_zoom();
+        check(!canvas.reset_zoom(), "resetting an already-reset zoom reports no change");
+        check(canvas.zoom_by(0.5), "a step that does move reports the change");
+
+        // The floor end of the same rule.
+        for (int i = 0; i < 40; ++i) canvas.zoom_by(0.5);
+        check(!canvas.zoom_by(0.5), "a step at the floor reports no change");
         canvas.zoom_by(-1.0);
         check(canvas.zoom() > 0, "a negative factor is ignored, not applied");
     }
@@ -1630,11 +2130,12 @@ void test_zoom() {
         a.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 1000});
         b.set_viewport({.x = 0, .y = 0, .width = 1000, .height = 1000});
         b.set_zoom(0.5);
+        const int b_before = b.viewport().x;
 
         a.pan_by(100, 0);
         b.pan_by(100, 0);
         check(a.viewport().x == 100, "at 1.0, 100 screen px is 100 canvas units");
-        check(b.viewport().x == 200,
+        check(b.viewport().x - b_before == 200,
               "at 0.5, the same 100 screen px is 200 canvas units -- the hand and "
               "the content stay together");
     }
@@ -1647,9 +2148,11 @@ void test_zoom() {
         canvas.set_zoom(0.5);
         canvas.note_screen_move("0x1", 300, 400);
         const auto placement = canvas.placement_of("0x1");
-        check(placement && placement->x == 600 && placement->y == 800,
-              "screen 300,400 at 0.5 zoom is canvas 600,800 -- the zoom is undone "
-              "as well as the pan");
+        check(placement &&
+                  placement->x == canvas.viewport().x + 600 &&
+                  placement->y == canvas.viewport().y + 800,
+              "a screen drag at 0.5 zoom undoes zoom and includes the centred "
+              "viewport offset");
         check(placement && placement->width == 100,
               "and the natural size is not overwritten by a move");
     }
@@ -1871,6 +2374,7 @@ int main(int argc, char** argv) {
     test_layout();
     test_desktop_parsing();
     test_display_seam();
+    test_autostart();
     test_session();
     test_commands();
     test_browser_commands();
@@ -1881,6 +2385,8 @@ int main(int argc, char** argv) {
     test_monitors_current();
     test_minimize();
     test_crew();
+    test_windows_stay_on_one_monitor();
+    test_placed_geometry_is_frame_space();
     test_frame_extents();
     test_zoom();
     test_board();

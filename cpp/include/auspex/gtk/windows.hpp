@@ -138,6 +138,7 @@ private:
     Gtk::SpinButton memory_turns_;
     Gtk::SpinButton vad_threshold_;
     Gtk::CheckButton enable_ai_{"Enable AI features"};
+    Gtk::CheckButton autostart_{"Start Auspex when I log in"};
     Gtk::Entry terminal_;
     Gtk::Entry launcher_;
     Gtk::Label status_;

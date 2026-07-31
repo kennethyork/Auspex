@@ -17,23 +17,39 @@ namespace {
 
 // Floor on a fitted tile. A window smaller than this is technically visible and
 // practically worthless, so the grid is allowed to overflow the viewport instead.
-// Zoom limits. Out to a third; in no further than life size.
+// Zoom limits. Out to a third, in to three times life size.
 //
-// The ceiling is 1.0 on purpose, and it is a design decision rather than caution.
-// This canvas owns exactly one monitor and must never put a window on another --
-// but zooming past 1.0 makes windows LARGER than the screen, at which point there
-// is nowhere on this monitor for them to be and any layout spills onto the next
-// one. Measured: two steps of zoom-in took a 1913x1012 window to 2993x1590 and the
-// following reset placed it at x=979, on the monitor to the left.
+// The ceiling used to be 1.00, because zooming past life size makes windows LARGER
+// than the screen and the layout then spilled onto the monitor next door. Measured
+// at the time: two steps of zoom-in took a 1913x1012 window to 2993x1590 and the
+// following reset placed it at x=979, on the display to the left.
 //
-// So "zoom in" here means "back towards life size", never past it. Magnifying a
-// window beyond its own size is a compositor's job -- it can scale pixels and clip
-// to an output; repositioning real X11 windows cannot.
+// That is no longer how oversize is handled. apply_positions caps a requested size
+// at the monitor's edge and parks anything that does not belong on screen BELOW
+// every monitor, so growing past the viewport can no longer reach a neighbour --
+// see the containment test, which walks a canvas through every zoom step asserting
+// exactly that. With the spill fixed at its source, a 1.00 ceiling only made "+" a
+// button that could not do anything: at life size it re-placed every window to
+// where it already was, costing two settling sleeps each and moving nothing.
+//
+// What zoom-in means here is still worth being precise about. X11 cannot magnify a
+// window's CONTENTS -- only Auspex's own compositor will do that, through
+// wlr_scene_buffer_set_dest_size. Above 1.0 a window is given more of the screen
+// and its neighbours are pushed off the edge, so zooming in is how you go from
+// several windows sharing the monitor to one of them having it.
 constexpr double kMinZoom = 0.33;
-constexpr double kMaxZoom = 1.00;
+constexpr double kMaxZoom = 3.00;
 
 constexpr int kMinTileWidth  = 280;
 constexpr int kMinTileHeight = 200;
+
+// The narrowest a window is asked to become before the canvas gives up and parks it
+// instead. Below roughly this, applications start refusing the resize and keep their
+// old size -- which on a canvas that owns one monitor means hanging over onto the
+// next one. Chosen to match the tile floor: a window too small to be a tile is too
+// small to be worth showing.
+constexpr int kMinPlacedWidth  = kMinTileWidth;
+constexpr int kMinPlacedHeight = kMinTileHeight;
 
 }  // namespace
 
@@ -139,15 +155,33 @@ bool Canvas::is_hidden(const std::string& window_id) const {
     return hidden_.count(window_id) != 0;
 }
 
-void Canvas::set_zoom(double zoom) {
-    zoom_ = std::clamp(zoom, kMinZoom, kMaxZoom);
+bool Canvas::set_zoom(double zoom) {
+    const double next = std::clamp(zoom, kMinZoom, kMaxZoom);
+    if (std::abs(next - zoom_) < 1e-9) return false;
+
+    // The viewport ORIGIN is the anchor, not its centre.
+    //
+    // Centre-anchoring is the right choice for a canvas that can scroll freely in
+    // every direction, and the wrong one for a canvas that owns a single monitor.
+    // Holding the centre fixed means zooming IN slides the viewport origin forward
+    // into canvas space, which puts every window that was at the left or top edge
+    // at a NEGATIVE screen coordinate -- off the side of the monitor. There is no
+    // free space there to hang off into, only the user's other screen, so those
+    // windows are parked. Measured: from a normal two-column fit, one press of "+"
+    // sent both windows off the canvas at once and the monitor went empty.
+    //
+    // Anchoring the origin means zoom only ever grows or shrinks the layout away
+    // from the top-left corner the fit already anchored it to. Nothing acquires a
+    // negative coordinate, so nothing is pushed off an edge it cannot hang over.
+    zoom_ = next;
+    return true;
 }
 
-void Canvas::reset_zoom() { zoom_ = 1.0; }
+bool Canvas::reset_zoom() { return set_zoom(1.0); }
 
-void Canvas::zoom_by(double factor) {
-    if (factor <= 0.0) return;
-    zoom_ = std::clamp(zoom_ * factor, kMinZoom, kMaxZoom);
+bool Canvas::zoom_by(double factor) {
+    if (factor <= 0.0) return false;
+    return set_zoom(zoom_ * factor);
 }
 
 void Canvas::pan_by(int dx, int dy) {
@@ -204,15 +238,19 @@ std::vector<ScreenPosition> Canvas::resolve(bool include_life_size) const {
 
         // A window is shown only if it fits ENTIRELY within the viewport.
         //
-        // The generous version of this test -- origin anywhere within a screen's
-        // width -- let a window near the right edge hang over onto the NEXT
-        // monitor, because X11 gives no way to clip a foreign window to a
-        // rectangle. The canvas owns one screen, so anything that would spill is
-        // parked instead.
+        // The generous version of this test -- any overlap counts -- lets a window
+        // straddle the edge, and on X11 a window that straddles the edge of one
+        // monitor is physically drawn across the next one, because there is no way
+        // to clip a window we do not own. Panning right by half a screen put half a
+        // terminal on the display to the left, in full view. The canvas owns one
+        // monitor, so anything that would spill is parked instead.
         //
         // The cost is that windows pop in and out at the edges of a pan rather than
         // sliding smoothly across them. That is the honest trade on X11: the only
         // alternative is letting the canvas leak onto screens it does not own.
+        //
+        // What this rule must NOT do is hide a window that has nowhere better to be.
+        // See the oversized case below.
         const int width  = placement.width  > 0
                                ? static_cast<int>(placement.width  * zoom_) : 0;
         const int height = placement.height > 0
@@ -226,9 +264,22 @@ std::vector<ScreenPosition> Canvas::resolve(bool include_life_size) const {
         const int top    = inset_top_;
         const int bottom = viewport_.height - inset_bottom_;
 
-        position.visible = position.x >= 0 && position.y >= top &&
-                           position.x + width  <= viewport_.width &&
-                           position.y + height <= bottom;
+        // A window bigger than the band can never satisfy "fits entirely", and
+        // parking it would mean it silently vanished -- open something larger than
+        // the screen, or drag a window taller than the gap between the bars, and the
+        // desktop would appear to swallow it. Those are judged on their ORIGIN
+        // instead: shown, anchored at the edge they start from, with apply_positions
+        // capping the size so the overflow still cannot reach the next monitor.
+        const int band      = std::max(1, bottom - top);
+        const bool oversized = width > viewport_.width || height > band;
+
+        position.visible =
+            oversized
+                ? (position.x >= 0 && position.x < viewport_.width &&
+                   position.y >= top && position.y < bottom)
+                : (position.x >= 0 && position.y >= top &&
+                   position.x + width  <= viewport_.width &&
+                   position.y + height <= bottom);
 
         result.push_back(std::move(position));
     }
@@ -259,12 +310,30 @@ std::optional<Rect> Canvas::content_bounds(int tile_width, int tile_height) cons
 }
 
 // ---------------------------------------------------------------------------
-bool apply_positions(const std::vector<ScreenPosition>& positions, const Rect& monitor) {
+Rect park_slot(const Rect& monitor, const Rect& screen) {
+    return Rect{.x = monitor.x,
+                .y = screen.y + screen.height,
+                .width = monitor.width,
+                .height = monitor.height};
+}
+
+bool apply_positions(const std::vector<ScreenPosition>& positions, const Rect& monitor,
+                     const Rect* screen) {
     bool all_ok = true;
 
     for (const auto& position : positions) {
         int x = position.x + monitor.x;
         int y = position.y + monitor.y;
+
+        // Parked, not merely off-viewport. resolve() has already decided this window
+        // does not fit; without the redirect it is moved to wherever its canvas
+        // coordinate happens to land, and on a multi-head desk that is the monitor
+        // next door rather than nowhere.
+        //
+        // Only when a screen was supplied. With one monitor the union IS the
+        // monitor, and following the canvas coordinate off the edge is both correct
+        // and cheaper than a relocation.
+        bool parking = screen != nullptr && !position.visible;
 
         // A maximised window ignores position AND size changes entirely, so the
         // state must be cleared first. The result is deliberately not checked: a
@@ -281,7 +350,50 @@ bool apply_positions(const std::vector<ScreenPosition>& positions, const Rect& m
         // Only when a resize is requested, which means a fit or a zoom. Those are
         // user-initiated and infrequent; a pan must never pay this cost, and a pan
         // cannot hit the bug because a maximised window is not being resized.
-        const bool resizing = position.width > 0 && position.height > 0;
+        // What the window is allowed to occupy, once it is on this monitor.
+        //
+        // A zoom scales sizes without bound, and a window grown past the right or
+        // bottom edge does not stop at the bezel -- it carries on across the user's
+        // next screen, because X11 has no way to clip a window we do not own. Capping
+        // here is what keeps the canvas on one monitor: zoom in and windows grow
+        // until they reach the edge, then stop.
+        //
+        // Only when a screen union was supplied. With a single monitor there is
+        // nothing to spill onto and the cap would just be a smaller zoom.
+        int want_width  = position.width;
+        int want_height = position.height;
+        if (screen != nullptr && !parking && want_width > 0 && want_height > 0) {
+            const int capped_width  = std::min(want_width,  monitor.width  - position.x);
+            const int capped_height = std::min(want_height, monitor.height - position.y);
+
+            // A cap only works if the window agrees to it. Applications set minimum
+            // sizes -- xfce4-terminal will not go below about 285px, because that is
+            // its narrowest whole number of character cells -- and a window that
+            // refuses to shrink stays its old width and hangs over the edge anyway.
+            // Measured: asked for 45px, kept 285, and 240px of it sat on the display
+            // next door.
+            //
+            // So a squeeze that would go below what applications generally honour is
+            // not attempted at all. The window is parked instead, which is the one
+            // outcome that is certain not to spill.
+            if (capped_width < kMinPlacedWidth || capped_height < kMinPlacedHeight) {
+                parking = true;
+            } else {
+                want_width  = capped_width;
+                want_height = capped_height;
+            }
+        }
+
+        if (parking) {
+            const Rect slot = park_slot(monitor, *screen);
+            x = slot.x;
+            y = slot.y;
+        }
+
+        // A parked window is not resized. Nobody can see it, and each resize costs
+        // two 60ms settling sleeps -- on a zoom that parks half the canvas that is
+        // the difference between a control that responds and one that stutters.
+        const bool resizing = !parking && want_width > 0 && want_height > 0;
         if (resizing) {
             display().unmaximize_window(position.id);
             std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -304,7 +416,7 @@ bool apply_positions(const std::vector<ScreenPosition>& positions, const Rect& m
         // Only a fit pass sets a size. Resizing on every pan would be both
         // gratuitous and destructive -- it would silently overwrite whatever size
         // the user had chosen for every window, every time they scrolled.
-        if (position.width > 0 && position.height > 0) {
+        if (resizing) {
             // The requested size describes the space the window should OCCUPY, but
             // resize_window sets the CLIENT size -- and the window manager then
             // draws a title bar and borders around that. Asking for exactly the gap
@@ -316,8 +428,8 @@ bool apply_positions(const std::vector<ScreenPosition>& positions, const Rect& m
             // because they differ -- an undecorated window reports zeros and is
             // unaffected -- and only when a resize was actually requested, which is
             // a fit or a zoom, never a pan.
-            int width  = position.width;
-            int height = position.height;
+            int width  = want_width;
+            int height = want_height;
             if (frame) {
                 width  = std::max(1, width  - frame->left - frame->right);
                 height = std::max(1, height - frame->top  - frame->bottom);
@@ -342,10 +454,10 @@ bool apply_positions(const std::vector<ScreenPosition>& positions, const Rect& m
                          "place %s vis=%d in(%d,%d %dx%d) frame(l%d t%d r%d b%d) "
                          "-> move(%d,%d) size(%d,%d)\n",
                          position.id.c_str(), position.visible ? 1 : 0,
-                         position.x, position.y, position.width, position.height,
+                         position.x, position.y, want_width, want_height,
                          frame ? frame->left : -1, frame ? frame->top : -1,
                          frame ? frame->right : -1, frame ? frame->bottom : -1,
-                         x, y, position.width, position.height);
+                         x, y, want_width, want_height);
         }
 
         all_ok = display().move_window(position.id, x, y) && all_ok;

@@ -516,7 +516,14 @@ check_tool xdotool  required "windows cannot be moved, resized or minimised; no 
 check_tool xprop    required "panels cannot claim the dock layer, desktop cannot claim its own"
 check_tool xwininfo required "no window geometry, so the canvas cannot place anything"
 
-check_tool xclip    optional "speak-selection and \"ask about this\" read nothing"
+# Either one will do, so neither on its own is worth a warning -- checked as a pair.
+if command -v xclip >/dev/null 2>&1 || command -v xsel >/dev/null 2>&1; then
+    good "  xclip/xsel"
+else
+    warn "  xclip/xsel — missing: speak-selection and \"ask about this\" read nothing"
+    MISSING_OPTIONAL+=("xclip or xsel")
+fi
+
 check_tool xdg-open optional "open_path and open_url cannot open anything"
 check_tool ollama   optional "no language model, so voice commands and chat are inert"
 

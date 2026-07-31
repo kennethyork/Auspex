@@ -5,16 +5,15 @@
 // it is visible, and until now the only way to move the viewport was to say "pan
 // left" out loud. This window is the other half -- the substrate itself.
 //
-// It is a _NET_WM_WINDOW_TYPE_DESKTOP window covering the monitor, stacked below
-// everything. That is the same mechanism xfdesktop and Nautilus use to draw
-// wallpaper and icons, which matters for two reasons: the window manager keeps it
-// at the bottom without Auspex having to fight for stacking, and the pointer
-// reaches it wherever no application window is in the way. So dragging empty
-// desktop drags the canvas, exactly as it would in a drawing program.
+// It is a sticky _NET_WM_STATE_BELOW window covering the monitor, one layer above
+// xfdesktop. If both were desktop-type siblings, Mint's desktop wins the stacking
+// race and swallows every empty-space pointer event. BELOW still keeps every
+// application above Auspex, while dragging empty desktop reaches this surface and
+// moves the canvas like a drawing program.
 //
 // WHY NOT A GLOBAL POINTER GRAB: it would work, and it would also swallow every
-// click meant for an application. A desktop-type window gets precisely the events
-// that were not meant for anything else, which is the correct set.
+// click meant for an application. A below-layer window gets precisely the empty
+// area left by applications, which is the correct set.
 //
 // WHAT THIS STILL CANNOT DO: zoom, and pan smoothly. Both need the compositor.
 // Panning here repositions real X11 windows, so a drag costs one move per managed
@@ -55,6 +54,10 @@ public:
 
     // Moves the viewport and repositions the real windows to match.
     void pan_by(int dx, int dy);
+
+    // One monitor-relative navigation step, used by persistent panel controls when
+    // a full window leaves no bare desktop surface to drag.
+    void pan_step(int x_direction, int y_direction);
 
     // Back to the origin of canvas space.
     void go_home();
@@ -145,6 +148,13 @@ private:
     const Config& config_;
     Canvas&       canvas_;
     Rect          monitor_;
+
+    // Every monitor's union. Windows the canvas cannot show are parked outside this,
+    // not merely outside monitor_ -- see apply_positions. Empty until a monitor list
+    // is available, and passed as null in that case so the single-screen behaviour
+    // is what a missing answer degrades to.
+    std::optional<Rect> screen_;
+    const Rect*         screen() const { return screen_ ? &*screen_ : nullptr; }
 
     Gtk::DrawingArea area_;
     std::string      title_ = "Auspex Desktop";

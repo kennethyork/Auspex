@@ -93,13 +93,6 @@ int main(int argc, char** argv) {
         bottom =
             std::make_unique<auspex::gtk::Panel>(config, auspex::PanelPosition::Bottom, *voice);
 
-        // The panel's zoom buttons drive the same canvas the desktop surface does,
-        // so the two controls cannot disagree about the current zoom.
-        top->set_zoom_handler([&](double factor) {
-            if (factor <= 0.0) desktop->reset_zoom();
-            else               desktop->zoom_by(factor);
-        });
-        top->set_grid_handler([&] { desktop->fit_all(); });
         top->set_window_restore_handler(
             [&](const std::string& id) { desktop->restore_managed_window(id); });
         top->set_window_full_handler(
@@ -110,6 +103,19 @@ int main(int argc, char** argv) {
         };
         top->set_geometry_handler(panel_geometry);
         bottom->set_geometry_handler(panel_geometry);
+        bottom->set_pan_handler(
+            [&](int x_direction, int y_direction) {
+                desktop->pan_step(x_direction, y_direction);
+            });
+
+        // The canvas controls are all on the bottom bar now: four arrows and, in the
+        // middle of them, 1:1. A factor of 0 means "back to the grid at life size",
+        // and it drives the same canvas the desktop surface does, so the panel and
+        // the wallpaper can never disagree about where things are.
+        bottom->set_zoom_handler([&](double factor) {
+            if (factor <= 0.0) desktop->reset_zoom();
+            else               desktop->zoom_by(factor);
+        });
 
         app->add_window(*top);
         app->add_window(*bottom);

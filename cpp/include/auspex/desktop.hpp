@@ -67,6 +67,21 @@ void invalidate_desktop_caches();
 // to the first listed. nullopt only if xrandr reports nothing.
 std::optional<MonitorInfo> primary_monitor();
 
+// The rectangle covering every monitor -- the X screen the outputs are laid out on.
+//
+// This is what "off screen" has to mean on a multi-head desk. The canvas owns one
+// monitor and hides anything it cannot fit by moving it outside that monitor, but
+// outside the primary monitor is where the user's OTHER monitors are: a window
+// pushed off the left edge lands on the screen to the left, in full view. The union
+// is the only rectangle a window can be moved beyond and genuinely disappear.
+//
+// nullopt when no monitor is known, which is the same condition primary_monitor()
+// returns nullopt for.
+std::optional<Rect> screen_bounds();
+
+// Exposed for testing: the same union, over a list you supply.
+std::optional<Rect> screen_bounds(const std::vector<MonitorInfo>& monitors);
+
 // Exposed for testing against captured `xrandr --listmonitors` output.
 std::vector<MonitorInfo> parse_monitors(const std::string& listmonitors_output);
 
@@ -193,6 +208,12 @@ std::optional<std::string> focused_window_title();
 // The text the user has highlighted (the primary selection), not the clipboard
 // they explicitly copied. nullopt when nothing is selected.
 std::optional<std::string> selected_text();
+
+// Whether selected_text() can answer at all. False means the environment is missing
+// the helper it needs, and every read will come back empty no matter what is
+// highlighted -- which callers must say out loud rather than reporting as "nothing
+// selected", and must not keep retrying on a timer.
+bool can_read_selection();
 
 // Synthesises typing into whatever holds focus. How dictation delivers its result.
 bool type_text(std::string_view text);

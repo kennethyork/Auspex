@@ -548,6 +548,15 @@ void VoiceController::do_speak_selection() {
     // and never holds focus, and the async clipboard API would have to marshal back
     // to this thread anyway. This is also exactly what panel.py's context poller
     // already used.
+    // Asked before the read, not after: without a helper the read is empty whatever
+    // you have highlighted, and "Nothing selected" would be telling you your own
+    // selection does not exist. Naming the fix is the difference between a button
+    // that looks broken and one you can do something about.
+    if (!can_read_selection()) {
+        post_status("Cannot read the selection -- install xclip or xsel");
+        return;
+    }
+
     const auto selection = selected_text();
     if (!selection) {
         post_status("Nothing selected");

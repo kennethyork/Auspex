@@ -658,7 +658,11 @@ ExecResult launch_onto_canvas(const CommandContext& context,
                 tile_h = std::max(150, geometry->height);
             }
             context.canvas->place_next(window.id, tile_w, tile_h);
-            apply_positions(context.canvas->resolve(), context.monitor);
+            // The monitor union, so a window that does not fit is parked off every
+            // screen rather than onto the one next door. Cached; see screen_bounds.
+            const auto screen = screen_bounds();
+            apply_positions(context.canvas->resolve(), context.monitor,
+                            screen ? &*screen : nullptr);
             return {true, placed_message};
         }
     }
@@ -827,7 +831,9 @@ ExecResult execute_action(const Action& action, const CommandContext& context) {
             else if (action.target == "up")      context.canvas->pan_by(0, -step_y);
             else if (action.target == "down")    context.canvas->pan_by(0, step_y);
 
-            apply_positions(context.canvas->resolve(), context.monitor);
+            const auto screen = screen_bounds();
+            apply_positions(context.canvas->resolve(), context.monitor,
+                            screen ? &*screen : nullptr);
             return {true, action.target == "home" ? "Back to the origin"
                                                   : "Panned " + action.target};
         }

@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include "auspex/audio.hpp"
+#include "auspex/autostart.hpp"
 #include "auspex/crew.hpp"
 #include "auspex/gtk/voice.hpp"
 #include "auspex/ollama_client.hpp"
@@ -44,6 +45,9 @@ std::vector<std::string> split_words(const std::string& command) {
 // ---------------------------------------------------------------------------
 LauncherWindow::LauncherWindow(const Config& config) : config_(config) {
     set_title("Auspex Launcher");
+    // Opts this window into the shell's translucency. See the .auspex-window rule
+    // in theme.cpp: the glass is the window and its layout boxes, never the rows.
+    add_css_class("auspex-window");
     set_default_size(520, 560);
 
     // NOT modal. A modal window needs a transient parent to mean anything, and the
@@ -191,6 +195,7 @@ void LauncherWindow::launch_selected() {
 // ---------------------------------------------------------------------------
 BoardWindow::BoardWindow() {
     set_title("Auspex Crew Board");
+    add_css_class("auspex-window");
     set_default_size(680, 560);
     set_hide_on_close(true);
 
@@ -296,6 +301,7 @@ void BoardWindow::decide(int n, bool accept) {
 ChatWindow::ChatWindow(const Config& config, VoiceController& voice)
     : config_(config), voice_(voice) {
     set_title("Auspex");
+    add_css_class("auspex-window");
     set_default_size(680, 620);
 
     log_.set_margin(12);
@@ -420,6 +426,7 @@ void ChatWindow::add_message(const std::string& text, bool from_user) {
 // ---------------------------------------------------------------------------
 SettingsWindow::SettingsWindow(Config config) : config_(std::move(config)) {
     set_title("Auspex Settings");
+    add_css_class("auspex-window");
     set_default_size(520, 620);
 
     root_.set_margin(14);
@@ -514,6 +521,12 @@ SettingsWindow::SettingsWindow(Config config) : config_(std::move(config)) {
 
     enable_ai_.set_active(config_.enable_ai);
     root_.append(enable_ai_);
+
+    // Autostart is NOT part of config.json. It lives in the XDG autostart directory
+    // because that is the file the session reads at login -- Auspex is not running
+    // then, so a flag in its own config could not possibly start it.
+    autostart_.set_active(autostart_enabled());
+    root_.append(autostart_);
 
     status_.add_css_class("subtitle");
     status_.set_xalign(0.0f);
@@ -610,6 +623,16 @@ void SettingsWindow::save() {
     std::filesystem::rename(temporary, path, ec);
     if (ec) {
         status_.set_text("Could not replace " + path.string());
+        return;
+    }
+
+    // Applied after config.json is safely on disk, and reported separately: it is a
+    // different file in a different place, and a failure here does not mean the rest
+    // of the settings were lost.
+    const bool want_autostart = autostart_.get_active();
+    if (want_autostart != autostart_enabled() && !set_autostart(want_autostart)) {
+        status_.set_text("Settings saved, but could not write " +
+                         autostart_path().string());
         return;
     }
 

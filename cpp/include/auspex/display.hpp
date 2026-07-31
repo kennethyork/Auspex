@@ -131,14 +131,14 @@ public:
     // bearing and is the backend's business, not the caller's.
     virtual bool dock_panel(std::string_view id, const PanelLayout& layout) = 0;
 
-    // Makes a window the desktop: the bottom-most surface, covering `bounds`,
-    // present on every workspace and absent from the taskbar. This is the canvas
-    // substrate -- the thing you see and drag when no application is in the way.
+    // Makes a window the canvas substrate: above the environment's existing
+    // desktop input surface, below application windows, covering `bounds`, present
+    // on every workspace and absent from the taskbar.
     //
     // Same reasoning as dock_panel: the type hint must be set before the window
     // manager decides the stacking, so the sequence belongs to the backend. It is
-    // NOT dock_panel with different numbers -- a desktop reserves no space, sits
-    // below rather than above, and must never be raised by a click.
+    // NOT dock_panel with different numbers -- the substrate reserves no space and
+    // must never cover an application.
     virtual bool place_desktop_window(std::string_view id, const Rect& bounds) = 0;
 
     // The wallpaper image the session is already using, if it can be discovered.
@@ -163,7 +163,23 @@ public:
     // The primary selection -- the text the user has highlighted, not the clipboard
     // they explicitly copied. nullopt when nothing is selected.
     virtual std::optional<std::string> primary_selection() = 0;
+
+    // Whether the selection can be read at all, which is NOT the same question as
+    // whether anything is selected.
+    //
+    // The X11 backend reads the selection by forking a helper, and that helper is a
+    // separate package almost nobody has by default. Without this, an absent helper
+    // and an empty selection are the same nullopt -- so the shell tells you nothing
+    // is selected while your text sits there highlighted, which is a lie, and the
+    // context poller forks a doomed process several times a second forever.
+    virtual bool can_read_selection() = 0;
 };
+
+// argv that prints the primary selection using `tool`, or empty for a tool this
+// backend does not know how to drive. Separate from the class so the mapping can be
+// tested without a display: the two helpers disagree about their flags, and getting
+// one wrong fails silently as "nothing is selected".
+std::vector<std::string> selection_command(std::string_view tool);
 
 // The process-wide backend. Detects on first use if nothing was installed.
 DisplayServer& display();

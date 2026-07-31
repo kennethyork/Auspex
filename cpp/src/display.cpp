@@ -49,6 +49,7 @@ public:
 
     bool type_text(std::string_view) override { return false; }
     std::optional<std::string> primary_selection() override { return std::nullopt; }
+    bool can_read_selection() override { return false; }
 };
 
 bool env_set(const char* name) {

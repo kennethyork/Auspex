@@ -300,13 +300,18 @@ LlmContextButton::LlmContextButton(const Config& config, VoiceController& voice)
     signal_clicked().connect(
         [this] { voice_.submit(VoiceController::Action::Command); });
 
+    selection_readable_ = can_read_selection();
+
     poll();
+    // Every tick forks a helper to ask what has focus, so the interval is a running
+    // cost rather than a one-off. Half a second is imperceptible on a label that
+    // says which window you are pointing at, and costs half of what 250ms did.
     Glib::signal_timeout().connect(
         [this] {
             poll();
             return true;
         },
-        250);
+        500);
 }
 
 void LlmContextButton::poll() {
@@ -320,7 +325,11 @@ void LlmContextButton::poll() {
         return;
     }
 
-    const std::string selected = selected_text().value_or(std::string{});
+    // Guarded rather than called unconditionally. This runs on a timer, and where
+    // no selection helper is installed the call is a fork and an exec that can only
+    // ever fail -- several times a second, for as long as the shell is up.
+    const std::string selected =
+        selection_readable_ ? selected_text().value_or(std::string{}) : std::string{};
 
     if (name == window_name_ && selected == selection_) return;
     window_name_ = name;
@@ -409,20 +418,17 @@ void Panel::build_top() {
     workspaces_ = std::make_unique<WorkspaceSwitcher>(config_.workspace_count);
     box_.append(*workspaces_);
 
-    zoom_out_.set_tooltip_text("Zoom the canvas out");
-    zoom_reset_.set_tooltip_text("Back to life size");
-    zoom_in_.set_tooltip_text("Zoom the canvas in");
-    zoom_out_.signal_clicked().connect([this]   { if (on_zoom_) on_zoom_(1.0 / 1.25); });
-    zoom_reset_.signal_clicked().connect([this] { if (on_zoom_) on_zoom_(0.0); });
-    zoom_in_.signal_clicked().connect([this]    { if (on_zoom_) on_zoom_(1.25); });
-    zoom_box_.append(zoom_out_);
-    zoom_box_.append(zoom_reset_);
-    zoom_box_.append(zoom_in_);
-    box_.append(zoom_box_);
-
-    grid_.set_tooltip_text("Arrange all open windows in a grid");
-    grid_.signal_clicked().connect([this] { if (on_grid_) on_grid_(); });
-    box_.append(grid_);
+    // No zoom buttons on the top bar, and no "Grid" button either.
+    //
+    // Both were controls that promised more than X11 can deliver. Zooming in scales
+    // the layout but cannot magnify a window's CONTENTS -- only Auspex's own
+    // compositor will do that -- so the buttons grew windows until applications
+    // refused to be squeezed any further and hung over onto the next monitor. The
+    // canvas is navigated by panning, which works exactly as it says, and reset to
+    // its grid by one button. Both now live together on the bottom bar.
+    //
+    // Zoom itself is unchanged and still reachable by ctrl+scroll and by voice; it
+    // simply no longer has a button implying it is the primary way around.
 
     windows_ = std::make_unique<WindowList>();
     box_.append(*windows_);
@@ -446,6 +452,32 @@ void Panel::build_top() {
 void Panel::build_bottom() {
     button_box_.set_halign(Gtk::Align::CENTER);
     button_box_.set_hexpand(true);
+
+    // A maximised/full window leaves no empty desktop to drag. These stay on the
+    // bottom overlay, so the infinite canvas is always navigable regardless of how
+    // completely application windows cover the viewport.
+    pan_left_.set_tooltip_text("Pan canvas left");
+    pan_up_.set_tooltip_text("Pan canvas up");
+    pan_down_.set_tooltip_text("Pan canvas down");
+    pan_right_.set_tooltip_text("Pan canvas right");
+    pan_left_.signal_clicked().connect([this] { if (on_pan_) on_pan_(-1, 0); });
+    pan_up_.signal_clicked().connect([this] { if (on_pan_) on_pan_(0, -1); });
+    pan_down_.signal_clicked().connect([this] { if (on_pan_) on_pan_(0, 1); });
+    pan_right_.signal_clicked().connect([this] { if (on_pan_) on_pan_(1, 0); });
+    // "1:1" sits in the MIDDLE of the arrows, not beside them. The arrows take you
+    // away from where you started in four directions; this is the one that brings
+    // you back and tidies up, so it belongs at their centre where a home key would
+    // be -- reachable without reading, from any of the four.
+    zoom_reset_.set_tooltip_text("Back to the grid at life size");
+    zoom_reset_.signal_clicked().connect([this] { if (on_zoom_) on_zoom_(0.0); });
+
+    pan_box_.append(pan_left_);
+    pan_box_.append(pan_up_);
+    pan_box_.append(zoom_reset_);
+    pan_box_.append(pan_down_);
+    pan_box_.append(pan_right_);
+
+    button_box_.append(pan_box_);
 
     // Upstream launched src/settings.py here. That window is not ported yet, so
     // this opens whichever settings app this desktop provides.

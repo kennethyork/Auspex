@@ -11,7 +11,7 @@
 // reconnect path for no behavioural gain. The helpers also mean the CLI tools link
 // zero X libraries, which is the property README's "GTK is optional" rests on.
 //
-// The cost is one fork per operation, which matters only for the panel's one-second
+// The cost is one fork per operation, which matters only for the panel's half-second
 // context poll -- two forks a second, measured at well under a millisecond each.
 //
 // WHEN THIS BECOMES XLIB: Stage 2, when Auspex owns the window manager. A WM must
@@ -271,29 +271,32 @@ public:
         if (id.empty()) return false;
         const std::string wid(id);
 
-        // _NET_WM_WINDOW_TYPE_DESKTOP first, for the same reason the dock sets its
-        // hint first: the window manager reads the type once, when it starts
-        // managing the window, and stacking follows from it. Set afterwards and the
-        // window has already been placed in the normal layer.
+        // Xfce already owns a full-screen DESKTOP window. When Auspex uses the same
+        // layer, xfdesktop sits above it and consumes every empty-space click. A
+        // NORMAL window with the BELOW state occupies the layer above xfdesktop
+        // and below every application, which is exactly the canvas input layer.
         bool ok = run({"xprop", "-id", wid, "-f", "_NET_WM_WINDOW_TYPE", "32a", "-set",
-                       "_NET_WM_WINDOW_TYPE", "_NET_WM_WINDOW_TYPE_DESKTOP"},
+                       "_NET_WM_WINDOW_TYPE", "_NET_WM_WINDOW_TYPE_NORMAL"},
                       false)
                       .ok;
         ok = move_window(wid, bounds.x, bounds.y) && ok;
         ok = resize_window(wid, bounds.width, bounds.height) && ok;
 
         // sticky: the canvas is not per-workspace, it is what workspaces become.
-        // below: an application window must never end up behind the desktop.
+        // below: applications stay above it, while NORMAL keeps it above Xfce's
+        // desktop so the pointer can actually reach the canvas.
         // skip_taskbar/skip_pager: the desktop is not something you alt-tab to.
         //
         // No _NET_WM_STRUT_PARTIAL, deliberately. A desktop that reserved space
         // would shrink the work area to nothing and leave every other window with
         // nowhere to go.
+        // wmctrl accepts at most two properties in one -b request. Supplying all
+        // four silently applied STICKY and discarded BELOW, allowing this normal
+        // window to rise over applications. Keep the two pairs explicit.
+        ok = run({"wmctrl", "-i", "-r", wid, "-b", "add,sticky,below"}, false).ok && ok;
         ok = run({"wmctrl", "-i", "-r", wid, "-b",
-                  "add,sticky,below,skip_taskbar,skip_pager"},
-                 false)
-                 .ok &&
-             ok;
+                  "add,skip_taskbar,skip_pager"},
+                 false).ok && ok;
         return ok;
     }
 
@@ -351,19 +354,46 @@ public:
     }
 
     std::optional<std::string> primary_selection() override {
-        // xclip rather than GTK's clipboard API: reading the X primary selection
-        // from the GTK thread needs the window to have focus, and the async
-        // clipboard API would have to marshal back to this thread anyway. This is
-        // also exactly what panel.py's context poller already used.
-        const auto selection = run({"xclip", "-o", "-selection", "primary"});
+        // A helper rather than GTK's clipboard API: reading the X primary selection
+        // from the GTK thread needs the window to have focus, and the panel is a
+        // dock window that never holds it.
+        const auto argv = selection_command(selection_tool());
+        if (argv.empty()) return std::nullopt;
+        const auto selection = run(argv);
         if (!selection.ok) return std::nullopt;
         const std::string text = trim(selection.out);
         if (text.empty()) return std::nullopt;
         return text;
     }
+
+    bool can_read_selection() override { return !selection_tool().empty(); }
+
+private:
+    // Resolved once. PATH does not change under a running shell, and this is asked
+    // on a timer -- a which-style lookup several times a second to reach the same
+    // answer is exactly the sort of cost the panel cannot afford.
+    //
+    // xclip first only because it is the more common install; xsel is equally good
+    // and is what several distributions ship in a default desktop, which is why
+    // hardcoding xclip left this silently dead on machines that had neither.
+    static const std::string& selection_tool() {
+        static const std::string tool = first_in_path({"xclip", "xsel"});
+        return tool;
+    }
 };
 
 }  // namespace
+
+std::vector<std::string> selection_command(std::string_view tool) {
+    // The primary selection specifically, not the clipboard: this is the text under
+    // the user's highlight, which is what "speak this" and "ask about this" mean.
+    // Both helpers default to a DIFFERENT selection than we want, so neither flag is
+    // optional -- xclip defaults to the clipboard, xsel to XA_PRIMARY only by
+    // accident of history and not on every build.
+    if (tool == "xclip") return {"xclip", "-o", "-selection", "primary"};
+    if (tool == "xsel")  return {"xsel", "--primary", "--output"};
+    return {};
+}
 
 std::unique_ptr<DisplayServer> make_x11_display() {
     return std::make_unique<X11Display>();

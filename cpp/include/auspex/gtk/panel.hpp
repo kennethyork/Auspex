@@ -128,6 +128,9 @@ private:
     VoiceController& voice_;
     std::string      window_name_;
     std::string      selection_;
+    // Resolved once at construction: whether reading the selection is even possible
+    // here. The poller must not ask PATH this question on every tick.
+    bool             selection_readable_ = false;
 };
 
 class Panel : public Gtk::ApplicationWindow {
@@ -148,9 +151,6 @@ public:
     void set_zoom_handler(sigc::slot<void(double)> handler) {
         on_zoom_ = std::move(handler);
     }
-    void set_grid_handler(sigc::slot<void()> handler) {
-        on_grid_ = std::move(handler);
-    }
     void set_window_restore_handler(sigc::slot<void(const std::string&)> handler) {
         if (windows_) windows_->set_restore_handler(std::move(handler));
     }
@@ -160,11 +160,14 @@ public:
     void set_geometry_handler(sigc::slot<void(PanelPosition, int)> handler) {
         on_geometry_ = std::move(handler);
     }
+    void set_pan_handler(sigc::slot<void(int, int)> handler) {
+        on_pan_ = std::move(handler);
+    }
 
 private:
     sigc::slot<void(double)> on_zoom_;
-    sigc::slot<void()>       on_grid_;
     sigc::slot<void(PanelPosition, int)> on_geometry_;
+    sigc::slot<void(int, int)> on_pan_;
     void install_status_handler();
 
     // Right-click menu. A panel with no way to close it is a panel you have to go
@@ -192,17 +195,10 @@ private:
     // Top
     Gtk::Button                          launcher_;
 
-    // Zoom controls live on the PANEL, not only on the desktop surface.
-    //
-    // Ctrl+scroll on the canvas works, but only where no window covers it -- and
-    // once auto-fit has laid windows out to fill the screen there is almost no bare
-    // desktop left to aim at. A control you can only reach when the canvas is
-    // nearly empty is not a control.
-    Gtk::Box                             zoom_box_{Gtk::Orientation::HORIZONTAL, 1};
-    Gtk::Button                          zoom_out_{"\u2212"};
+    // The one canvas control that is not a pan. It lives on the BOTTOM bar, in the
+    // middle of the arrows -- see panel.cpp for why the zoom buttons that used to be
+    // up here are gone.
     Gtk::Button                          zoom_reset_{"1:1"};
-    Gtk::Button                          zoom_in_{"+"};
-    Gtk::Button                          grid_{"Grid"};
     std::unique_ptr<WorkspaceSwitcher>   workspaces_;
     std::unique_ptr<WindowList>          windows_;
     std::unique_ptr<SystemMonitorWidget> sysmon_;
@@ -211,6 +207,11 @@ private:
     std::unique_ptr<Clock>               clock_;
 
     // Bottom
+    Gtk::Box                          pan_box_{Gtk::Orientation::HORIZONTAL, 1};
+    Gtk::Button                       pan_left_{"\u2190"};
+    Gtk::Button                       pan_up_{"\u2191"};
+    Gtk::Button                       pan_down_{"\u2193"};
+    Gtk::Button                       pan_right_{"\u2192"};
     Gtk::Box                          button_box_{Gtk::Orientation::HORIZONTAL, 8};
     Gtk::Button                       settings_;
     Gtk::Image                        settings_icon_;

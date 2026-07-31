@@ -148,9 +148,14 @@ public:
     // viewport fixed. Zooming around the origin instead would fling the thing you
     // were looking at off the edge, which is the difference between a zoom that
     // feels like a zoom and one that feels like a jump.
-    void zoom_by(double factor);
-    void set_zoom(double zoom);
-    void reset_zoom();
+    //
+    // Returns whether the zoom actually MOVED. At the clamp limits it does not, and
+    // the caller must not then re-place every window: applying a layout is a
+    // subprocess and two 60ms settling sleeps per window, so a button held at the
+    // limit stutters the whole desktop to arrive back exactly where it started.
+    bool zoom_by(double factor);
+    bool set_zoom(double zoom);
+    bool reset_zoom();
 
     // Windows that are minimised. They stay MANAGED -- the canvas remembers where
     // they belong so restoring one puts it back rather than filing it somewhere new
@@ -205,12 +210,29 @@ private:
 };
 
 // Applies resolved positions to the real windows, through the DisplayServer.
-// Off-viewport windows keep following their canvas coordinates rather than being
-// clamped or parked at a screen edge.
+//
+// `screen` is the union of every monitor. Pass it and a window the canvas cannot
+// show is parked outside that union, where nothing can see it. Omit it and an
+// off-viewport window keeps following its canvas coordinates, which is correct only
+// when the canvas's monitor is the whole screen.
+//
+// The distinction is the entire point on a multi-head desk. Panning left pushes a
+// window to a negative offset from the primary monitor -- and if another monitor is
+// mounted to the left, that offset is not off screen, it is the middle of the user's
+// other display. Zooming in does the same thing off the right edge. Either way the
+// canvas spills onto screens it does not own, which is what it exists not to do.
 //
 // For a window's current geometry -- what note_screen_move needs -- call
 // display().window_geometry() directly; there is nothing canvas-specific to add.
-bool apply_positions(const std::vector<ScreenPosition>& positions, const Rect& monitor);
+bool apply_positions(const std::vector<ScreenPosition>& positions, const Rect& monitor,
+                     const Rect* screen = nullptr);
+
+// Where a parked window goes: below everything, at the canvas's own left edge.
+//
+// Below rather than beside, because monitors are almost always laid out in a row --
+// so the space under the arrangement is free even when both sides are occupied.
+// Exposed so the choice can be asserted rather than inferred from a move log.
+Rect park_slot(const Rect& monitor, const Rect& screen);
 
 // --- adoption ---------------------------------------------------------------
 //

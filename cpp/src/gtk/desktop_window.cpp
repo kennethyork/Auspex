@@ -84,6 +84,11 @@ double floor_to_step(double value, double step) {
 // ---------------------------------------------------------------------------
 DesktopWindow::DesktopWindow(const Config& config, Canvas& canvas, const Rect& monitor)
     : config_(config), canvas_(canvas), monitor_(monitor) {
+    // Before anything is placed. The first adoption pass runs during construction,
+    // and without this it would park windows against a null union -- straight onto
+    // the monitor next door, which is the behaviour this exists to stop.
+    screen_ = screen_bounds();
+
     panel_top_ = compute_panel_layout(
         monitor_, 1, config_.panel_height, PanelPosition::Top).bounds.height;
     panel_bottom_ = compute_panel_layout(
@@ -229,6 +234,12 @@ void DesktopWindow::pan_by(int dx, int dy) {
     schedule_apply();
 }
 
+void DesktopWindow::pan_step(int x_direction, int y_direction) {
+    const int step_x = static_cast<int>(monitor_.width * kStepFraction);
+    const int step_y = static_cast<int>(monitor_.height * kStepFraction);
+    pan_by(x_direction * step_x, y_direction * step_y);
+}
+
 void DesktopWindow::fit_all() {
     // Sticky overlay bars must not limit the infinite plane, but a deliberate
     // layout must not put title bars or controls underneath them. Apply their real
@@ -251,7 +262,7 @@ void DesktopWindow::fit_all() {
         position.height = last_fit_.tile_height;
     }
     canvas_.set_insets(0, 0);
-    apply_positions(positions, monitor_);
+    apply_positions(positions, monitor_, screen());
     last_positions_ = std::move(positions);
     area_.queue_draw();
 }
@@ -301,7 +312,7 @@ void DesktopWindow::full_managed_window(const std::string& window_id) {
         .width = monitor_.width,
         .height = safe_height,
     }};
-    apply_positions(target, monitor_);
+    apply_positions(target, monitor_, screen());
     last_positions_ = canvas_.resolve();
     activate_window(window_id);
     needs_redraw_ = true;
@@ -342,7 +353,12 @@ void DesktopWindow::restore_managed_window(const std::string& window_id) {
 }
 
 void DesktopWindow::zoom_by(double factor) {
-    canvas_.zoom_by(factor);
+    // Nothing moved, so nothing is re-placed. At the clamp limits this is the whole
+    // difference between a button that quietly does nothing and one that visibly
+    // hitches the desktop -- every apply is an unmaximise, a resize and a move per
+    // window, with two 60ms settling sleeps in between.
+    if (!canvas_.zoom_by(factor)) return;
+
     needs_redraw_ = true;
     area_.queue_draw();
 
@@ -350,16 +366,31 @@ void DesktopWindow::zoom_by(double factor) {
     // A plain resolve deliberately omits sizes at 1.0 so panning is cheap, but
     // using it here left the real windows stuck at the previous smaller size.
     last_positions_ = canvas_.resolve(/*include_life_size=*/true);
-    apply_positions(last_positions_, monitor_);
+    apply_positions(last_positions_, monitor_, screen());
 }
 
 void DesktopWindow::reset_zoom() {
-    // Reset means life size, not "fit everything". Re-fitting here overwrote the
-    // user's natural window sizes and made the 1:1 control behave like a second
-    // layout command.
+    // "1:1" is the one button that puts the desktop back in order: life size AND
+    // back on the grid, in that order.
+    //
+    // It used to reset the zoom only, on the reasoning that re-laying out would
+    // overwrite window sizes the user had chosen. In practice that made it the
+    // control you pressed when things had got messy and which then did not tidy
+    // anything -- the zoom number changed and every window stayed where the panning
+    // had left it. Sorting the layout out is the entire reason to reach for it, and
+    // it is why the separate "Grid" button is gone: two buttons for one intention.
+    //
+    // Home first. Fitting lays windows out relative to the viewport, so fitting
+    // while panned away would place the grid off in canvas space rather than on the
+    // screen in front of you.
+    Viewport viewport = canvas_.viewport();
+    viewport.x = 0;
+    viewport.y = 0;
+    canvas_.set_viewport(viewport);
+
     canvas_.reset_zoom();
-    last_positions_ = canvas_.resolve(/*include_life_size=*/true);
-    apply_positions(last_positions_, monitor_);
+    fit_all();
+
     needs_redraw_ = true;
     area_.queue_draw();
 }
@@ -389,10 +420,23 @@ void DesktopWindow::schedule_apply() {
 
 void DesktopWindow::apply_now() {
     last_positions_ = canvas_.resolve();
-    apply_positions(last_positions_, monitor_);
+    apply_positions(last_positions_, monitor_, screen());
 }
 
 bool DesktopWindow::adopt_monitor_change() {
+    // The union of every monitor is refreshed BEFORE the early return below, because
+    // it can change while the canvas's own monitor does not. Plug a screen in beside
+    // the primary and monitor_ is untouched, but where "off screen" starts has
+    // moved -- and a stale union parks windows onto the display you just connected.
+    //
+    // list_monitors() is cached for five seconds, so asking every tick is free.
+    if (const auto bounds = screen_bounds(); bounds && bounds != screen_) {
+        screen_ = bounds;
+        // Re-place immediately: every parked window is currently sitting at a
+        // location computed against the old union.
+        apply_now();
+    }
+
     const auto monitor = primary_monitor();
     if (!monitor || monitor->bounds == monitor_) return false;
 
@@ -525,24 +569,6 @@ void DesktopWindow::reconcile() {
                 [&](const ScreenPosition& p) { return p.id == id && !p.visible; });
             if (parked != last_positions_.end()) continue;
 
-            // Dragged off this monitor? Then it is no longer the canvas's business.
-            //
-            // The canvas owns one screen and never pans anything onto another. But
-            // moving a window to another monitor BY HAND is a normal thing to want,
-            // and it only works if the canvas lets go -- otherwise the next apply
-            // pulls it straight back, and the window fights the hand. Releasing it
-            // leaves it exactly where it was put, unmanaged, until it is dragged
-            // back onto this screen and adopted again.
-            const int centre_x = found->second.x + found->second.width / 2;
-            const int centre_y = found->second.y + found->second.height / 2;
-            const bool on_this_monitor =
-                centre_x >= monitor_.x && centre_x < monitor_.x + monitor_.width &&
-                centre_y >= monitor_.y && centre_y < monitor_.y + monitor_.height;
-            if (!on_this_monitor) {
-                released.push_back(id);
-                continue;
-            }
-
             const int screen_x = found->second.x - monitor_.x;
             const int screen_y = found->second.y - monitor_.y;
 
@@ -565,6 +591,29 @@ void DesktopWindow::reconcile() {
                 std::abs(screen_y - expected_y) <= kMoveTolerance) {
                 continue;
             }
+
+            // Only NOW is it fair to ask whether the window left this monitor,
+            // because only now do we know the canvas did not put it there itself.
+            //
+            // Asking first was the bug. Zooming in squeezes the rightmost window
+            // against the monitor's edge, and once its centre crosses that edge the
+            // canvas concluded the user had dragged it to the next screen -- so it
+            // let go of a window it had just moved. The window stopped answering to
+            // zoom, to 1:1, to anything, and sat half on the display next door.
+            //
+            // Dragging a window to another monitor BY HAND is still a normal thing
+            // to want, and it still works: a hand-dragged window is by definition
+            // somewhere the canvas did not put it, so it reaches this point.
+            const int centre_x = found->second.x + found->second.width / 2;
+            const int centre_y = found->second.y + found->second.height / 2;
+            const bool on_this_monitor =
+                centre_x >= monitor_.x && centre_x < monitor_.x + monitor_.width &&
+                centre_y >= monitor_.y && centre_y < monitor_.y + monitor_.height;
+            if (!on_this_monitor) {
+                released.push_back(id);
+                continue;
+            }
+
             canvas_.note_screen_move(id, screen_x, screen_y);
         }
     }
