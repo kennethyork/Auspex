@@ -47,6 +47,7 @@ public:
     bool place_desktop_window(std::string_view, const Rect&) override { return false; }
     std::optional<std::string> current_wallpaper() override { return std::nullopt; }
 
+    std::optional<Point> pointer_position() override { return std::nullopt; }
     bool type_text(std::string_view) override { return false; }
     std::optional<std::string> primary_selection() override { return std::nullopt; }
     bool can_read_selection() override { return false; }

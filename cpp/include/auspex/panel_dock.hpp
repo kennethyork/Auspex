@@ -21,6 +21,13 @@
 
 namespace auspex {
 
+struct Point {
+    int x = 0;
+    int y = 0;
+
+    bool operator==(const Point&) const = default;
+};
+
 struct Rect {
     int x = 0;
     int y = 0;

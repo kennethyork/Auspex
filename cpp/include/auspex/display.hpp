@@ -164,6 +164,18 @@ public:
     // they explicitly copied. nullopt when nothing is selected.
     virtual std::optional<std::string> primary_selection() = 0;
 
+    // Where the pointer is, in root coordinates.
+    //
+    // Needed because tray protocols hand the click position to the application so
+    // it can put its own menu somewhere sensible -- XApp's ButtonPress takes it
+    // directly. GTK4 reports pointer positions relative to a surface and offers no
+    // way to turn that into a root coordinate without linking gdk-x11, which is the
+    // dependency this seam exists to avoid.
+    //
+    // nullopt when it cannot be determined; callers then let the application choose
+    // its own position rather than pointing it at the origin.
+    virtual std::optional<Point> pointer_position() = 0;
+
     // Whether the selection can be read at all, which is NOT the same question as
     // whether anything is selected.
     //

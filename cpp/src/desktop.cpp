@@ -601,6 +601,29 @@ bool can_read_selection() {
     return display().can_read_selection();
 }
 
+std::optional<Point> parse_pointer_position(const std::string& shell_output) {
+    std::optional<int> x;
+    std::optional<int> y;
+
+    for (const auto& line : split_lines(shell_output)) {
+        const auto equals = line.find('=');
+        if (equals == std::string::npos) continue;
+        const std::string key   = trim(line.substr(0, equals));
+        const std::string value = trim(line.substr(equals + 1));
+        if (key == "X") x = to_int(value);
+        if (key == "Y") y = to_int(value);
+    }
+
+    // Both, or neither. A half-parsed position would put a menu somewhere arbitrary
+    // rather than admitting it does not know.
+    if (!x || !y) return std::nullopt;
+    return Point{.x = *x, .y = *y};
+}
+
+std::optional<Point> pointer_position() {
+    return display().pointer_position();
+}
+
 bool type_text(std::string_view text) {
     return display().type_text(text);
 }

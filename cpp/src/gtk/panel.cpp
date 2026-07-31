@@ -287,6 +287,262 @@ void Clock::tick() {
 }
 
 // ---------------------------------------------------------------------------
+// VolumeButton
+// ---------------------------------------------------------------------------
+VolumeButton::VolumeButton()
+    : slider_(Gtk::Adjustment::create(0, 0, 100, 1, 5, 0), Gtk::Orientation::HORIZONTAL) {
+    add_css_class("flat");
+    set_has_frame(false);
+
+    slider_.set_size_request(180, -1);
+    slider_.set_draw_value(true);
+    slider_.set_value_pos(Gtk::PositionType::RIGHT);
+    slider_.signal_value_changed().connect([this] {
+        if (!adjusting_) return;   // a poll wrote this value, not the user
+        set_volume(static_cast<int>(slider_.get_value()));
+    });
+    // The drag guard. Without it the one-second poll writes the sink's value back
+    // into the slider halfway through a drag and the handle jumps under the hand.
+    {
+        auto press = Gtk::GestureClick::create();
+        press->signal_pressed().connect([this](int, double, double) { adjusting_ = true; });
+        press->signal_released().connect([this](int, double, double) { adjusting_ = false; });
+        slider_.add_controller(press);
+    }
+
+    mute_.signal_clicked().connect([this] {
+        set_muted(!state_.muted);
+        poll();
+    });
+
+    popover_box_.set_margin(10);
+    popover_box_.append(slider_);
+    popover_box_.append(mute_);
+    popover_.set_child(popover_box_);
+
+    // Upward: this lives on the bottom bar, and a popover opening downwards from
+    // there is placed below the screen edge and simply never seen.
+    set_direction(Gtk::ArrowType::UP);
+    set_popover(popover_);
+
+    // Read the real level as it opens rather than trusting the last poll, so the
+    // slider is never a second out of date at the moment you look at it.
+    popover_.signal_show().connect([this] { poll(); });
+
+    // Scrolling the button itself, which is what people do without opening anything.
+    {
+        auto scroll = Gtk::EventControllerScroll::create();
+        scroll->set_flags(Gtk::EventControllerScroll::Flags::VERTICAL);
+        scroll->signal_scroll().connect(
+            [this](double, double dy) {
+                if (!state_.known) return true;
+                const int step = dy < 0 ? 5 : -5;
+                apply(std::clamp(state_.percent + step, 0, 100), state_.muted);
+                set_volume(state_.percent);
+                return true;
+            },
+            false);
+        add_controller(scroll);
+    }
+
+    poll();
+    Glib::signal_timeout().connect(
+        [this] {
+            poll();
+            return true;
+        },
+        1000);
+}
+
+void VolumeButton::poll() {
+    const VolumeState now = current_volume();
+    // Neither tool present: hide rather than show a slider that cannot do anything.
+    set_visible(now.known);
+    if (!now.known || now == state_) return;
+    apply(now.percent, now.muted);
+}
+
+void VolumeButton::apply(int percent, bool muted) {
+    state_.percent = percent;
+    state_.muted   = muted;
+    state_.known   = true;
+
+    set_icon_name(volume_icon_name(state_));
+    if (!adjusting_) slider_.set_value(percent);
+    mute_.set_label(muted ? "Unmute" : "Mute");
+    set_tooltip_text(muted ? "Muted" : "Volume " + std::to_string(percent) + "%");
+}
+
+// ---------------------------------------------------------------------------
+// NetworkButton
+// ---------------------------------------------------------------------------
+NetworkButton::NetworkButton(const Config& config) : config_(config) {
+    add_css_class("flat");
+    set_has_frame(false);
+
+    status_.set_xalign(0.0f);
+    status_.set_max_width_chars(28);
+    status_.set_wrap(true);
+
+    // Opening the system's own network editor rather than reimplementing it. Joining
+    // a wifi network means passwords, certificates and captive portals, and a panel
+    // that did that badly would be worse than one that hands over to the tool built
+    // for it.
+    settings_.signal_clicked().connect([this] {
+        popover_.popdown();
+        if (!config_.network_command.empty()) {
+            spawn_detached(split_words(config_.network_command));
+        }
+    });
+    settings_.set_visible(!config_.network_command.empty());
+
+    wifi_heading_.set_xalign(0.0f);
+    wifi_heading_.add_css_class("subtitle");
+
+    wifi_scroller_.set_child(wifi_box_);
+    wifi_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    // Tall enough for a handful of networks, capped so a busy street does not give
+    // the popover the height of the screen.
+    wifi_scroller_.set_max_content_height(260);
+    wifi_scroller_.set_propagate_natural_height(true);
+
+    radio_.signal_clicked().connect([this] {
+        set_wifi_radio(!wifi_radio_enabled());
+        rebuild_networks();
+    });
+
+    popover_box_.set_margin(10);
+    popover_box_.append(status_);
+    popover_box_.append(wifi_heading_);
+    popover_box_.append(wifi_scroller_);
+    popover_box_.append(radio_);
+    popover_box_.append(settings_);
+    popover_.set_child(popover_box_);
+
+    set_direction(Gtk::ArrowType::UP);
+    set_popover(popover_);
+    popover_.signal_show().connect([this] {
+        poll();
+        rebuild_networks();
+    });
+
+    poll();
+    // Five seconds, not one. Network state changes on the scale of plugging a cable
+    // in, and each poll is up to three nmcli processes -- the cost the panel's other
+    // pollers were already trimmed for.
+    Glib::signal_timeout().connect(
+        [this] {
+            poll();
+            return true;
+        },
+        5000);
+}
+
+void NetworkButton::poll() {
+    const NetworkState now = current_network();
+    // nmcli absent: hide rather than show a permanently offline icon on a machine
+    // whose network is fine.
+    set_visible(now.known);
+    if (!now.known || now == state_) return;
+    state_ = now;
+
+    set_icon_name(network_icon_name(state_));
+
+    std::string summary;
+    switch (state_.kind) {
+        case NetworkState::Kind::Wired:
+            summary = state_.connection.empty() ? "Wired" : state_.connection;
+            break;
+        case NetworkState::Kind::Wireless:
+            summary = state_.connection.empty() ? "Wireless" : state_.connection;
+            if (state_.signal_percent > 0) {
+                summary += "  " + std::to_string(state_.signal_percent) + "%";
+            }
+            break;
+        case NetworkState::Kind::None:
+            summary = "Not connected";
+            break;
+    }
+    // Connected without a route is the state worth naming: it is the difference
+    // between the cable being out and the internet being down.
+    if (state_.kind != NetworkState::Kind::None && !state_.online) {
+        summary += "\nNo internet access";
+    }
+
+    status_.set_text(summary);
+    set_tooltip_text(summary);
+}
+
+void NetworkButton::rebuild_networks() {
+    while (Gtk::Widget* child = wifi_box_.get_first_child()) wifi_box_.remove(*child);
+    wifi_rows_.clear();
+
+    // A desktop with no radio is not shown an empty list and a switch that does
+    // nothing -- it is simply not shown wifi at all.
+    if (!has_wifi_device()) {
+        wifi_heading_.set_visible(false);
+        wifi_scroller_.set_visible(false);
+        radio_.set_visible(false);
+        return;
+    }
+
+    const bool on = wifi_radio_enabled();
+    radio_.set_visible(true);
+    radio_.set_label(on ? "Turn Wi-Fi off" : "Turn Wi-Fi on");
+
+    if (!on) {
+        // The radio being off is the reason the list is empty, and saying so is the
+        // difference between a menu that looks broken and one that tells you what
+        // to press.
+        wifi_heading_.set_text("Wi-Fi is off");
+        wifi_heading_.set_visible(true);
+        wifi_scroller_.set_visible(false);
+        return;
+    }
+
+    const auto networks = scan_wifi();
+    wifi_heading_.set_visible(true);
+    if (networks.empty()) {
+        wifi_heading_.set_text("No networks in range");
+        wifi_scroller_.set_visible(false);
+        return;
+    }
+
+    wifi_heading_.set_text("Wi-Fi networks");
+    wifi_scroller_.set_visible(true);
+
+    for (const auto& network : networks) {
+        auto row = std::make_unique<Gtk::Button>();
+        auto* label = Gtk::make_managed<Gtk::Label>();
+
+        std::string text = network.ssid;
+        if (network.secured) text += "  \U0001F512";
+        text += "   " + std::to_string(network.signal_percent) + "%";
+        label->set_text(text);
+        label->set_xalign(0.0f);
+
+        row->set_child(*label);
+        row->set_has_frame(false);
+        if (network.in_use) row->add_css_class("active-workspace");
+
+        const std::string ssid = network.ssid;
+        row->signal_clicked().connect([this, ssid] {
+            popover_.popdown();
+            // A saved network joins from here. A new secured one cannot -- it needs
+            // a password, and this panel deliberately has nowhere to type one and
+            // nowhere to keep it -- so the system's own dialog is opened instead.
+            if (!connect_wifi(ssid) && !config_.network_command.empty()) {
+                spawn_detached(split_words(config_.network_command));
+            }
+            poll();
+        });
+
+        wifi_box_.append(*row);
+        wifi_rows_.push_back(std::move(row));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LlmContextButton
 // ---------------------------------------------------------------------------
 LlmContextButton::LlmContextButton(const Config& config, VoiceController& voice)
@@ -436,14 +692,9 @@ void Panel::build_top() {
     sysmon_ = std::make_unique<SystemMonitorWidget>();
     box_.append(*sysmon_);
 
-    // Only shown when something to launch was actually found on this system.
-    if (!config_.network_command.empty()) {
-        network_icon_.set_from_icon_name("network-wireless-symbolic");
-        network_.set_child(network_icon_);
-        const std::string command = config_.network_command;
-        network_.signal_clicked().connect([command] { launch(command); });
-        box_.append(network_);
-    }
+    // No network button up here. It moved to the bottom bar next to the volume and
+    // the tray, where the rest of the status controls now live -- and one button in
+    // one place is a row of pixels back for the window list.
 
     clock_ = std::make_unique<Clock>();
     box_.append(*clock_);
@@ -478,6 +729,22 @@ void Panel::build_bottom() {
     pan_box_.append(pan_right_);
 
     button_box_.append(pan_box_);
+
+    // The tray lives on the bottom bar, and it is told so: XApp hands the panel's
+    // edge to the application so it knows which way to open its menu, and an icon
+    // on the bottom bar that claims to be on the top gets a menu opening downwards
+    // off the screen.
+    tray_ = std::make_unique<SystemTray>(std::max(16, config_.panel_height - 8),
+                                         /*panel_at_top=*/false);
+    button_box_.append(*tray_);
+
+    // Sound sits next to the tray because that is where people look for it, even
+    // though it is not and cannot be a tray icon.
+    volume_ = std::make_unique<VolumeButton>();
+    button_box_.append(*volume_);
+
+    network_button_ = std::make_unique<NetworkButton>(config_);
+    button_box_.append(*network_button_);
 
     // Upstream launched src/settings.py here. That window is not ported yet, so
     // this opens whichever settings app this desktop provides.

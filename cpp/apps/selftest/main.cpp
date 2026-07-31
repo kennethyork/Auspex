@@ -30,6 +30,7 @@
 #include "auspex/panel_dock.hpp"
 #include "auspex/session.hpp"
 #include "auspex/sysmon.hpp"
+#include "auspex/tray.hpp"
 #include "auspex/voice_gate.hpp"
 #include "auspex/theme.hpp"
 
@@ -451,6 +452,8 @@ public:
     std::optional<std::string> current_wallpaper() override { return canned_wallpaper; }
 
     bool type_text(std::string_view) override { return true; }
+    std::optional<auspex::Point> pointer_position() override { return canned_pointer; }
+    std::optional<auspex::Point> canned_pointer;
     std::optional<std::string> primary_selection() override { return canned_selection; }
     bool can_read_selection() override { return selection_readable; }
 
@@ -501,6 +504,29 @@ void test_display_seam() {
 
         rec->selection_readable = false;
         check(!auspex::can_read_selection(), "unreadable backend says so");
+    }
+
+    // The pointer, which tray icons need in ROOT coordinates so an application can
+    // place its own menu. `--shell` is parsed rather than the sentence form, so a
+    // translated locale cannot break it.
+    {
+        const auto at = auspex::parse_pointer_position(
+            "X=3249\nY=1058\nSCREEN=0\nWINDOW=44040199\n");
+        check(at.has_value(), "a full reading parses");
+        if (at) {
+            check_eq(at->x, 3249, "x is read");
+            check_eq(at->y, 1058, "y is read");
+        }
+
+        // Half an answer is no answer: a menu placed from a partial reading lands
+        // somewhere arbitrary, which is worse than letting the application choose.
+        check(!auspex::parse_pointer_position("X=100\n").has_value(),
+              "x without y is refused");
+        check(!auspex::parse_pointer_position("Y=100\n").has_value(),
+              "y without x is refused");
+        check(!auspex::parse_pointer_position("").has_value(), "empty is refused");
+        check(!auspex::parse_pointer_position("X=left\nY=up\n").has_value(),
+              "non-numeric values are refused rather than read as zero");
     }
 
     // The helper flags. Both tools default to a selection we do not want, so a
@@ -1815,6 +1841,385 @@ void test_crew() {
 
 // The invariant Kenny asked for in one sentence: whatever the canvas does, no window
 // it places may touch a monitor other than its own.
+void test_volume_and_network() {
+    std::cout << "volume and network\n";
+
+    using namespace auspex;
+
+    // Volume. Neither of these is a tray icon on a stock Xfce desktop -- the sound
+    // control is a plugin inside xfce4-panel's own process -- so Auspex reads the
+    // sinks itself, through the same wpctl/pactl path the spoken command uses.
+    {
+        const auto wpctl = parse_wpctl_volume("Volume: 0.47\n");
+        check(wpctl.known, "wpctl output is understood");
+        check_eq(wpctl.percent, 47, "a fraction becomes a percentage");
+        check(!wpctl.muted, "and is not muted");
+
+        const auto muted = parse_wpctl_volume("Volume: 0.47 [MUTED]\n");
+        check(muted.muted, "the MUTED marker is read");
+        check_eq(muted.percent, 47, "and the level is still read alongside it");
+
+        // PipeWire allows over-amplification. Reading 1.50 as 1% would be silent and
+        // wrong in the direction that hurts.
+        check_eq(parse_wpctl_volume("Volume: 1.50\n").percent, 150,
+                 "above life size is not clamped away at parse time");
+        check(!parse_wpctl_volume("").known, "no output is not a volume");
+        check(!parse_wpctl_volume("Volume: loud\n").known, "nonsense is not a volume");
+
+        // pactl's line is much noisier, and the raw value comes FIRST -- reading
+        // forwards to the first number finds 30801, not 47.
+        const auto pactl = parse_pactl_volume(
+            "Volume: front-left: 30801 /  47% / -19.67 dB,   "
+            "front-right: 30801 /  47% / -19.67 dB\n        balance 0.00\n");
+        check(pactl.known, "pactl output is understood");
+        check_eq(pactl.percent, 47, "the percentage is taken, not the raw value");
+
+        check(parse_pactl_mute("Mute: yes\n"), "muted is read");
+        check(!parse_pactl_mute("Mute: no\n"), "unmuted is read");
+        check(!parse_pactl_mute(""), "no answer is not muted");
+
+        // The icon has one job: never show a loud speaker on a muted sink.
+        VolumeState state;
+        state.known = true;
+        state.percent = 80;
+        state.muted = true;
+        check_eq(volume_icon_name(state), std::string("audio-volume-muted-symbolic"),
+                 "muted at 80% is still the muted icon");
+        state.muted = false;
+        check_eq(volume_icon_name(state), std::string("audio-volume-high-symbolic"),
+                 "80% unmuted is high");
+        state.percent = 0;
+        check_eq(volume_icon_name(state), std::string("audio-volume-muted-symbolic"),
+                 "zero is muted whatever the flag says");
+    }
+
+    // Network. Captured from this machine, which has ethernet up, wifi down, and
+    // libvirt's bridge reporting itself as connected.
+    {
+        const std::string devices =
+            "eno1:ethernet:connected:Wired connection 1\n"
+            "lo:loopback:connected (externally):lo\n"
+            "virbr0:bridge:connected (externally):virbr0\n"
+            "wlp4s0:wifi:disconnected:\n"
+            "p2p-dev-wlp4s0:wifi-p2p:disconnected:\n";
+
+        const auto state = parse_nmcli_devices(devices);
+        check(state.known, "the device list is understood");
+        check(state.kind == NetworkState::Kind::Wired, "ethernet is the active link");
+        check_eq(state.connection, std::string("Wired connection 1"),
+                 "and its connection is named");
+
+        // The bridge is the trap: virbr0 says "connected (externally)" on any
+        // machine with libvirt, and taking it would report the network up with the
+        // cable unplugged.
+        const auto bridge_only =
+            parse_nmcli_devices("lo:loopback:connected (externally):lo\n"
+                                "virbr0:bridge:connected (externally):virbr0\n"
+                                "eno1:ethernet:disconnected:\n");
+        check(bridge_only.known, "a list with nothing up is still an answer");
+        check(bridge_only.kind == NetworkState::Kind::None,
+              "a libvirt bridge is not an internet connection");
+
+        const auto wifi = parse_nmcli_devices("wlp4s0:wifi:connected:attkenneth-wifi\n");
+        check(wifi.kind == NetworkState::Kind::Wireless, "wifi is recognised");
+        check_eq(wifi.connection, std::string("attkenneth-wifi"), "and its SSID kept");
+
+        // A desktop with both up is using the cable.
+        const auto both = parse_nmcli_devices("wlp4s0:wifi:connected:some-ssid\n"
+                                              "eno1:ethernet:connected:Wired\n");
+        check(both.kind == NetworkState::Kind::Wired, "wired wins over wireless");
+
+        check(!parse_nmcli_devices("").known, "no output is not an answer");
+
+        // Signal is only read for the network actually in use.
+        const std::string list = " :attkenneth-wifi:75\n"
+                                 "*:attkenneth-wifi:64\n"
+                                 " :neighbour:59\n";
+        check_eq(parse_nmcli_wifi_signal(list), 64,
+                 "the in-use network's signal is taken, not the strongest one");
+        check_eq(parse_nmcli_wifi_signal(" :a:75\n"), 0, "nothing in use is no signal");
+
+        check(parse_nmcli_connectivity("connected:full\n"), "full connectivity is online");
+        check(!parse_nmcli_connectivity("connected:portal\n"),
+              "a captive portal is a link, not the internet");
+        check(!parse_nmcli_connectivity("connected:limited\n"), "limited is not online");
+        check(!parse_nmcli_connectivity(""), "no answer is not online");
+
+        // The icon distinguishes "cable out" from "internet down" -- different
+        // problems, fixed in different places.
+        NetworkState wired;
+        wired.known = true;
+        wired.kind = NetworkState::Kind::Wired;
+        wired.online = true;
+        check_eq(network_icon_name(wired), std::string("network-wired-symbolic"),
+                 "a working cable");
+        wired.online = false;
+        check_eq(network_icon_name(wired), std::string("network-wired-no-route-symbolic"),
+                 "a cable with no route out is its own icon");
+
+        NetworkState air;
+        air.known = true;
+        air.kind = NetworkState::Kind::Wireless;
+        air.online = true;
+        air.signal_percent = 80;
+        check_eq(network_icon_name(air),
+                 std::string("network-wireless-signal-excellent-symbolic"),
+                 "a strong signal");
+        air.signal_percent = 30;
+        check_eq(network_icon_name(air), std::string("network-wireless-signal-ok-symbolic"),
+                 "a middling signal");
+
+        check_eq(network_icon_name({}), std::string("network-offline-symbolic"),
+                 "nothing known is offline");
+    }
+
+    // The wifi list the network menu offers. Captured shape from this machine, which
+    // sees the same access point several times on two bands.
+    {
+        const std::string list =
+            " :attkenneth-wifi:75:WPA2\n"
+            "*:attkenneth-wifi:64:WPA2\n"
+            " :attkenneth-wifi:59:WPA2\n"
+            " :neighbour:41:WPA2\n"
+            " :open-cafe:30:\n"
+            " ::22:WPA2\n";                    // hidden, nothing to click
+
+        const auto networks = parse_nmcli_wifi_list(list);
+        check_eq(networks.size(), std::size_t{3},
+                 "one entry per name, and the hidden network dropped");
+        if (networks.size() == 3) {
+            check_eq(networks[0].ssid, std::string("attkenneth-wifi"),
+                     "the network in use is listed first");
+            check(networks[0].in_use, "and marked as in use");
+            check_eq(networks[0].signal_percent, 75,
+                     "keeping the strongest of its access points");
+            check(networks[0].secured, "a WPA2 network is secured");
+
+            check_eq(networks[1].ssid, std::string("neighbour"),
+                     "then the strongest of the rest");
+            check_eq(networks[2].ssid, std::string("open-cafe"), "then weaker ones");
+            check(!networks[2].secured, "an empty security field is an open network");
+        }
+
+        // Terse output escapes the separator. Splitting naively cuts this SSID in
+        // half and then tries to join a network that does not exist.
+        const auto escaped = parse_nmcli_wifi_list(" :my\\:network:50:WPA2\n");
+        check_eq(escaped.size(), std::size_t{1}, "an escaped colon is one network");
+        if (!escaped.empty()) {
+            check_eq(escaped[0].ssid, std::string("my:network"),
+                     "and its name survives intact");
+        }
+
+        check(parse_nmcli_wifi_list("").empty(), "no output is no networks");
+        check(parse_nmcli_wifi_list("garbage\n").empty(), "unparseable lines are skipped");
+    }
+}
+
+void test_tray() {
+    std::cout << "system tray\n";
+
+    using namespace auspex;
+
+    // Item addresses. Both spellings are live on one desktop: the watcher on this
+    // machine reports ":1.77/org/blueman/sni", and the specification's own examples
+    // use a bare bus name.
+    {
+        const auto blueman = parse_tray_item_address(":1.77/org/blueman/sni");
+        check_eq(blueman.service, std::string(":1.77"), "service is split at the path");
+        check_eq(blueman.path, std::string("/org/blueman/sni"), "and the path kept whole");
+
+        const auto steam =
+            parse_tray_item_address(":1.339/org/ayatana/NotificationItem/steam");
+        check_eq(steam.service, std::string(":1.339"), "a deeper path splits the same");
+        check_eq(steam.path, std::string("/org/ayatana/NotificationItem/steam"),
+                 "every segment of the path is kept");
+
+        const auto bare = parse_tray_item_address("org.example.App");
+        check_eq(bare.service, std::string("org.example.App"), "a bare name is a service");
+        check_eq(bare.path, std::string("/StatusNotifierItem"),
+                 "and gets the specification's default path");
+
+        // A path with no service must not be answered by guessing a service: the
+        // call would go to whichever process happened to reply.
+        check(parse_tray_item_address("/org/blueman/sni").service.empty(),
+              "a bare path is not an item");
+        check(parse_tray_item_address("").service.empty(), "empty is not an item");
+        check(parse_tray_item_address("   ").service.empty(), "blank is not an item");
+    }
+
+    // Status, and what it does to the icon.
+    {
+        check(parse_tray_status("Active") == TrayStatus::Active, "Active parses");
+        check(parse_tray_status("Passive") == TrayStatus::Passive, "Passive parses");
+        check(parse_tray_status("NeedsAttention") == TrayStatus::NeedsAttention,
+              "NeedsAttention parses");
+        check(parse_tray_status("") == TrayStatus::Active,
+              "an unknown status is Active, never something that could hide an icon");
+
+        check_eq(tray_icon_name(TrayStatus::Active, "steam_tray_mono", "alert"),
+                 std::string("steam_tray_mono"), "Active uses the ordinary icon");
+        check_eq(tray_icon_name(TrayStatus::NeedsAttention, "steam_tray_mono", "alert"),
+                 std::string("alert"), "NeedsAttention prefers the attention icon");
+
+        // Applications set the status and leave the icon empty. Honouring that
+        // literally blanks the icon at the moment it wants to be noticed.
+        check_eq(tray_icon_name(TrayStatus::NeedsAttention, "steam_tray_mono", ""),
+                 std::string("steam_tray_mono"),
+                 "an empty attention icon falls back rather than blanking");
+
+        check(tray_item_visible(TrayStatus::Passive),
+              "Passive items are still shown -- applications use it as 'idle'");
+    }
+
+    // Tooltips. blueman is the awkward case: it fills in the description and leaves
+    // the title empty, so a naive read shows nothing.
+    {
+        check_eq(tray_tooltip("", "Bluetooth Enabled", "blueman"),
+                 std::string("Bluetooth Enabled"),
+                 "a description with no title is still a tooltip");
+        check_eq(tray_tooltip("Steam", "", "steam"), std::string("Steam"),
+                 "a title with no description is the tooltip");
+        check_eq(tray_tooltip("Steam", "Online", "steam"),
+                 std::string("Steam\nOnline"), "both are shown, title first");
+        check_eq(tray_tooltip("", "", "Nextcloud"), std::string("Nextcloud"),
+                 "neither falls back to the item's own name");
+
+        // Qt markup is not Pango markup and would be drawn as literal tags.
+        check_eq(strip_tray_markup("<b>Syncing</b> 3 files"),
+                 std::string("Syncing 3 files"), "markup is stripped, text kept");
+        check_eq(strip_tray_markup("plain"), std::string("plain"),
+                 "text without markup is untouched");
+    }
+
+    // Pixmaps. The byte order is the part that fails silently -- wrong colours read
+    // as a theming problem rather than a decoding one.
+    {
+        // One pixel, opaque red, as SNI sends it: A, R, G, B.
+        const std::uint8_t argb[4] = {0xFF, 0xFF, 0x00, 0x00};
+        const auto rgba = tray_argb_to_rgba(argb, sizeof(argb), 1, 1);
+        check_eq(rgba.size(), std::size_t{4}, "one pixel in, one pixel out");
+        if (rgba.size() == 4) {
+            check_eq(static_cast<int>(rgba[0]), 255, "red channel first");
+            check_eq(static_cast<int>(rgba[1]), 0,   "green");
+            check_eq(static_cast<int>(rgba[2]), 0,   "blue");
+            check_eq(static_cast<int>(rgba[3]), 255, "alpha last");
+        }
+
+        // Half-transparent green, to catch a swap that only shows on non-opaque
+        // pixels.
+        const std::uint8_t argb2[4] = {0x80, 0x00, 0xFF, 0x00};
+        const auto rgba2 = tray_argb_to_rgba(argb2, sizeof(argb2), 1, 1);
+        if (rgba2.size() == 4) {
+            check_eq(static_cast<int>(rgba2[1]), 255, "green survives the reorder");
+            check_eq(static_cast<int>(rgba2[3]), 128, "and so does partial alpha");
+        }
+
+        // A buffer that disagrees with the dimensions is refused rather than read
+        // past the end -- the data comes from another process.
+        check(tray_argb_to_rgba(argb, 4, 2, 2).empty(),
+              "a short buffer is refused, not read past");
+        check(tray_argb_to_rgba(argb, 4, 0, 0).empty(), "zero dimensions are refused");
+        check(tray_argb_to_rgba(nullptr, 0, 1, 1).empty(), "no data is refused");
+
+        const std::vector<TrayPixmapSize> sizes{{16, 16}, {48, 48}, {22, 22}};
+        check_eq(best_tray_pixmap(sizes), 1, "the largest pixmap is chosen");
+        check_eq(best_tray_pixmap({}), -1, "no pixmaps means no choice");
+        check_eq(best_tray_pixmap({{0, 0}}), -1, "a zero-sized pixmap is not a choice");
+    }
+
+    // XApp status icons -- Mint's own protocol, and the reason the tray was showing
+    // two icons where the system panel showed four. mintupdate, mintreport and
+    // blueberry are all here and none of them are on StatusNotifierItem.
+    {
+        check(is_xapp_status_service("org.x.StatusIcon.tray_py"),
+              "a Mint status service is recognised");
+        check(is_xapp_status_service("org.x.StatusIcon.blueberry"),
+              "and so is another one");
+
+        // The bare interface name is not a service offering an icon.
+        check(!is_xapp_status_service("org.x.StatusIcon"),
+              "the interface name alone is not a service");
+        check(!is_xapp_status_service("org.kde.StatusNotifierItem"),
+              "an SNI name is not an XApp one");
+        check(!is_xapp_status_service(""), "empty is not a service");
+
+        // The same process owns com.linuxmint.reports-tray as well; only the
+        // prefixed name is the one that advertises icons.
+        check(!is_xapp_status_service("com.linuxmint.reports-tray"),
+              "a Mint application's own name is not its icon service");
+
+        check(tray_icon_is_path("/usr/share/icons/hicolor/mintreport.png"),
+              "an absolute path is loaded as a file");
+        check(!tray_icon_is_path("mintreport-symbolic"),
+              "a themed name is looked up in the theme");
+        check(!tray_icon_is_path(""), "nothing is not a path");
+
+        // GtkPositionType, which the application uses to decide which way its menu
+        // opens. Getting it backwards opens the menu off the edge of the screen.
+        check_eq(xapp_panel_position(true), 2, "a top panel reports GTK_POS_TOP");
+        check_eq(xapp_panel_position(false), 3, "a bottom panel reports GTK_POS_BOTTOM");
+    }
+
+    // Menus. Both items on this desktop do everything through one.
+    {
+        check_eq(strip_menu_mnemonics("_Quit"), std::string("Quit"),
+                 "a mnemonic marker is removed, its letter kept");
+        check_eq(strip_menu_mnemonics("Save __As"), std::string("Save _As"),
+                 "a doubled underscore is a literal one");
+        check_eq(strip_menu_mnemonics("No mnemonic"), std::string("No mnemonic"),
+                 "a label without one is untouched");
+
+        // Built by hand rather than with designated initialisers: the struct has
+        // more fields than each case cares about, and naming only some of them is
+        // a warning under -Wextra.
+        const auto entry = [](std::int32_t id, const char* label, bool visible = true) {
+            TrayMenuNode node;
+            node.id = id;
+            node.label = label;
+            node.visible = visible;
+            return node;
+        };
+        const auto rule = [](std::int32_t id) {
+            TrayMenuNode node;
+            node.id = id;
+            node.separator = true;
+            return node;
+        };
+
+        std::vector<TrayMenuNode> nodes{
+            rule(1),                       // leading, dropped
+            entry(2, "Open"),
+            rule(3),
+            rule(4),                       // doubled, dropped
+            entry(5, "Hidden", false),     // dropped
+            entry(6, "Quit"),
+            rule(7),                       // trailing, dropped
+        };
+        const auto tidy = tidy_tray_menu(nodes);
+        check_eq(tidy.size(), std::size_t{3}, "only the real entries and one rule");
+        if (tidy.size() == 3) {
+            check_eq(tidy[0].label, std::string("Open"), "first entry survives");
+            check(tidy[1].separator, "one separator between the groups");
+            check_eq(tidy[2].label, std::string("Quit"), "last entry survives");
+        }
+
+        // A menu that is nothing but separators is empty, not a stack of rules.
+        const auto rules = tidy_tray_menu({rule(1), rule(2)});
+        check(rules.empty(), "a menu of only separators tidies to nothing");
+
+        // Submenus are tidied too, or a nested section keeps its stray rules.
+        TrayMenuNode parent = entry(1, "More");
+        parent.children = {rule(2), entry(3, "Deep")};
+        std::vector<TrayMenuNode> nested{parent};
+        const auto tidy_nested = tidy_tray_menu(nested);
+        check_eq(tidy_nested.size(), std::size_t{1}, "the parent survives");
+        if (!tidy_nested.empty()) {
+            check_eq(tidy_nested[0].children.size(), std::size_t{1},
+                     "and its children are tidied as well");
+        }
+    }
+}
+
 void test_windows_stay_on_one_monitor() {
     std::cout << "one-monitor containment\n";
 
@@ -2385,6 +2790,8 @@ int main(int argc, char** argv) {
     test_monitors_current();
     test_minimize();
     test_crew();
+    test_volume_and_network();
+    test_tray();
     test_windows_stay_on_one_monitor();
     test_placed_geometry_is_frame_space();
     test_frame_extents();

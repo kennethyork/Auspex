@@ -353,6 +353,14 @@ public:
             .ok;
     }
 
+    std::optional<Point> pointer_position() override {
+        // `--shell` gives X=..\nY=.. rather than a sentence, so the parse cannot be
+        // broken by a translated locale.
+        const auto result = run({"xdotool", "getmouselocation", "--shell"});
+        if (!result.ok) return std::nullopt;
+        return parse_pointer_position(result.out);
+    }
+
     std::optional<std::string> primary_selection() override {
         // A helper rather than GTK's clipboard API: reading the X primary selection
         // from the GTK thread needs the window to have focus, and the panel is a

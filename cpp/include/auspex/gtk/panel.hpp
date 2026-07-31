@@ -26,11 +26,15 @@
 #include <gtkmm/image.h>
 #include <gtkmm/label.h>
 #include <gtkmm/gestureclick.h>
+#include <gtkmm/menubutton.h>
+#include <gtkmm/scrolledwindow.h>
+#include <gtkmm/scale.h>
 #include <gtkmm/togglebutton.h>
 
 #include "auspex/config.hpp"
 #include "auspex/desktop.hpp"
 #include "auspex/panel_dock.hpp"
+#include "auspex/gtk/tray.hpp"
 #include "auspex/gtk/windows.hpp"
 #include "auspex/sysmon.hpp"
 
@@ -95,6 +99,65 @@ private:
     std::string  menu_target_;
     sigc::slot<void(const std::string&)> on_restore_;
     sigc::slot<void(const std::string&)> on_full_;
+};
+
+// Volume, as a panel control rather than a tray icon.
+//
+// The sound icon on a stock Xfce desktop is libpulseaudio-plugin.so running inside
+// xfce4-panel's own process -- a panel plugin, not a tray icon. It publishes
+// nothing on StatusNotifierItem or on XApp, so no tray can adopt it and Auspex has
+// to bring its own. It drives the same wpctl/pactl path the spoken "set the volume"
+// command already uses.
+// A MenuButton, not a Button with a popover bolted on. A plain button pops the
+// popover up and then dismisses it again with its own release event -- the button
+// highlights and nothing appears. MenuButton is the widget that owns this
+// interaction, including parenting and placement.
+class VolumeButton : public Gtk::MenuButton {
+public:
+    VolumeButton();
+
+private:
+    void poll();
+    void apply(int percent, bool muted);
+
+    Gtk::Popover     popover_;
+    Gtk::Box         popover_box_{Gtk::Orientation::VERTICAL, 8};
+    Gtk::Scale       slider_;
+    Gtk::Button      mute_{"Mute"};
+
+    VolumeState state_;
+    // Set while the slider is being dragged, so the one-second poll cannot yank the
+    // handle out from under the pointer with a value it read mid-drag.
+    bool        adjusting_ = false;
+};
+
+// Network, for the same reason as VolumeButton: it is not a tray icon on a stock
+// desktop either, and having it here means the state is visible without expanding
+// the tray.
+class NetworkButton : public Gtk::MenuButton {
+public:
+    explicit NetworkButton(const Config& config);
+
+private:
+    void poll();
+
+    const Config& config_;
+
+    void rebuild_networks();
+
+    Gtk::Popover popover_;
+    Gtk::Box     popover_box_{Gtk::Orientation::VERTICAL, 8};
+    Gtk::Label   status_;
+    // Wifi list. Rebuilt each time the popover opens: a cached list is a list of
+    // where you were, and the whole point of opening it is to see where you are.
+    Gtk::Label          wifi_heading_;
+    Gtk::ScrolledWindow wifi_scroller_;
+    Gtk::Box            wifi_box_{Gtk::Orientation::VERTICAL, 2};
+    Gtk::Button         radio_{"Turn Wi-Fi on"};
+    Gtk::Button  settings_{"Network settings\u2026"};
+
+    NetworkState state_;
+    std::vector<std::unique_ptr<Gtk::Widget>> wifi_rows_;
 };
 
 // CPU/RAM/GPU/VRAM readout.
@@ -201,6 +264,9 @@ private:
     Gtk::Button                          zoom_reset_{"1:1"};
     std::unique_ptr<WorkspaceSwitcher>   workspaces_;
     std::unique_ptr<WindowList>          windows_;
+    std::unique_ptr<SystemTray>          tray_;
+    std::unique_ptr<VolumeButton>        volume_;
+    std::unique_ptr<NetworkButton>       network_button_;
     std::unique_ptr<SystemMonitorWidget> sysmon_;
     Gtk::Button                          network_;
     Gtk::Image                           network_icon_;

@@ -209,6 +209,13 @@ std::optional<std::string> focused_window_title();
 // they explicitly copied. nullopt when nothing is selected.
 std::optional<std::string> selected_text();
 
+// Parses `xdotool getmouselocation --shell`, which prints X=, Y=, SCREEN= and
+// WINDOW= on separate lines. Exposed for testing against captured output.
+std::optional<Point> parse_pointer_position(const std::string& shell_output);
+
+// Where the pointer is, in root coordinates. nullopt when it cannot be determined.
+std::optional<Point> pointer_position();
+
 // Whether selected_text() can answer at all. False means the environment is missing
 // the helper it needs, and every read will come back empty no matter what is
 // highlighted -- which callers must say out loud rather than reporting as "nothing
