@@ -143,6 +143,15 @@ private:
     void update_toggle();
 
     // The second protocol. Mint's own applications are here and nowhere else.
+    // Owning org.x.StatusIconMonitor is what makes Mint's applications publish
+    // over D-Bus at all. libxapp checks whether anyone owns that name: if somebody
+    // does it exports org.x.StatusIcon.<name>, and if nobody does it falls back to
+    // a legacy XEmbed icon, which nothing here can see.
+    //
+    // So this is not "also announce ourselves" -- without it, nm-applet,
+    // mintupdate and mintreport vanish from the bus completely the moment
+    // xfce4-panel stops holding the name.
+    void try_become_xapp_monitor();
     void sync_xapp_services();
     void add_xapp_service(const std::string& service);
     void remove_xapp_service(const std::string& service);
@@ -156,6 +165,7 @@ private:
     guint            host_name_id_    = 0;
     guint            watcher_name_id_ = 0;
     guint            watcher_object_id_ = 0;
+    guint            xapp_monitor_id_   = 0;
     std::vector<guint> subscriptions_;
 
     int icon_size_;

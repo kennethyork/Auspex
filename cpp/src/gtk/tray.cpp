@@ -11,6 +11,7 @@
 #include <giomm/simpleactiongroup.h>
 #include <gdkmm/pixbuf.h>
 #include <gdkmm/texture.h>
+#include <glibmm/main.h>
 #include <gtkmm/icontheme.h>
 
 #include "auspex/desktop.hpp"
@@ -26,6 +27,7 @@ constexpr const char* kItemInterface    = "org.kde.StatusNotifierItem";
 constexpr const char* kMenuInterface    = "com.canonical.dbusmenu";
 constexpr const char* kXAppInterface    = "org.x.StatusIcon";
 constexpr const char* kXAppRoot         = "/org/x/StatusIcon";
+constexpr const char* kXAppMonitorName  = "org.x.StatusIconMonitor";
 
 // Every call into another application is time-limited.
 //
@@ -789,8 +791,29 @@ void SystemTray::connect_bus() {
         },
         this, nullptr));
 
+    try_become_xapp_monitor();
+
     sync_items();
     sync_xapp_services();
+}
+
+void SystemTray::try_become_xapp_monitor() {
+    // DO_NOT_QUEUE, for the same reason as the StatusNotifier watcher: taking the
+    // name from a panel that is already serving it mid-session would move every
+    // Mint icon from that panel to this one without being asked.
+    xapp_monitor_id_ = g_bus_own_name_on_connection(
+        bus_, kXAppMonitorName, G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE,
+        [](GDBusConnection*, const gchar*, gpointer user_data) {
+            // Applications watch this name and switch to publishing over D-Bus when
+            // it appears, so anything that had already fallen back to an XEmbed
+            // icon comes back -- but only after it has noticed. Re-scanned on a
+            // short delay rather than immediately, or the scan runs before any of
+            // them have exported anything.
+            auto* self = static_cast<SystemTray*>(user_data);
+            Glib::signal_timeout().connect_once(
+                [self] { self->sync_xapp_services(); }, 1500);
+        },
+        nullptr, this, nullptr);
 }
 
 void SystemTray::sync_xapp_services() {
