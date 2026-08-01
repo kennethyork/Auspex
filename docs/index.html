@@ -1,0 +1,746 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auspex — a Linux desktop that listens</title>
+<meta name="description" content="Auspex is a local AI desktop environment for Linux. Voice, an infinite canvas, and a panel that replaces xfce4-panel outright — with every model running on your own machine.">
+<meta name="color-scheme" content="light dark">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="Auspex — a Linux desktop that listens">
+<meta property="og:description" content="A local AI desktop environment for Linux. Voice, an infinite canvas, two tray protocols, and every model on your own disk.">
+<meta property="og:url" content="https://kennethyork.github.io/Auspex/">
+
+
+<style>
+  /* ---- tokens ------------------------------------------------------------ */
+  :root {
+    --ink:        #0e0f16;
+    --paper:      #eaecf3;
+
+    --bg:         var(--paper);
+    --bg-raised:  #f4f5f9;
+    --bg-sunk:    #dfe2ec;
+    --fg:         #14161f;
+    --fg-muted:   #565b6e;
+    --fg-faint:   #858aa0;
+    --rule:       #c9cddc;
+
+    --accent:     #5b52d6;
+    --accent-dim: #7d76e2;
+    --jade:       #1d7f63;
+    --amber:      #96631d;
+
+    --grid:       rgba(20, 22, 31, .055);
+
+    --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Mono",
+            Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+            "Noto Sans", sans-serif;
+
+    --measure: 65ch;
+    --step--1: clamp(.78rem, .76rem + .1vw, .84rem);
+    --step-0:  clamp(1rem, .97rem + .16vw, 1.09rem);
+    --step-1:  clamp(1.2rem, 1.13rem + .35vw, 1.42rem);
+    --step-2:  clamp(1.5rem, 1.36rem + .7vw, 2rem);
+    --step-3:  clamp(2rem, 1.6rem + 2vw, 3.4rem);
+    --step-4:  clamp(2.6rem, 1.7rem + 4.4vw, 5.6rem);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:        var(--ink);
+      --bg-raised: #171926;
+      --bg-sunk:   #090a10;
+      --fg:        #e6e8f2;
+      --fg-muted:  #9ba1bb;
+      --fg-faint:  #6b7189;
+      --rule:      #262a3c;
+
+      --accent:     #8f8cf5;
+      --accent-dim: #6f6ccd;
+      --jade:       #3fb894;
+      --amber:      #d99a4e;
+
+      --grid: rgba(230, 232, 242, .05);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg:        var(--ink);
+    --bg-raised: #171926;
+    --bg-sunk:   #090a10;
+    --fg:        #e6e8f2;
+    --fg-muted:  #9ba1bb;
+    --fg-faint:  #6b7189;
+    --rule:      #262a3c;
+    --accent:     #8f8cf5;
+    --accent-dim: #6f6ccd;
+    --jade:       #3fb894;
+    --amber:      #d99a4e;
+    --grid: rgba(230, 232, 242, .05);
+  }
+
+  :root[data-theme="light"] {
+    --bg:        var(--paper);
+    --bg-raised: #f4f5f9;
+    --bg-sunk:   #dfe2ec;
+    --fg:        #14161f;
+    --fg-muted:  #565b6e;
+    --fg-faint:  #858aa0;
+    --rule:      #c9cddc;
+    --accent:     #5b52d6;
+    --accent-dim: #7d76e2;
+    --jade:       #1d7f63;
+    --amber:      #96631d;
+    --grid: rgba(20, 22, 31, .055);
+  }
+
+  /* ---- base -------------------------------------------------------------- */
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: var(--step-0);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* The canvas grid, behind everything — the same 64px step the real one uses. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 64px 64px;
+  }
+
+  main, header, footer { position: relative; z-index: 1; }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: .2em; }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+
+  .wrap {
+    width: min(100% - 3rem, 78rem);
+    margin-inline: auto;
+  }
+
+  .prose { max-width: var(--measure); }
+  .prose p { margin: 0 0 1.1em; color: var(--fg-muted); }
+  .prose p strong { color: var(--fg); font-weight: 600; }
+
+  /* Micro-label, set exactly like the panel's own readouts. */
+  .label {
+    font-family: var(--mono);
+    font-size: var(--step--1);
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+  }
+
+  /* ---- the page's own panel strip ---------------------------------------- */
+  .panelbar {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    padding: .4rem clamp(.9rem, 3vw, 1.6rem);
+    background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: var(--step--1);
+  }
+  .panelbar .brand { font-weight: 700; letter-spacing: -.02em; }
+  .panelbar .spacer { flex: 1; }
+  .panelbar .readout { color: var(--fg-faint); display: none; }
+  @media (min-width: 46rem) { .panelbar .readout { display: inline; } }
+  .panelbar .clock { color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+
+  .ghost {
+    font: inherit;
+    font-family: var(--mono);
+    color: var(--fg-muted);
+    background: none;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: .15rem .5rem;
+    cursor: pointer;
+  }
+  .ghost:hover { color: var(--fg); border-color: var(--accent-dim); }
+
+  /* ---- hero -------------------------------------------------------------- */
+  .hero { padding: clamp(3rem, 9vw, 7rem) 0 clamp(2rem, 5vw, 4rem); }
+
+  .hero h1 {
+    font-family: var(--mono);
+    font-size: var(--step-4);
+    line-height: .92;
+    letter-spacing: -.055em;
+    font-weight: 700;
+    margin-bottom: .35em;
+  }
+  .hero h1 .dim { color: var(--fg-faint); }
+
+  .hero .thesis {
+    font-size: var(--step-1);
+    line-height: 1.45;
+    max-width: 34ch;
+    color: var(--fg-muted);
+    margin: 0 0 2rem;
+  }
+  .hero .thesis strong { color: var(--fg); font-weight: 600; }
+
+  /* ---- the live panel demo ------------------------------------------------ */
+  .demo {
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    background: var(--bg-sunk);
+    overflow: hidden;
+  }
+  .demo-stage {
+    position: relative;
+    height: clamp(190px, 26vw, 260px);
+    background:
+      radial-gradient(120% 90% at 30% 0%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 60%),
+      var(--bg-sunk);
+    overflow: hidden;
+  }
+  .demo-stage::before {
+    content: "";
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+
+  .win {
+    position: absolute;
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--rule));
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--bg-raised) 88%, var(--accent));
+    box-shadow: 0 6px 18px rgba(0,0,0,.18);
+    transition: all .5s cubic-bezier(.22,.75,.2,1);
+    overflow: hidden;
+  }
+  .win .bar {
+    height: 13px;
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  .win .tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--fg-faint);
+    padding: .35rem .45rem;
+    white-space: nowrap;
+  }
+
+  .readoutchip {
+    position: absolute;
+    right: 10px; bottom: 10px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-muted);
+    background: color-mix(in srgb, var(--bg-sunk) 82%, transparent);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: .2rem .45rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* the miniature bottom bar */
+  .minibar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: .3rem;
+    flex-wrap: wrap;
+    padding: .45rem .6rem;
+    background: color-mix(in srgb, var(--bg-raised) 95%, transparent);
+    border-top: 1px solid var(--rule);
+  }
+  .key {
+    position: relative;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-muted);
+    background: color-mix(in srgb, var(--bg-sunk) 60%, transparent);
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: .28rem .5rem;
+    cursor: default;
+    display: inline-flex;
+    align-items: center;
+    gap: .3rem;
+    white-space: nowrap;
+  }
+  .key[data-act] { cursor: pointer; }
+  .key:hover { color: var(--fg); border-color: var(--rule); }
+  .key[aria-pressed="true"] { color: var(--accent); border-color: var(--accent-dim); }
+  .key .tip {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    translate: -50% 0;
+    background: var(--fg);
+    color: var(--bg);
+    font-size: 10.5px;
+    letter-spacing: .01em;
+    padding: .25rem .45rem;
+    border-radius: 4px;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .14s;
+  }
+  .key:hover .tip, .key:focus-visible .tip { opacity: 1; }
+  .key.wide { color: var(--fg); }
+
+  .trayicons { display: flex; gap: .3rem; overflow: hidden; transition: max-width .35s, opacity .25s; }
+  .trayicons[data-open="false"] { max-width: 0; opacity: 0; }
+  .trayicons[data-open="true"]  { max-width: 300px; opacity: 1; }
+
+  .demo-note {
+    font-family: var(--mono);
+    font-size: var(--step--1);
+    color: var(--fg-faint);
+    padding: .5rem .75rem;
+    border-top: 1px solid var(--rule);
+    background: var(--bg-raised);
+  }
+
+  /* ---- sections ---------------------------------------------------------- */
+  section { padding: clamp(3rem, 8vw, 6rem) 0; }
+  .sec-head { display: flex; gap: 1rem; align-items: baseline; margin-bottom: 2rem; flex-wrap: wrap; }
+  .sec-head h2 {
+    font-family: var(--mono);
+    font-size: var(--step-3);
+    letter-spacing: -.045em;
+    line-height: 1;
+    font-weight: 700;
+  }
+
+  .rule { height: 1px; background: var(--rule); border: 0; margin: 0; }
+
+  /* ---- comparison -------------------------------------------------------- */
+  .compare { display: grid; gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; }
+  @media (min-width: 52rem) { .compare { grid-template-columns: 1fr 1fr; } }
+  .cell { background: var(--bg); padding: 1.4rem 1.5rem; }
+  .cell h3 { font-size: var(--step-0); font-weight: 650; margin-bottom: .5rem; letter-spacing: -.01em; }
+  .cell p { margin: 0; color: var(--fg-muted); font-size: .95rem; }
+  .cell.usual { background: var(--bg-sunk); }
+  .cell.usual h3 { color: var(--fg-faint); font-weight: 500; }
+  .cell .kicker {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em;
+    text-transform: uppercase; display: block; margin-bottom: .55rem;
+  }
+  .cell.usual .kicker { color: var(--fg-faint); }
+  .cell.ours  .kicker { color: var(--accent); }
+
+  /* ---- evidence cards ---------------------------------------------------- */
+  .cards { display: grid; gap: 1.25rem; }
+  @media (min-width: 60rem) { .cards { grid-template-columns: repeat(3, 1fr); } }
+  .card {
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    background: var(--bg-raised);
+    padding: 1.3rem 1.35rem;
+    display: flex; flex-direction: column; gap: .8rem;
+  }
+  .card h3 { font-size: var(--step-0); font-weight: 650; letter-spacing: -.012em; }
+  .card p { margin: 0; color: var(--fg-muted); font-size: .93rem; }
+  .card .sym { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--amber); }
+
+  .trace {
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.75;
+    background: var(--bg-sunk);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: .7rem .8rem;
+    overflow-x: auto;
+    font-variant-numeric: tabular-nums;
+  }
+  .trace .k { color: var(--fg-faint); }
+  .trace .bad { color: var(--amber); }
+  .trace .good { color: var(--jade); }
+
+  /* ---- numbers ----------------------------------------------------------- */
+  .figures { display: grid; gap: 1px; background: var(--rule); border-block: 1px solid var(--rule); }
+  @media (min-width: 44rem) { .figures { grid-template-columns: repeat(4, 1fr); } }
+  .fig { background: var(--bg); padding: 1.5rem 1.2rem; }
+  .fig b {
+    display: block;
+    font-family: var(--mono);
+    font-size: var(--step-2);
+    letter-spacing: -.04em;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    margin-bottom: .4rem;
+  }
+  .fig span { color: var(--fg-muted); font-size: .9rem; }
+
+  /* ---- list -------------------------------------------------------------- */
+  .plain { list-style: none; padding: 0; margin: 0; display: grid; gap: .85rem; }
+  .plain li { display: grid; grid-template-columns: auto 1fr; gap: .75rem; align-items: start; color: var(--fg-muted); }
+  .plain li::before {
+    content: "";
+    width: 7px; height: 7px; margin-top: .55em;
+    background: var(--accent);
+    border-radius: 1px;
+  }
+  .plain li b { color: var(--fg); font-weight: 620; }
+
+  footer { border-top: 1px solid var(--rule); padding: 3rem 0 4rem; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<header class="panelbar">
+  <span class="brand">Auspex</span>
+  <span class="readout">CPU 8.4% · RAM 10.1% · GPU 24.0%</span>
+  <span class="spacer"></span>
+  <span class="clock" id="clock">--:--:--</span>
+  <button class="ghost" id="theme" type="button">theme</button>
+</header>
+
+<main>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="hero wrap">
+    <p class="label" style="margin:0 0 1.4rem">Local AI desktop environment · Linux · X11</p>
+
+    <h1>A desktop<br>that <span class="dim">listens.</span></h1>
+
+    <p class="thesis">
+      Auspex replaces your panel and your desktop with something that hears you,
+      answers you, and lays your windows out on a plane larger than the screen.
+      <strong>Every model runs on your machine.</strong>
+    </p>
+
+    <div class="demo">
+      <div class="demo-stage" id="stage">
+        <div class="win" id="w1" style="left:6%; top:14%; width:40%; height:64%;">
+          <div class="bar"></div><div class="tag">Terminal</div>
+        </div>
+        <div class="win" id="w2" style="left:52%; top:14%; width:40%; height:64%;">
+          <div class="bar"></div><div class="tag">Firefox</div>
+        </div>
+        <div class="readoutchip" id="chip">0, 0 &nbsp; 2 windows</div>
+      </div>
+
+      <div class="minibar">
+        <button class="key" data-act="mode" id="modekey" aria-pressed="true" type="button">
+          <span id="modelabel">Grid</span><span class="tip">Grid arranges your windows; canvas leaves them where you drag them</span>
+        </button>
+        <span class="key">←<span class="tip">Pan canvas left</span></span>
+        <span class="key">↑<span class="tip">Pan canvas up</span></span>
+        <span class="key">1:1<span class="tip">Back to the grid at life size</span></span>
+        <span class="key">↓<span class="tip">Pan canvas down</span></span>
+        <span class="key">→<span class="tip">Pan canvas right</span></span>
+
+        <button class="key" data-act="tray" id="traykey" aria-pressed="false" type="button">
+          <span id="trayarrow">◀</span><span class="tip">Show the tray</span>
+        </button>
+        <span class="trayicons" id="tray" data-open="false">
+          <span class="key">✳<span class="tip">Bluetooth · StatusNotifierItem</span></span>
+          <span class="key">◎<span class="tip">Steam · StatusNotifierItem</span></span>
+          <span class="key">⌁<span class="tip">Network · XApp</span></span>
+          <span class="key">▣<span class="tip">Update manager · XApp</span></span>
+        </span>
+
+        <span class="key">◑<span class="tip">Volume — built in, because it can never be a tray icon</span></span>
+        <span class="key wide">Ask about Terminal…<span class="tip">Click to speak a command, right-click to chat</span></span>
+        <span class="key">Speak<span class="tip">Read the highlighted text aloud</span></span>
+        <span class="key">Text<span class="tip">Click to dictate, click again to stop</span></span>
+        <span class="key">Auto<span class="tip">Listen continuously, hands-free</span></span>
+      </div>
+
+      <p class="demo-note" style="margin:0">
+        This is the real bar, rebuilt in the page. Hover anything · press Grid to switch modes · open the tray.
+      </p>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="wrap">
+    <div class="sec-head">
+      <span class="label">01 → 07</span>
+      <h2>Not a panel.</h2>
+    </div>
+
+    <div class="prose" style="margin-bottom:2.5rem">
+      <p>
+        A Linux panel is a strip that launches things and lists windows. Auspex keeps
+        all of that — and is answering a different question underneath it.
+        Here is every place it diverges from the panel you are running now.
+      </p>
+    </div>
+
+    <div class="compare">
+      <div class="cell usual">
+        <span class="kicker">Usually</span>
+        <h3>The desktop is a backdrop</h3>
+        <p>Windows sit on a fixed screen. Run out of room and you get another workspace.</p>
+      </div>
+      <div class="cell ours">
+        <span class="kicker">Auspex</span>
+        <h3>The desktop is a canvas</h3>
+        <p>Windows live on a plane larger than the monitor. Pan it, zoom it, drop things in the space beyond the edge — then pan back and they are where you left them. Grid mode arranges them for you; canvas mode never touches what you placed by hand.</p>
+      </div>
+
+      <div class="cell usual">
+        <span class="kicker">Usually</span>
+        <h3>You type at it</h3>
+        <p>A launcher, a search box, keyboard shortcuts you have to remember.</p>
+      </div>
+      <div class="cell ours">
+        <span class="kicker">Auspex</span>
+        <h3>You talk to it</h3>
+        <p>whisper.cpp is compiled into the shell — not a service it calls. Say “open my downloads” and it opens. Dictate into whatever window has focus. Ask a question aloud and hear the answer back through Piper.</p>
+      </div>
+
+      <div class="cell usual">
+        <span class="kicker">Usually</span>
+        <h3>AI means a cloud account</h3>
+        <p>An API key, a subscription, and your screen contents leaving the machine.</p>
+      </div>
+      <div class="cell ours">
+        <span class="kicker">Auspex</span>
+        <h3>The model is on your disk</h3>
+        <p>Speech recognition, the language model and the voice all run locally. No key, no account, no telemetry, and it works with the network unplugged.</p>
+      </div>
+
+      <div class="cell usual">
+        <span class="kicker">Usually</span>
+        <h3>One tray protocol</h3>
+        <p>Most panels implement StatusNotifierItem and stop there.</p>
+      </div>
+      <div class="cell ours">
+        <span class="kicker">Auspex</span>
+        <h3>Two, plus the monitor name</h3>
+        <p>SNI <em>and</em> XApp, which is what Mint’s own applications use. Auspex also claims <code>org.x.StatusIconMonitor</code> — without it those applications fall back to a legacy tray and vanish from the bus entirely. On this desktop that is the difference between two icons and five.</p>
+      </div>
+
+      <div class="cell usual">
+        <span class="kicker">Usually</span>
+        <h3>Volume is a plugin</h3>
+        <p>Sound and network arrive as panel plugins loaded into the panel’s own process.</p>
+      </div>
+      <div class="cell ours">
+        <span class="kicker">Auspex</span>
+        <h3>Volume is built in, deliberately</h3>
+        <p>Those plugins publish nothing on any tray protocol, so no panel can adopt another panel’s. Auspex ships its own volume, network with a Wi-Fi list, calendar with recurring events, and a notification log built by watching the bus rather than by seizing the notification daemon.</p>
+      </div>
+
+      <div class="cell usual">
+        <span class="kicker">Usually</span>
+        <h3>A crash costs you the panel</h3>
+        <p>Until you notice it is gone and start it again from a terminal.</p>
+      </div>
+      <div class="cell ours">
+        <span class="kicker">Auspex</span>
+        <h3>It supervises itself</h3>
+        <p>Login starts a supervisor, not the shell. A crash restarts in three seconds; five crashes in five minutes is treated as a loop rather than bad luck, and it says so instead of thrashing.</p>
+      </div>
+
+      <div class="cell usual">
+        <span class="kicker">Usually</span>
+        <h3>The AI is a chat window</h3>
+        <p>A box you paste into, next to the work rather than in it.</p>
+      </div>
+      <div class="cell ours">
+        <span class="kicker">Auspex</span>
+        <h3>A crew works in the open</h3>
+        <p>Hand a task to a bench of agents that each build in their own git worktree, with an auditor reading every diff before it lands. The panel counts the subtasks off as they finish; nothing reaches your files until you accept it.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="wrap">
+    <div class="sec-head">
+      <span class="label">Evidence</span>
+      <h2>Measured, not assumed.</h2>
+    </div>
+
+    <div class="prose" style="margin-bottom:2.5rem">
+      <p>
+        Moving somebody else’s windows around means trusting what the system tells you
+        about them. Three times it lied, and each one was found by reading real output
+        rather than reasoning about it.
+      </p>
+    </div>
+
+    <div class="cards">
+      <article class="card">
+        <span class="sym">Drift</span>
+        <h3>The window manager double-counted</h3>
+        <p><code>wmctrl -lG</code> reports a position that is neither the frame nor the client: it asks X for the client’s offset <em>inside</em> its frame, then translates that same offset to root coordinates. The decoration is counted twice.</p>
+        <div class="trace"><span class="k">asked&nbsp;&nbsp;&nbsp;</span>1920, 42
+<span class="k">reported</span> <span class="bad">1930, 100</span>
+<span class="k">truth&nbsp;&nbsp;&nbsp;</span> <span class="good">1920, 42</span></div>
+        <p>A 29px title bar made every window read back 58px below where it had just been put. The layout took that for a drag, wrote it in, and every window walked steadily down the screen.</p>
+      </article>
+
+      <article class="card">
+        <span class="sym">Silence</span>
+        <h3>A locale swallowed the calendar</h3>
+        <p>Dates were built with a stream, which formats integers through the global locale. One with digit grouping writes the year with a comma — an eleven-character key that fails validation, so every event was refused without a word.</p>
+        <div class="trace"><span class="k">in shell&nbsp;</span> <span class="bad">2,026-07-31</span>
+<span class="k">in tests&nbsp;</span> <span class="good">2026-07-31</span></div>
+        <p>Invisible to the test suite, which runs under the C locale. Seen on screen, in the corner of a popover, reading “nothing noted”.</p>
+      </article>
+
+      <article class="card">
+        <span class="sym">Loop</span>
+        <h3>A lost window drove a busy loop</h3>
+        <p>A window parked below every monitor could never be adopted again — its centre was on no screen. So it reappeared in the adoption plan on every tick, forever.</p>
+        <div class="trace"><span class="k">idle, before</span> <span class="bad">1 place/sec</span>
+<span class="k">idle, after&nbsp;</span> <span class="good">0</span></div>
+        <p>A window nobody could see was quietly driving a subprocess call per managed window per second for the length of the session.</p>
+      </article>
+    </div>
+  </section>
+
+  <div class="figures">
+    <div class="fig wrap" style="width:auto"><b>894</b><span>checks, run on every build</span></div>
+    <div class="fig"><b>22k</b><span>lines of C++, no vendored bulk</span></div>
+    <div class="fig"><b>0</b><span>X11 libraries linked by the tools</span></div>
+    <div class="fig"><b>2</b><span>tray protocols spoken</span></div>
+  </div>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="wrap">
+    <div class="sec-head">
+      <span class="label">Method</span>
+      <h2>How it holds together.</h2>
+    </div>
+
+    <div class="prose">
+      <p>
+        Auspex runs as an ordinary application inside the session you already have.
+        It does not replace your window manager, so a crash costs you a panel rather
+        than a desktop — and you can put the old one back with one command.
+      </p>
+    </div>
+
+    <ul class="plain" style="margin-top:2rem; max-width:var(--measure)">
+      <li><b>No Xlib anywhere in the tools.</b> Window management goes through a seam driving <code>wmctrl</code>, <code>xdotool</code> and <code>xprop</code> as subprocesses, so the CLI binaries link zero X libraries and a second backend is a runtime choice rather than a rewrite.</li>
+      <li><b>The model never emits a command line.</b> Voice commands resolve to a fixed set of verbs, executed with an argv vector through <code>execvp</code>. There is no shell in the path, and free text that reaches a subprocess comes from your transcript, never from a paraphrase.</li>
+      <li><b>Irreversible things are checked twice.</b> Accepting a changeset is validated against the board that actually exists, so a number a model invented is refused rather than applied to somebody else’s work.</li>
+      <li><b>Privileged actions ask polkit.</b> Setting the clock or the timezone goes through <code>pkexec</code> with the argument validated first — against the system’s own list of zones, not a pattern.</li>
+      <li><b>One engine, two faces.</b> The crew is not reimplemented. Auspex drives the <code>ollamadev</code> CLI and renders the result, because two copies of that logic is how a wrong diff eventually lands in your files.</li>
+    </ul>
+  </section>
+
+  <hr class="rule">
+
+  <section class="wrap">
+    <div class="prose">
+      <p class="label" style="margin-bottom:1rem">Status</p>
+      <p>
+        Auspex runs on X11 today, on this machine, as the only panel — xfce4-panel
+        switched off, tray intact, starting itself at login under a supervisor.
+        A wlroots spike has already proved the part X11 cannot do: scaling a live
+        window so that zooming out makes it genuinely smaller rather than merely
+        narrower. That is the next thing.
+      </p>
+      <p style="margin-bottom:0">
+        <a href="https://github.com/kennethyork/Auspex">github.com/kennethyork/Auspex</a>
+      </p>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap">
+  <p class="label" style="margin:0">Auspex · built in the open · everything local</p>
+</footer>
+
+<script>
+  // Clock — the panel's own format, and the reason the strip reads as a panel.
+  const clock = document.getElementById("clock");
+  function tick() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, "0");
+    clock.textContent = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+                        `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  tick();
+  setInterval(tick, 1000);
+
+  // Theme toggle. Stamps the root so it beats the media query in both directions.
+  document.getElementById("theme").addEventListener("click", () => {
+    const root = document.documentElement;
+    const dark = root.getAttribute("data-theme") === "dark" ||
+                 (!root.hasAttribute("data-theme") &&
+                  matchMedia("(prefers-color-scheme: dark)").matches);
+    root.setAttribute("data-theme", dark ? "light" : "dark");
+  });
+
+  // Tray — collapsed by default, exactly as the real one is.
+  const traykey = document.getElementById("traykey");
+  const tray = document.getElementById("tray");
+  const trayarrow = document.getElementById("trayarrow");
+  traykey.addEventListener("click", () => {
+    const open = tray.dataset.open === "true";
+    tray.dataset.open = open ? "false" : "true";
+    traykey.setAttribute("aria-pressed", String(!open));
+    trayarrow.textContent = open ? "◀" : "▶";
+    traykey.querySelector(".tip").textContent = open ? "Show the tray" : "Hide the tray";
+  });
+
+  // Grid / canvas. Grid tiles the two windows; canvas puts them where a hand would.
+  const modekey = document.getElementById("modekey");
+  const modelabel = document.getElementById("modelabel");
+  const w1 = document.getElementById("w1");
+  const w2 = document.getElementById("w2");
+  const chip = document.getElementById("chip");
+
+  const layouts = {
+    grid:   [{ left: "6%",  top: "14%", width: "40%", height: "64%" },
+             { left: "52%", top: "14%", width: "40%", height: "64%" }],
+    canvas: [{ left: "10%", top: "22%", width: "34%", height: "48%" },
+             { left: "48%", top: "9%",  width: "44%", height: "72%" }]
+  };
+
+  modekey.addEventListener("click", () => {
+    const grid = modekey.getAttribute("aria-pressed") === "true";
+    const next = grid ? "canvas" : "grid";
+    modekey.setAttribute("aria-pressed", String(!grid));
+    modelabel.textContent = grid ? "Canvas" : "Grid";
+    Object.assign(w1.style, layouts[next][0]);
+    Object.assign(w2.style, layouts[next][1]);
+    chip.textContent = next === "grid" ? "0, 0   2 windows" : "-201, -79   2 windows";
+  });
+</script>
+
+</body>
+</html>
