@@ -393,10 +393,17 @@ private:
     Gtk::Button                       settings_;
     Gtk::Image                        settings_icon_;
     std::unique_ptr<LlmContextButton> llm_;
+    // Icon AND label, like the dictation button beside them. An icon alone is a
+    // guess -- a speaker could mean play, mute, or read aloud, and the only way to
+    // find out was to press it and see what happened.
     Gtk::Button                       speak_;
+    Gtk::Box                          speak_box_{Gtk::Orientation::HORIZONTAL, 4};
     Gtk::Image                        speak_icon_;
+    Gtk::Label                        speak_label_;
     Gtk::Button                       dictate_;
+    Gtk::Box                          dictate_box_{Gtk::Orientation::HORIZONTAL, 4};
     Gtk::Image                        dictate_icon_;
+    Gtk::Label                        dictate_label_;
 
     // Voice to text, as a TOGGLE rather than a press-and-hold.
     //
@@ -413,7 +420,9 @@ private:
     // reachable from nothing at all -- every spoken utterance went through the
     // command parser first, which can read a plain question as an action.
     Gtk::Button                       ask_;
+    Gtk::Box                          ask_box_{Gtk::Orientation::HORIZONTAL, 4};
     Gtk::Image                        ask_icon_;
+    Gtk::Label                        ask_label_;
     Gtk::Button                       terminal_;
     Gtk::Image                        terminal_icon_;
     // A toggle, not a button: this is the always-on ear, the closest equivalent to

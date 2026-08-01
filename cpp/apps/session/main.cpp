@@ -206,12 +206,86 @@ void print_plan(const auspex::SessionComponents& components, const auspex::Confi
               << "  XDG_SESSION_TYPE     x11\n";
 }
 
+// Runs the shell until it exits cleanly, restarting it when it does not.
+//
+// `session` says whether Auspex owns the desktop. It changes only what happens when
+// the policy gives up: as a session there is a window manager and a wallpaper still
+// up, so staying alive keeps a usable desktop; as a guest there is nothing to hold
+// open and exiting says so plainly rather than leaving a silent process behind.
+int supervise_shell(const std::string& shell, const auspex::RestartPolicy& policy,
+                    bool session) {
+    std::vector<std::int64_t> crashes;
+
+    while (!g_terminate) {
+        const pid_t shell_pid = spawn_tracked({shell}, false);
+        if (shell_pid < 0) {
+            std::cerr << "auspex-session: could not start " << shell << "\n";
+            return 1;
+        }
+
+        int status = 0;
+        while (::waitpid(shell_pid, &status, 0) < 0) {
+            if (errno == EINTR) {
+                if (g_terminate) break;
+                continue;
+            }
+            break;
+        }
+        // The shell is gone; stop tracking it so teardown does not signal its pid.
+        std::erase(g_children, shell_pid);
+
+        if (g_terminate) break;
+
+        // Zero is a logout, not a crash -- quitting Auspex from its own menu must
+        // not be undone by the thing that is supposed to be protecting it.
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) break;
+
+        const auto plan = auspex::plan_restart(crashes, ::time(nullptr), policy);
+        if (plan.exhausted) {
+            if (session) {
+                std::cerr << "auspex-session: the shell keeps crashing; leaving the "
+                             "rest of the session running so the desktop stays "
+                             "usable\n";
+                // Do NOT tear down. The user has a WM, a wallpaper and their
+                // windows, and can open a terminal to read the log. A black screen
+                // is the one outcome worse than a missing panel.
+                while (!g_terminate) ::pause();
+            } else {
+                std::cerr << "auspex-session: the shell keeps crashing; giving up. "
+                             "Your session is otherwise untouched.\n";
+            }
+            break;
+        }
+
+        std::cerr << "auspex-session: shell exited abnormally; restarting in "
+                  << plan.delay_seconds << "s\n";
+        sleep_interruptibly(plan.delay_seconds);
+    }
+
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::vector<std::string> args(argv + 1, argv + argc);
     const bool plan_only = !args.empty() && (args[0] == "--plan" || args[0] == "--check");
     const bool check     = !args.empty() && args[0] == "--check";
+
+    // Supervise the shell and start NOTHING else.
+    //
+    // This is the mode for running inside somebody else's session, which is what
+    // Auspex does most of the time. Everything below step 1 -- the window manager,
+    // the compositor, the wallpaper, XDG_CURRENT_DESKTOP -- exists for the case
+    // where Auspex IS the session, and every one of them is actively harmful when
+    // it is not: a second window manager fights the one already running, and
+    // rewriting XDG_CURRENT_DESKTOP sends portal requests to a daemon this session
+    // never started.
+    //
+    // What is left is the part that was actually wanted: if the panel dies, bring
+    // it back, with the same crash-loop policy the full session uses.
+    const bool supervise_only =
+        !args.empty() && (args[0] == "--supervise" || args[0] == "--shell-only");
 
     const auspex::Config       config     = auspex::Config::load();
     const auspex::RestartPolicy policy    = {};
@@ -237,6 +311,22 @@ int main(int argc, char** argv) {
         }
         std::cout << "ready\n";
         return 0;
+    }
+
+    if (supervise_only) {
+        if (shell.empty()) {
+            std::cerr << "auspex-session: auspex-shell not found\n";
+            return 1;
+        }
+
+        std::signal(SIGTERM, on_terminate);
+        std::signal(SIGINT, on_terminate);
+        std::signal(SIGCHLD, SIG_DFL);
+        std::signal(SIGPIPE, SIG_IGN);
+
+        const int code = supervise_shell(shell, policy, /*session=*/false);
+        terminate_children();
+        return code;
     }
 
     if (components.window_manager.empty() || shell.empty()) {
@@ -292,48 +382,7 @@ int main(int argc, char** argv) {
     }
 
     // 6. The shell, supervised.
-    std::vector<std::int64_t> crashes;
-    int exit_code = 0;
-
-    while (!g_terminate) {
-        const pid_t shell_pid = spawn_tracked({shell}, false);
-        if (shell_pid < 0) {
-            std::cerr << "auspex-session: could not start " << shell << "\n";
-            exit_code = 1;
-            break;
-        }
-
-        int status = 0;
-        while (::waitpid(shell_pid, &status, 0) < 0) {
-            if (errno == EINTR) {
-                if (g_terminate) break;
-                continue;
-            }
-            break;
-        }
-        // The shell is gone; stop tracking it so teardown does not signal its pid.
-        std::erase(g_children, shell_pid);
-
-        if (g_terminate) break;
-
-        const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        if (clean) break;   // a logout, not a crash
-
-        const auto plan = auspex::plan_restart(crashes, ::time(nullptr), policy);
-        if (plan.exhausted) {
-            std::cerr << "auspex-session: the shell keeps crashing; leaving "
-                      << components.window_manager
-                      << " running so the desktop stays usable\n";
-            // Do NOT tear down. The user has a WM, a wallpaper and their windows,
-            // and can open a terminal to read the log. Wait to be told to end.
-            while (!g_terminate) ::pause();
-            break;
-        }
-
-        std::cerr << "auspex-session: shell exited abnormally; restarting in "
-                  << plan.delay_seconds << "s\n";
-        sleep_interruptibly(plan.delay_seconds);
-    }
+    const int exit_code = supervise_shell(shell, policy, /*session=*/true);
 
     terminate_children();
     return exit_code;

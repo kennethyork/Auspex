@@ -80,13 +80,22 @@ std::filesystem::path own_executable() {
     return self;
 }
 
-std::string autostart_entry(const std::filesystem::path& executable) {
+std::filesystem::path supervisor_beside(const std::filesystem::path& shell) {
+    if (shell.empty()) return {};
+    std::error_code ec;
+    const auto sibling = shell.parent_path() / "auspex-session";
+    if (std::filesystem::exists(sibling, ec)) return sibling;
+    return {};
+}
+
+std::string autostart_entry(const std::filesystem::path& executable, bool supervise) {
     std::ostringstream entry;
     entry << "[Desktop Entry]\n"
           << "Type=Application\n"
           << "Name=Auspex\n"
           << "Comment=Local AI desktop shell\n"
-          << "Exec=" << executable.string() << "\n"
+          << "Exec=" << executable.string() << (supervise ? " --supervise" : "")
+          << "\n"
           << "Icon=preferences-desktop\n"
           << "Terminal=false\n"
           // Written explicitly rather than left out. Absent means enabled, but a
@@ -149,7 +158,10 @@ bool set_autostart(bool enabled, const std::filesystem::path& path,
 
     std::ofstream out(path, std::ios::trunc);
     if (!out) return false;
-    out << autostart_entry(executable);
+    // The supervisor when there is one. Its absence is not an error -- a build
+    // without it still autostarts, just without anything to restart the panel.
+    const bool supervise = executable.filename() == "auspex-session";
+    out << autostart_entry(executable, supervise);
     return out.good();
 }
 
@@ -157,11 +169,19 @@ bool set_autostart(bool enabled) {
     // Prefer the stable path, and create it as part of enabling: ticking the box
     // after moving the source tree is then also what repairs the link, rather than
     // leaving a login that quietly starts nothing.
-    std::filesystem::path target = own_executable();
+    const std::filesystem::path shell = own_executable();
+
+    // Start the SUPERVISOR at login, not the shell: a panel that dies with nothing
+    // watching it is a panel you have to notice is gone and start by hand.
+    std::filesystem::path target = shell;
+    std::filesystem::path link   = stable_executable_path();
+    if (const auto supervisor = supervisor_beside(shell); !supervisor.empty()) {
+        target = supervisor;
+        link   = link.parent_path() / "auspex-session";
+    }
+
     if (enabled) {
-        if (const auto stable = install_stable_executable(stable_executable_path(),
-                                                          target);
-            !stable.empty()) {
+        if (const auto stable = install_stable_executable(link, target); !stable.empty()) {
             target = stable;
         }
     }

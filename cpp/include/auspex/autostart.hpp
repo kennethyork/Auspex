@@ -48,8 +48,22 @@ std::filesystem::path stable_executable_path();
 std::filesystem::path install_stable_executable(
     const std::filesystem::path& link, const std::filesystem::path& target);
 
+// auspex-session next to `shell`, or empty when it was not built.
+//
+// The supervisor is what should actually be started at login: if the panel dies,
+// something has to bring it back, and nothing else will. It is looked for beside
+// the shell rather than in PATH so a build directory supervises its own shell
+// rather than whichever one happens to be installed.
+std::filesystem::path supervisor_beside(const std::filesystem::path& shell);
+
 // The desktop entry text that would launch `executable`.
-std::string autostart_entry(const std::filesystem::path& executable);
+//
+// `supervise` adds the flag that tells auspex-session to start the shell and
+// NOTHING else -- no window manager, no compositor, no wallpaper. Those belong to
+// the case where Auspex owns the session, and starting a second window manager
+// inside somebody else's is actively destructive.
+std::string autostart_entry(const std::filesystem::path& executable,
+                            bool supervise = false);
 
 // Whether Auspex is set to start at login.
 //

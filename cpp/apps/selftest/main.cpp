@@ -901,6 +901,31 @@ void test_autostart() {
         check(auspex::install_stable_executable(link, {}).empty(),
               "no target installs nothing");
 
+        // The supervisor is what should start at login. Found beside the shell so a
+        // build directory supervises its own shell rather than an installed one.
+        {
+            const fs::path build = root / "build";
+            check(auspex::supervisor_beside(build / "auspex-shell").empty(),
+                  "no supervisor beside the shell is not an error");
+
+            { std::ofstream out(build / "auspex-session"); out << "#!/bin/sh\n"; }
+            check_eq(auspex::supervisor_beside(build / "auspex-shell"),
+                     build / "auspex-session", "and it is found when it is there");
+            check(auspex::supervisor_beside({}).empty(), "nothing beside nothing");
+
+            // The flag matters: without it auspex-session starts a window manager,
+            // and a second window manager inside somebody else's session is
+            // destructive rather than merely wrong.
+            const std::string supervised =
+                auspex::autostart_entry(build / "auspex-session", /*supervise=*/true);
+            check(supervised.find("auspex-session --supervise") != std::string::npos,
+                  "a supervisor entry passes --supervise");
+
+            const std::string plain = auspex::autostart_entry(build / "auspex-shell");
+            check(plain.find("--supervise") == std::string::npos,
+                  "and a plain shell entry does not");
+        }
+
         check(!auspex::stable_executable_path().empty(),
               "there is always a stable path to aim at");
         check_eq(auspex::stable_executable_path().filename(),

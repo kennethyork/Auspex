@@ -63,6 +63,7 @@ WorkspaceSwitcher::WorkspaceSwitcher(int workspace_count)
 
     for (int index = 0; index < workspace_count; ++index) {
         auto button = std::make_unique<Gtk::Button>(std::to_string(index + 1));
+        button->set_tooltip_text("Switch to workspace " + std::to_string(index + 1));
         button->signal_clicked().connect([index] { switch_workspace(index); });
         append(*button);
         buttons_.push_back(std::move(button));
@@ -204,6 +205,9 @@ void WindowList::poll() {
             entry.minimized = minimized;
             entry.active    = active;
             entry.button = std::make_unique<Gtk::Button>(label_for(window.title, minimized));
+            // The full title. The button shows at most thirty characters, so for
+            // anything longer the hover text is the only place it exists.
+            entry.button->set_tooltip_text(window.title);
             const std::string id = window.id;
             entry.button->signal_clicked().connect([this, id] { toggle(id); });
 
@@ -225,6 +229,9 @@ void WindowList::poll() {
         if (entry.title != window.title || entry.minimized != minimized) {
             entry.title     = window.title;
             entry.minimized = minimized;
+            // Kept in step with the label, or the hover text goes on describing the
+            // page a browser tab used to be on.
+            entry.button->set_tooltip_text(window.title);
             // Minimised windows are shown in brackets, as xfce4-panel does. Without
             // some mark, a minimised window and an open one look identical and the
             // task list stops telling you anything.
@@ -250,8 +257,12 @@ void WindowList::poll() {
 // ---------------------------------------------------------------------------
 // SystemMonitorWidget
 // ---------------------------------------------------------------------------
+// The readout is four numbers with no units and no explanation of what they are
+// measured against, which is fine once you know and opaque until then.
 SystemMonitorWidget::SystemMonitorWidget() : Gtk::Box(Gtk::Orientation::HORIZONTAL, 4) {
     label_.add_css_class("monitor-label");
+    // Four numbers with no units. Obvious once you know, opaque until then.
+    set_tooltip_text("Processor, memory, graphics and video memory in use");
     append(label_);
 
     label_.set_text(monitor_.format_label());
@@ -281,6 +292,8 @@ Clock::Clock(const Config& config)
     note_scroller_.set_max_content_height(160);
     note_scroller_.set_propagate_natural_height(true);
 
+    today_.set_tooltip_text("Jump back to today");
+    open_calendar_.set_tooltip_text("Open the full calendar");
     open_calendar_.signal_clicked().connect([this] {
         popover_.popdown();
         if (on_open_) on_open_();
@@ -414,6 +427,13 @@ void Clock::tick() {
     char buffer[64];
     if (std::strftime(buffer, sizeof(buffer), format, &local) > 0) {
         label_.set_text(buffer);
+    }
+
+    // The long form, which is the thing the short form on the panel leaves out --
+    // the day of the week is what people are usually squinting at a date for.
+    char full[128];
+    if (std::strftime(full, sizeof(full), "%A %e %B %Y", &local) > 0) {
+        set_tooltip_text(std::string(full) + "\nClick for the calendar");
     }
 }
 
@@ -1076,6 +1096,7 @@ void Panel::build_top() {
     launcher_.add_css_class("launcher-button");
     // Our own launcher window now, so the shell no longer needs xfce4-appfinder or
     // rofi to be installed.
+    launcher_.set_tooltip_text("Find and start an application");
     launcher_.signal_clicked().connect([this] { show_launcher(); });
     box_.append(launcher_);
 
@@ -1169,6 +1190,7 @@ void Panel::build_bottom() {
     // manager is no longer used as a stand-in.
     settings_icon_.set_from_icon_name("preferences-system-symbolic");
     settings_.set_child(settings_icon_);
+    settings_.set_tooltip_text("Auspex settings");
     settings_.signal_clicked().connect([this] { show_settings(); });
     button_box_.append(settings_);
 
@@ -1186,7 +1208,11 @@ void Panel::build_bottom() {
     button_box_.append(*llm_);
 
     speak_icon_.set_from_icon_name("audio-speakers-symbolic");
-    speak_.set_child(speak_icon_);
+    speak_label_.set_text("Speak");
+    speak_box_.append(speak_icon_);
+    speak_box_.append(speak_label_);
+    speak_.set_child(speak_box_);
+    speak_.set_tooltip_text("Read the highlighted text aloud");
     speak_.signal_clicked().connect(
         [this] { voice_.submit(VoiceController::Action::SpeakSelection); });
     button_box_.append(speak_);
@@ -1220,7 +1246,10 @@ void Panel::build_bottom() {
     // because they want opposite things from the same sentence -- one is trying to
     // find a verb in it, this one is not trying to interpret it at all.
     ask_icon_.set_from_icon_name("dialog-question-symbolic");
-    ask_.set_child(ask_icon_);
+    ask_label_.set_text("Ask");
+    ask_box_.append(ask_icon_);
+    ask_box_.append(ask_label_);
+    ask_.set_child(ask_box_);
     ask_.set_tooltip_text("Ask a question aloud and hear the answer");
     ask_.signal_clicked().connect(
         [this] { voice_.submit(VoiceController::Action::AskAloud); });
@@ -1230,7 +1259,10 @@ void Panel::build_bottom() {
     // down, restoring the gesture behaviour of widgets/voice.py. A GestureClick is
     // used rather than signal_clicked because we need press and release separately.
     dictate_icon_.set_from_icon_name("audio-input-microphone-symbolic");
-    dictate_.set_child(dictate_icon_);
+    dictate_label_.set_text("Hold");
+    dictate_box_.append(dictate_icon_);
+    dictate_box_.append(dictate_label_);
+    dictate_.set_child(dictate_box_);
     dictate_gesture_ = Gtk::GestureClick::create();
     dictate_gesture_->signal_pressed().connect([this](int, double, double) {
         voice_.press_hold(VoiceController::Action::Dictate);
@@ -1244,6 +1276,7 @@ void Panel::build_bottom() {
 
     if (!config_.terminal.empty()) {
         terminal_icon_.set_from_icon_name("utilities-terminal-symbolic");
+    terminal_.set_tooltip_text("Open a terminal");
         terminal_.set_child(terminal_icon_);
         terminal_.signal_clicked().connect([this] { launch(config_.terminal); });
         button_box_.append(terminal_);
