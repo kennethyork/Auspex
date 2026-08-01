@@ -1,6 +1,9 @@
 #include "auspex/crew.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 
 #include <nlohmann/json.hpp>
 
@@ -102,6 +105,121 @@ std::vector<std::string> crew_steer_command(int n, const std::string& instructio
 
 std::vector<std::string> crew_resume_command() {
     return {"ollamadev", "crew", "resume"};
+}
+
+
+// ---------------------------------------------------------------------------
+// Run state
+// ---------------------------------------------------------------------------
+std::filesystem::path crew_state_path() {
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        return std::filesystem::path(home) / ".ollamadev" / "crew" / "current.json";
+    }
+    return {};
+}
+
+CrewRun parse_crew_run(const std::string& json_text) {
+    CrewRun run;
+    if (json_text.empty()) return run;
+
+    const auto document = json::parse(json_text, nullptr, /*allow_exceptions=*/false);
+    if (document.is_discarded() || !document.is_object()) return run;
+
+    // A file that parses but describes no run is still an answer -- it is how the
+    // engine says the crew is idle -- so `known` is set here rather than only when
+    // there is something to show.
+    run.known = true;
+
+    if (document.contains("active") && document["active"].is_boolean()) {
+        run.active = document["active"].get<bool>();
+    }
+    if (document.contains("runId") && document["runId"].is_string()) {
+        run.run_id = document["runId"].get<std::string>();
+    }
+    if (document.contains("task") && document["task"].is_string()) {
+        run.task = trim(document["task"].get<std::string>());
+    }
+
+    if (document.contains("subtasks") && document["subtasks"].is_array()) {
+        for (const auto& entry : document["subtasks"]) {
+            if (!entry.is_object()) continue;
+            CrewSubtask subtask;
+            if (entry.contains("n") && entry["n"].is_number_integer()) {
+                subtask.n = entry["n"].get<int>();
+            }
+            if (entry.contains("role") && entry["role"].is_string()) {
+                subtask.role = entry["role"].get<std::string>();
+            }
+            if (entry.contains("title") && entry["title"].is_string()) {
+                subtask.title = trim(entry["title"].get<std::string>());
+            }
+            if (entry.contains("state") && entry["state"].is_string()) {
+                subtask.state = entry["state"].get<std::string>();
+            }
+            run.subtasks.push_back(std::move(subtask));
+        }
+    }
+
+    return run;
+}
+
+CrewRun current_crew_run(const std::filesystem::path& path) {
+    if (path.empty()) return {};
+
+    std::ifstream in(path);
+    if (!in) return {};   // no crew has ever run here
+
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    return parse_crew_run(contents.str());
+}
+
+CrewProgress crew_progress(const CrewRun& run) {
+    CrewProgress progress;
+    progress.total = static_cast<int>(run.subtasks.size());
+    for (const auto& subtask : run.subtasks) {
+        if (subtask.state == "done") ++progress.done;
+    }
+    return progress;
+}
+
+std::optional<CrewSubtask> crew_current_subtask(const CrewRun& run) {
+    // The first that is not done. The engine runs coders in parallel, so this is
+    // "the earliest thing still outstanding" rather than literally the only one
+    // being worked on -- which is the right thing to name in one line of panel.
+    for (const auto& subtask : run.subtasks) {
+        if (subtask.state != "done") return subtask;
+    }
+    return std::nullopt;
+}
+
+std::string crew_status_label(const CrewRun& run) {
+    if (!run.known || !run.active) return {};
+
+    const CrewProgress progress = crew_progress(run);
+    // No plan yet means the Director is still deciding what the pieces are. Saying
+    // "0/0" would look like a stalled run rather than the first stage of a live one.
+    if (progress.total == 0) return "Crew planning";
+
+    return "Crew " + std::to_string(progress.done) + "/" +
+           std::to_string(progress.total);
+}
+
+std::string crew_status_detail(const CrewRun& run) {
+    if (!run.known) return {};
+
+    if (!run.active) {
+        return run.task.empty() ? "The crew is idle"
+                                : "The crew is idle. Last task: " + run.task;
+    }
+
+    std::string detail = run.task.empty() ? "The crew is working" : run.task;
+    if (const auto subtask = crew_current_subtask(run); subtask && !subtask->title.empty()) {
+        detail += "\n";
+        if (!subtask->role.empty()) detail += subtask->role + ": ";
+        detail += subtask->title;
+    }
+    return detail;
 }
 
 }  // namespace auspex

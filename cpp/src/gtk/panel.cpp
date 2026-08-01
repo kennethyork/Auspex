@@ -715,6 +715,76 @@ void NotificationButton::rebuild() {
 }
 
 // ---------------------------------------------------------------------------
+// CrewButton
+// ---------------------------------------------------------------------------
+CrewButton::CrewButton() {
+    add_css_class("flat");
+    set_has_frame(false);
+
+    icon_.set_from_icon_name("system-run-symbolic");
+    box_.append(icon_);
+    box_.append(label_);
+    set_child(box_);
+
+    // Straight to the board. While a run is live the board is where its results
+    // will land, and after it finishes the board is the only reason to care that it
+    // ran at all.
+    signal_clicked().connect([this] { if (on_board_) on_board_(); });
+
+    // Hidden until there is something to say. A control that is permanently
+    // present and permanently blank is worse than no control.
+    set_visible(false);
+
+    poll();
+    // Two seconds. A crew subtask takes tens of seconds at best, so this is already
+    // far finer than the thing it is watching, and it costs one stat when nothing
+    // has changed.
+    Glib::signal_timeout().connect(
+        [this] {
+            poll();
+            return true;
+        },
+        2000);
+}
+
+void CrewButton::poll() {
+    const auto path = crew_state_path();
+    if (path.empty()) {
+        set_visible(false);
+        return;
+    }
+
+    // The modification time first: a run that has not changed costs a stat rather
+    // than opening and parsing the file every two seconds for the whole session.
+    std::error_code ec;
+    const auto stamp = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        // No file at all means no crew has ever run here, which is not a state
+        // worth showing anything for.
+        set_visible(false);
+        return;
+    }
+    if (have_mtime_ && stamp == mtime_) return;
+    mtime_      = stamp;
+    have_mtime_ = true;
+
+    const CrewRun run = current_crew_run(path);
+    if (run == last_) return;
+    last_ = run;
+
+    const std::string label = crew_status_label(run);
+    set_visible(!label.empty());
+    if (label.empty()) return;
+
+    label_.set_text(label);
+    set_tooltip_text(crew_status_detail(run));
+
+    // The same class the recording controls use, so "something of mine is running"
+    // looks the same wherever it appears on the panel.
+    add_css_class("recording");
+}
+
+// ---------------------------------------------------------------------------
 // VolumeButton
 // ---------------------------------------------------------------------------
 VolumeButton::VolumeButton()
@@ -1104,6 +1174,14 @@ void Panel::build_top() {
     // and therefore where the hand already goes.
     pinned_ = std::make_unique<PinnedLaunchers>(config_);
     box_.append(*pinned_);
+
+    // Only when there is a crew to report on. On a machine without ollamadev this
+    // is not a feature that is switched off, it is one that does not exist.
+    if (crew_available()) {
+        crew_ = std::make_unique<CrewButton>();
+        crew_->set_board_handler([this] { show_board(); });
+        box_.append(*crew_);
+    }
 
     workspaces_ = std::make_unique<WorkspaceSwitcher>(config_.workspace_count);
     box_.append(*workspaces_);

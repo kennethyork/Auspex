@@ -35,6 +35,7 @@
 #include <gtkmm/togglebutton.h>
 
 #include "auspex/calendar.hpp"
+#include "auspex/crew.hpp"
 #include "auspex/config.hpp"
 #include "auspex/desktop.hpp"
 #include "auspex/panel_dock.hpp"
@@ -153,6 +154,42 @@ private:
     // unusable for ordinary calls, so it cannot be the shared session bus every
     // other part of the shell is talking on.
     GDBusConnection* monitor_ = nullptr;
+};
+
+// What the crew is doing, while it does it.
+//
+// A crew run opens a terminal on the canvas, so its output has always been
+// watchable -- but only if you happen to be looking at that terminal. This is the
+// part that says something is happening when you are not: a button that appears
+// while a run is live, counts the subtasks off as they finish, and goes away again
+// when it is done.
+//
+// Read from the file ollamadev already maintains rather than by watching for a
+// process. See crew.hpp: the run is detached into a terminal, so there is no pid to
+// hold, and only the engine's own state file can say WHICH subtask is in flight.
+class CrewButton : public Gtk::Button {
+public:
+    CrewButton();
+
+    // Wired by the Panel, which owns the board window.
+    void set_board_handler(sigc::slot<void()> handler) {
+        on_board_ = std::move(handler);
+    }
+
+private:
+    void poll();
+
+    Gtk::Box   box_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Image icon_;
+    Gtk::Label label_;
+
+    CrewRun    last_;
+    // The modification time of the state file, so a run that has not changed costs
+    // one stat rather than a parse. This polls for the life of the session.
+    std::filesystem::file_time_type mtime_{};
+    bool       have_mtime_ = false;
+
+    sigc::slot<void()> on_board_;
 };
 
 // Volume, as a panel control rather than a tray icon.
@@ -385,6 +422,7 @@ private:
     std::unique_ptr<WorkspaceSwitcher>   workspaces_;
     std::unique_ptr<WindowList>          windows_;
     std::unique_ptr<PinnedLaunchers>     pinned_;
+    std::unique_ptr<CrewButton>          crew_;
     std::unique_ptr<NotificationButton>  notifications_;
     std::unique_ptr<SystemTray>          tray_;
     std::unique_ptr<VolumeButton>        volume_;

@@ -20,6 +20,7 @@
 // #1 and #2 are pending is refused rather than doing something arbitrary.
 #pragma once
 
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -66,6 +67,72 @@ std::vector<BoardItem> board_items();
 // on the board, which is the check that keeps a hallucinated index from applying
 // somebody else's changeset.
 std::optional<BoardItem> board_item(const std::vector<BoardItem>& items, int n);
+
+// --- run state ---------------------------------------------------------------
+//
+// ollamadev writes what the crew is doing to ~/.ollamadev/crew/current.json while
+// it runs. Auspex reads that file rather than watching for a process, because a
+// crew is started in a terminal on the canvas and detached -- there is no pid to
+// hold on to, and pgrep for a command line is guesswork that breaks the moment
+// somebody runs two.
+//
+// A file the engine already maintains is also the only source that can say WHICH
+// subtask is being worked on. That is the difference between a panel that says
+// something is happening and one that says what.
+
+struct CrewSubtask {
+    int         n = 0;
+    std::string role;    // "coder", "researcher", ...
+    std::string title;
+    std::string state;   // "done" and whatever else the engine uses
+
+    bool operator==(const CrewSubtask&) const = default;
+};
+
+struct CrewRun {
+    bool                     active = false;
+    std::string              run_id;
+    std::string              task;
+    std::vector<CrewSubtask> subtasks;
+    // False when the file is missing or unreadable, which is different from a run
+    // that has finished: one means "no crew has ever run here", the other means
+    // "the crew is idle". A panel should show nothing for the first.
+    bool                     known = false;
+
+    bool operator==(const CrewRun&) const = default;
+};
+
+// $HOME/.ollamadev/crew/current.json.
+std::filesystem::path crew_state_path();
+
+// Parses that file. Anything malformed yields a run that is not `known`, rather
+// than a half-populated one that would report a wrong count.
+CrewRun parse_crew_run(const std::string& json_text);
+
+CrewRun current_crew_run(const std::filesystem::path& path = crew_state_path());
+
+// How far along. `total` is the number of subtasks the Director planned; `done` is
+// how many have finished. Both zero when nothing is planned yet, which is a real
+// state -- the Director runs before there are any subtasks to count.
+struct CrewProgress {
+    int done  = 0;
+    int total = 0;
+
+    bool operator==(const CrewProgress&) const = default;
+};
+
+CrewProgress crew_progress(const CrewRun& run);
+
+// The subtask being worked on: the first that is not done. nullopt when the plan
+// is empty or everything has finished.
+std::optional<CrewSubtask> crew_current_subtask(const CrewRun& run);
+
+// A short line for a panel button: "Crew 1/3" while running, empty when idle.
+std::string crew_status_label(const CrewRun& run);
+
+// The longer form for a tooltip: what the crew was asked to do, and what it is
+// doing about it right now.
+std::string crew_status_detail(const CrewRun& run);
 
 // The argv for each decision. Returned rather than run so the command can be
 // asserted in a test without a crew, and so the caller decides whether it runs on

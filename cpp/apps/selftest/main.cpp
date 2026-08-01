@@ -1870,6 +1870,137 @@ void test_minimize() {
     }
 }
 
+void test_crew_run_state() {
+    std::cout << "crew run state\n";
+
+    using namespace auspex;
+    namespace fs = std::filesystem;
+
+    // The shape ollamadev actually writes, taken from a real run on this machine.
+    {
+        const std::string text =
+            R"({"active":false,"runId":"crew_1785471220","subtasks":[)"
+            R"({"backend":"ollama","model":"gpt-oss:20b-cloud","n":1,"role":"coder",)"
+            R"("route":"","state":"done","title":"Add comment to crew_available function"}],)"
+            R"("task":"add a one-line comment above the crew_available function",)"
+            R"("ts":1785471249327})";
+
+        const auto run = parse_crew_run(text);
+        check(run.known, "a real state file is understood");
+        check(!run.active, "and this one had finished");
+        check_eq(run.run_id, std::string("crew_1785471220"), "the run id is read");
+        check_eq(run.task,
+                 std::string("add a one-line comment above the crew_available function"),
+                 "and the task");
+        check_eq(run.subtasks.size(), std::size_t{1}, "with its one subtask");
+        if (!run.subtasks.empty()) {
+            check_eq(run.subtasks[0].n, 1, "numbered");
+            check_eq(run.subtasks[0].role, std::string("coder"), "with a role");
+            check_eq(run.subtasks[0].state, std::string("done"), "and a state");
+        }
+
+        // Idle is a different answer from unknown: one means the crew has finished,
+        // the other that no crew has ever run here. A panel shows nothing for the
+        // second and a finished run for the first.
+        check_eq(crew_status_label(run), std::string(""),
+                 "a finished run puts nothing on the panel");
+        check(crew_status_detail(run).find("idle") != std::string::npos,
+              "but can still say it is idle");
+    }
+
+    // A live run, part way through.
+    {
+        const std::string text =
+            R"({"active":true,"runId":"crew_1","task":"add rate limiting","subtasks":[)"
+            R"({"n":1,"role":"researcher","state":"done","title":"Read the API layer"},)"
+            R"({"n":2,"role":"coder","state":"running","title":"Add the limiter"},)"
+            R"({"n":3,"role":"coder","state":"pending","title":"Add tests"}]})";
+
+        const auto run = parse_crew_run(text);
+        check(run.active, "a live run says so");
+
+        const auto progress = crew_progress(run);
+        check_eq(progress.done, 1, "one subtask finished");
+        check_eq(progress.total, 3, "of three planned");
+
+        check_eq(crew_status_label(run), std::string("Crew 1/3"),
+                 "which is what the panel shows");
+
+        // The earliest outstanding subtask. Coders run in parallel, so this is the
+        // right thing to NAME in one line rather than a claim about the only one
+        // being worked on.
+        const auto current = crew_current_subtask(run);
+        check(current.has_value(), "there is something outstanding");
+        if (current) {
+            check_eq(current->title, std::string("Add the limiter"),
+                     "the earliest one that is not done");
+        }
+
+        const std::string detail = crew_status_detail(run);
+        check(detail.find("add rate limiting") != std::string::npos,
+              "the tooltip says what was asked for");
+        check(detail.find("Add the limiter") != std::string::npos,
+              "and what is being done about it");
+    }
+
+    // The Director runs before there are any subtasks to count. "0/0" would read as
+    // a stalled run rather than the first stage of a live one.
+    {
+        const auto run = parse_crew_run(R"({"active":true,"runId":"x","subtasks":[]})");
+        check_eq(crew_progress(run).total, 0, "no plan yet");
+        check_eq(crew_status_label(run), std::string("Crew planning"),
+                 "and the panel says planning rather than 0 of 0");
+        check(!crew_current_subtask(run).has_value(), "with nothing outstanding to name");
+    }
+
+    // Everything finished but the file not yet cleared.
+    {
+        const auto run = parse_crew_run(
+            R"({"active":true,"subtasks":[{"n":1,"state":"done","title":"a"}]})");
+        check(crew_progress(run).done == 1 && crew_progress(run).total == 1,
+              "all done");
+        check(!crew_current_subtask(run).has_value(),
+              "nothing outstanding once everything is done");
+    }
+
+    // Malformed input must not produce a half-populated run that reports a wrong
+    // count -- the count is the whole of what the panel shows.
+    {
+        check(!parse_crew_run("").known, "empty is not a run");
+        check(!parse_crew_run("not json").known, "nonsense is not a run");
+        check(!parse_crew_run("[1,2,3]").known, "a list is not a run");
+
+        // Present but wrongly typed fields are skipped rather than trusted.
+        const auto odd = parse_crew_run(
+            R"({"active":"yes","runId":42,"subtasks":"none"})");
+        check(odd.known, "an object is still a run");
+        check(!odd.active, "a non-boolean active is not true");
+        check(odd.run_id.empty(), "a non-string id is dropped");
+        check(odd.subtasks.empty(), "a non-array subtask list is dropped");
+    }
+
+    // Reading it off disk, including the case that matters most: no file at all.
+    {
+        const fs::path path = fs::temp_directory_path() / "auspex-selftest-crew.json";
+        std::error_code ec;
+        fs::remove(path, ec);
+
+        check(!current_crew_run(path).known,
+              "no state file means no crew has ever run here");
+
+        {
+            std::ofstream out(path);
+            out << R"({"active":true,"task":"t","subtasks":[{"n":1,"state":"running","title":"x"}]})";
+        }
+        const auto run = current_crew_run(path);
+        check(run.known && run.active, "a file on disk is read");
+        check_eq(crew_status_label(run), std::string("Crew 0/1"), "and counted");
+
+        fs::remove(path, ec);
+        check(!crew_state_path().empty(), "there is always a path to look at");
+    }
+}
+
 void test_crew() {
     std::cout << "crew\n";
     using auspex::crew_task_from_utterance;
@@ -3537,6 +3668,7 @@ int main(int argc, char** argv) {
     test_fit_and_geometry();
     test_monitors_current();
     test_minimize();
+    test_crew_run_state();
     test_crew();
     test_notifications_and_pins();
     test_calendar_notes();
