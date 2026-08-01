@@ -2194,6 +2194,76 @@ void test_crew_run_state() {
         check(!is_known_pack("bugfix", {}), "with no list, nothing is known");
     }
 
+        
+    // Reading a patch. The board carries the whole diff in its "detail" field --
+    // there is nothing to fetch it with, because `crew diff` is not a verb and
+    // asking for one starts a run with "diff" as the prompt.
+    {
+        const std::string patch =
+            "diff --git a/wc.py b/wc.py\n"
+            "index 83db48f..bf269f4 100644\n"
+            "--- a/wc.py\n"
+            "+++ b/wc.py\n"
+            "@@ -1,4 +1,6 @@\n"
+            " def count_words(text):\n"
+            "-    return len(text.split())\n"
+            "+    if not text:\n"
+            "+        return 0\n"
+            "+    return len(text.split())\n";
+
+        // The ordering of these checks is the whole of the classifier: "+++ b/wc.py"
+        // starts with '+' and is a HEADER, not an added line. Colouring it as an
+        // addition puts two bright lines at the top of every file in the patch.
+        check(classify_diff_line("+++ b/wc.py") == DiffLine::FileHeader,
+              "+++ is a file header, not an addition");
+        check(classify_diff_line("--- a/wc.py") == DiffLine::FileHeader,
+              "and --- is not a removal");
+        check(classify_diff_line("diff --git a/x b/x") == DiffLine::FileHeader,
+              "so is the git header");
+        check(classify_diff_line("index 83db48f..bf269f4 100644") == DiffLine::FileHeader,
+              "and the index line");
+        check(classify_diff_line("new file mode 100644") == DiffLine::FileHeader,
+              "and a new file line");
+        check(classify_diff_line("@@ -1,4 +1,6 @@") == DiffLine::Hunk,
+              "a hunk header is its own thing");
+        check(classify_diff_line("+    return 0") == DiffLine::Added, "an addition");
+        check(classify_diff_line("-    old line") == DiffLine::Removed, "a removal");
+        check(classify_diff_line(" unchanged") == DiffLine::Context, "context");
+        check(classify_diff_line("") == DiffLine::Context, "an empty line is context");
+
+        const DiffStat stat = diff_stat(patch);
+        check_eq(stat.added, 3, "three lines added");
+        check_eq(stat.removed, 1, "one removed");
+        // The headers must not be counted, or every file in a patch adds two to the
+        // total and the summary is quietly wrong on every multi-file changeset.
+        check(stat.added + stat.removed == 4,
+              "and the four header lines are not counted as changes");
+
+        check_eq(diff_stat("").added, 0, "an empty diff changes nothing");
+    }
+
+    // The board carries the diff and the file names through to the window.
+    {
+        const std::string json = R"([{"id":"crew_1","kind":"crew_branch",)"
+            R"("summary":"coder #2 - unit tests","detail":"@@ -1 +1,2 @@\n+added\n",)"
+            R"("data":{"n":2,"reason":"audit flagged: imports","files":["wc.py","test_wc.py"]}}])";
+
+        const auto items = parse_board(json);
+        check_eq(items.size(), std::size_t{1}, "one held changeset");
+        if (!items.empty()) {
+            check_eq(items[0].n, 2, "numbered as the user would say it");
+            check_eq(items[0].files, 2, "two files");
+            check_eq(items[0].file_names.size(), std::size_t{2}, "named, not just counted");
+            if (items[0].file_names.size() == 2) {
+                check_eq(items[0].file_names[0], std::string("wc.py"), "in order");
+            }
+            check(items[0].diff.find("+added") != std::string::npos,
+                  "and the patch itself comes through");
+            check_eq(diff_stat(items[0].diff).added, 1, "and can be counted");
+        }
+    }
+
+
                 check(!board_state_path().empty(), "the board has a file to watch");
         check(board_state_path() != crew_state_path(),
               "and it is not the same file as the run state");

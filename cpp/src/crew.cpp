@@ -47,6 +47,7 @@ std::vector<BoardItem> parse_board(const std::string& output) {
         item.id      = string_field(entry, "id");
         item.kind    = string_field(entry, "kind");
         item.summary = string_field(entry, "summary");
+        item.diff    = string_field(entry, "detail");
 
         if (entry.contains("data") && entry["data"].is_object()) {
             const auto& data = entry["data"];
@@ -54,6 +55,9 @@ std::vector<BoardItem> parse_board(const std::string& output) {
             item.reason = string_field(data, "reason");
             if (data.contains("files") && data["files"].is_array()) {
                 item.files = static_cast<int>(data["files"].size());
+                for (const auto& name : data["files"]) {
+                    if (name.is_string()) item.file_names.push_back(name.get<std::string>());
+                }
             }
         }
 
@@ -175,6 +179,34 @@ std::vector<std::string> crew_steer_command(int n, const std::string& instructio
     // contain anything; as an argument it is data, and there is no shell to make it
     // otherwise.
     return {"ollamadev", "crew", "steer", std::to_string(n), instruction};
+}
+
+DiffLine classify_diff_line(std::string_view line) {
+    // Order matters. "+++ b/file" starts with '+' and is a header, not an added
+    // line -- colouring it green would put two bright lines at the top of every
+    // file in the patch.
+    if (line.rfind("+++", 0) == 0 || line.rfind("---", 0) == 0 ||
+        line.rfind("diff --git", 0) == 0 || line.rfind("index ", 0) == 0 ||
+        line.rfind("new file", 0) == 0 || line.rfind("deleted file", 0) == 0 ||
+        line.rfind("similarity index", 0) == 0 || line.rfind("rename ", 0) == 0) {
+        return DiffLine::FileHeader;
+    }
+    if (line.rfind("@@", 0) == 0) return DiffLine::Hunk;
+    if (!line.empty() && line[0] == '+') return DiffLine::Added;
+    if (!line.empty() && line[0] == '-') return DiffLine::Removed;
+    return DiffLine::Context;
+}
+
+DiffStat diff_stat(const std::string& diff) {
+    DiffStat stat;
+    for (const auto& line : split_lines(diff)) {
+        switch (classify_diff_line(line)) {
+            case DiffLine::Added:   ++stat.added;   break;
+            case DiffLine::Removed: ++stat.removed; break;
+            default: break;
+        }
+    }
+    return stat;
 }
 
 std::vector<std::string> crew_resume_command() {

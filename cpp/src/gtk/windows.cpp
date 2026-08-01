@@ -750,10 +750,61 @@ CrewWindow::CrewWindow() {
     // ---- what it is doing ----
     run_heading_.set_xalign(0.0f);
     run_heading_.add_css_class("subtitle");
-    run_scroller_.set_child(run_box_);
-    run_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
-    run_scroller_.set_max_content_height(200);
-    run_scroller_.set_propagate_natural_height(true);
+
+    {
+        const auto build_lane = [](Lane& lane, const char* title) {
+            lane.title.set_text(title);
+            lane.title.set_xalign(0.0f);
+            lane.title.add_css_class("subtitle");
+            lane.scroller.set_child(lane.body);
+            lane.scroller.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+            lane.scroller.set_min_content_height(90);
+            lane.scroller.set_max_content_height(180);
+            lane.scroller.set_propagate_natural_height(true);
+            lane.column.append(lane.title);
+            lane.column.append(lane.scroller);
+            lane.column.set_hexpand(true);
+        };
+        build_lane(todo_,  "To do");
+        build_lane(doing_, "Doing");
+        build_lane(done_,  "Done");
+
+        lanes_.append(todo_.column);
+        lanes_.append(doing_.column);
+        lanes_.append(done_.column);
+    }
+
+    // Steering a coder while it works. The instruction is your words, sent as one
+    // argument -- the model never composes what goes to a running coder.
+    steer_.set_placeholder_text("Tell a running coder something\u2026");
+    steer_.set_hexpand(true);
+    steer_.signal_activate().connect([this] { steer_send_.activate(); });
+    steer_send_.signal_clicked().connect([this] {
+        const std::string text = std::string(steer_.get_text());
+        if (text.empty()) {
+            status_.set_text("Say what to tell the coder first");
+            return;
+        }
+
+        // The subtask being worked on. Steering is aimed at a coder, and picking
+        // the earliest outstanding one is the only choice the state file supports.
+        const CrewRun run = current_crew_run();
+        const auto target = crew_current_subtask(run);
+        if (!target) {
+            status_.set_text("\u26a0 nothing is running to steer");
+            return;
+        }
+
+        const auto argv = crew_steer_command(target->n, text);
+        if (argv.empty() || !spawn_detached(argv)) {
+            status_.set_text("\u26a0 could not reach the crew");
+            return;
+        }
+        status_.set_text("\u2713 steered coder " + std::to_string(target->n));
+        steer_.set_text("");
+    });
+    steer_row_.append(steer_);
+    steer_row_.append(steer_send_);
 
     // ---- what it is holding ----
     board_heading_.set_xalign(0.0f);
@@ -773,7 +824,8 @@ CrewWindow::CrewWindow() {
     root_.append(second_row_);
     root_.append(start_row_);
     root_.append(run_heading_);
-    root_.append(run_scroller_);
+    root_.append(lanes_);
+    root_.append(steer_row_);
     root_.append(board_heading_);
     root_.append(board_scroller_);
     root_.append(status_);
@@ -833,14 +885,17 @@ void CrewWindow::refresh_run() {
     const auto stamp = std::filesystem::last_write_time(path, ec);
     if (ec) {
         run_heading_.set_text("No crew has run here yet.");
-        run_scroller_.set_visible(false);
+        lanes_.set_visible(false);
+        steer_row_.set_visible(false);
         return;
     }
     if (have_run_mtime_ && stamp == run_mtime_) return;
     run_mtime_      = stamp;
     have_run_mtime_ = true;
 
-    while (Gtk::Widget* child = run_box_.get_first_child()) run_box_.remove(*child);
+    for (Lane* lane : {&todo_, &doing_, &done_}) {
+        while (Gtk::Widget* child = lane->body.get_first_child()) lane->body.remove(*child);
+    }
     run_rows_.clear();
 
     const CrewRun run = current_crew_run(path);
@@ -849,37 +904,58 @@ void CrewWindow::refresh_run() {
     run_heading_.set_text(label.empty()
                               ? (run.task.empty() ? "The crew is idle."
                                                   : "Idle. Last task: " + run.task)
-                              : label + " — " + run.task);
-    run_scroller_.set_visible(!run.subtasks.empty());
+                              : label + " \u2014 " + run.task);
+    lanes_.set_visible(!run.subtasks.empty());
+    // Only offered while something is actually running. A steer box on an idle
+    // crew is a control that can only report that there is nothing to steer.
+    steer_row_.set_visible(run.active);
+
+    int counts[3] = {0, 0, 0};
 
     for (const auto& subtask : run.subtasks) {
-        auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
+        // Three lanes from whatever words the engine uses. "done" is the only state
+        // named with certainty, and anything actively in flight reads as doing;
+        // everything else has not started. An unrecognised state lands in To do,
+        // which is the reading that overstates least.
+        Lane* lane  = &todo_;
+        int   which = 0;
+        if (subtask.state == "done") {
+            lane = &done_;
+            which = 2;
+        } else if (subtask.state == "running" || subtask.state == "doing" ||
+                   subtask.state == "active" || subtask.state == "working") {
+            lane = &doing_;
+            which = 1;
+        }
+        ++counts[which];
 
-        // The state in words rather than a colour alone: "done" and "running" are
-        // the two things being looked for, and a dot cannot be read at a glance
-        // without a legend.
-        auto* state = Gtk::make_managed<Gtk::Label>(
-            subtask.state.empty() ? "?" : subtask.state);
-        state->set_xalign(0.0f);
-        state->set_size_request(80, -1);
-        state->add_css_class(subtask.state == "done" ? "subtitle" : "recording");
+        auto card = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 2);
+        card->add_css_class("code-block");
 
-        auto* who = Gtk::make_managed<Gtk::Label>(subtask.role);
+        auto* title = Gtk::make_managed<Gtk::Label>(subtask.title);
+        title->set_xalign(0.0f);
+        title->set_wrap(true);
+        title->set_max_width_chars(24);
+
+        auto* who = Gtk::make_managed<Gtk::Label>(
+            "#" + std::to_string(subtask.n) +
+            (subtask.role.empty() ? "" : "  " + subtask.role));
         who->set_xalign(0.0f);
-        who->set_size_request(90, -1);
         who->add_css_class("subtitle");
 
-        auto* what = Gtk::make_managed<Gtk::Label>(subtask.title);
-        what->set_xalign(0.0f);
-        what->set_hexpand(true);
-        what->set_wrap(true);
+        card->append(*who);
+        card->append(*title);
+        // The one in flight is marked, so the Doing lane still reads at a glance
+        // when it holds several.
+        if (lane == &doing_) card->add_css_class("recording");
 
-        row->append(*state);
-        row->append(*who);
-        row->append(*what);
-        run_box_.append(*row);
-        run_rows_.push_back(std::move(row));
+        lane->body.append(*card);
+        run_rows_.push_back(std::move(card));
     }
+
+    todo_.title.set_text("To do (" + std::to_string(counts[0]) + ")");
+    doing_.title.set_text("Doing (" + std::to_string(counts[1]) + ")");
+    done_.title.set_text("Done (" + std::to_string(counts[2]) + ")");
 }
 
 void CrewWindow::refresh_board() {
@@ -925,19 +1001,122 @@ void CrewWindow::refresh_board() {
         reason->set_xalign(0.0f);
         reason->set_wrap(true);
 
-        auto* files = Gtk::make_managed<Gtk::Label>(
-            std::to_string(item.files) + (item.files == 1 ? " file" : " files"));
+        // The files by name, and what the patch does to them. A count alone does
+        // not tell you whether this touches one test or the whole module.
+        const DiffStat stat = diff_stat(item.diff);
+        std::string subtitle = std::to_string(item.files) +
+                               (item.files == 1 ? " file" : " files");
+        if (stat.added || stat.removed) {
+            subtitle += "   +" + std::to_string(stat.added) +
+                        " \u2212" + std::to_string(stat.removed);
+        }
+        if (!item.file_names.empty()) {
+            subtitle += "   ";
+            for (std::size_t i = 0; i < item.file_names.size() && i < 3; ++i) {
+                if (i) subtitle += ", ";
+                subtitle += item.file_names[i];
+            }
+            if (item.file_names.size() > 3) {
+                subtitle += ", +" + std::to_string(item.file_names.size() - 3) + " more";
+            }
+        }
+
+        auto* files = Gtk::make_managed<Gtk::Label>(subtitle);
         files->set_xalign(0.0f);
+        files->set_wrap(true);
         files->add_css_class("subtitle");
 
+        const int n = item.n;
+
+        // ---- the diff, folded away ----
+        auto* diff_view = Gtk::make_managed<Gtk::TextView>();
+        diff_view->set_editable(false);
+        diff_view->set_monospace(true);
+        diff_view->set_cursor_visible(false);
+        auto* diff_scroller = Gtk::make_managed<Gtk::ScrolledWindow>();
+        diff_scroller->set_child(*diff_view);
+        // Horizontal scrolling, NOT wrapping: a wrapped diff line stops lining up
+        // with the ones above it and the patch becomes unreadable.
+        diff_scroller->set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC);
+        diff_scroller->set_min_content_height(180);
+        diff_scroller->add_css_class("code-block");
+
+        {
+            auto buffer = diff_view->get_buffer();
+            auto added   = buffer->create_tag();
+            auto removed = buffer->create_tag();
+            auto hunk    = buffer->create_tag();
+            auto header  = buffer->create_tag();
+            // The theme's own colours, so a patch reads the same as the rest of
+            // the desktop rather than in whatever green a diff tool would pick.
+            const Palette& palette = theme_by_name(Config::load().theme);
+            added->property_foreground()   = Glib::ustring(std::string(palette.link));
+            removed->property_foreground() = Glib::ustring(std::string(palette.error));
+            hunk->property_foreground()    = Glib::ustring(std::string(palette.accent));
+            header->property_foreground()  = Glib::ustring(std::string(palette.subtitle_fg));
+
+            for (const auto& line : split_lines(item.diff)) {
+                auto end = buffer->end();
+                switch (classify_diff_line(line)) {
+                    case DiffLine::Added:
+                        buffer->insert_with_tag(end, line + "\n", added); break;
+                    case DiffLine::Removed:
+                        buffer->insert_with_tag(end, line + "\n", removed); break;
+                    case DiffLine::Hunk:
+                        buffer->insert_with_tag(end, line + "\n", hunk); break;
+                    case DiffLine::FileHeader:
+                        buffer->insert_with_tag(end, line + "\n", header); break;
+                    case DiffLine::Context:
+                        buffer->insert(end, line + "\n"); break;
+                }
+            }
+        }
+
+        diff_scroller->set_visible(expanded_.count(n) != 0);
+
         auto* buttons = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
-        buttons->set_halign(Gtk::Align::END);
+        auto* toggle = Gtk::make_managed<Gtk::Button>(
+            expanded_.count(n) ? "Hide diff" : "Show diff");
+        toggle->set_sensitive(!item.diff.empty());
+        toggle->signal_clicked().connect([this, n, diff_scroller, toggle] {
+            const bool open = expanded_.count(n) != 0;
+            if (open) expanded_.erase(n); else expanded_.insert(n);
+            diff_scroller->set_visible(!open);
+            toggle->set_label(open ? "Show diff" : "Hide diff");
+        });
+
+        auto* spacer = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL);
+        spacer->set_hexpand(true);
+
         auto* accept = Gtk::make_managed<Gtk::Button>("Accept");
         accept->add_css_class("suggested-action");
         auto* discard = Gtk::make_managed<Gtk::Button>("Discard");
-        const int n = item.n;
         accept->signal_clicked().connect([this, n] { decide(n, true); });
-        discard->signal_clicked().connect([this, n] { decide(n, false); });
+
+        // Discard asks first. Accepting puts files into your folder and git can
+        // undo it; discarding deletes the changeset and nothing can.
+        const std::string summary_text = item.summary;
+        discard->signal_clicked().connect([this, n, summary_text] {
+            auto dialog = Gtk::AlertDialog::create();
+            dialog->set_message("Discard change " + std::to_string(n) + "?");
+            dialog->set_detail(summary_text +
+                               "\n\nIts changeset is deleted and cannot be recovered.");
+            dialog->set_buttons({"Cancel", "Discard"});
+            dialog->set_cancel_button(0);
+            dialog->set_default_button(0);
+            dialog->choose(*this, [this, n](const Glib::RefPtr<Gio::AsyncResult>& result) {
+                try {
+                    if (auto d = Gtk::AlertDialog::create(); d->choose_finish(result) == 1) {
+                        decide(n, false);
+                    }
+                } catch (const Glib::Error&) {
+                    // Dismissed with Escape, which is a Cancel.
+                }
+            });
+        });
+
+        buttons->append(*toggle);
+        buttons->append(*spacer);
         buttons->append(*discard);
         buttons->append(*accept);
 
@@ -945,6 +1124,7 @@ void CrewWindow::refresh_board() {
         if (!item.reason.empty()) row->append(*reason);
         row->append(*files);
         row->append(*buttons);
+        row->append(*diff_scroller);
 
         board_box_.append(*row);
         board_rows_.push_back(std::move(row));

@@ -35,6 +35,14 @@ struct BoardItem {
     std::string summary;        // what the coder says it did
     std::string reason;         // why the Auditor held it
     int         files = 0;
+    std::vector<std::string> file_names;
+
+    // The unified diff, straight from the board's "detail" field.
+    //
+    // Carried here rather than fetched on demand because there is nothing to fetch
+    // it WITH: there is no `crew diff` verb, and asking for one starts a run with
+    // "diff" as the prompt. The board already holds the whole patch.
+    std::string diff;
 
     bool operator==(const BoardItem&) const = default;
 };
@@ -207,5 +215,22 @@ std::vector<std::string> crew_steer_command(int n, const std::string& instructio
 // person means; naming a specific id is a thing to do at a terminal with the list
 // in front of you, not by voice.
 std::vector<std::string> crew_resume_command();
+
+// --- reading a diff ----------------------------------------------------------
+
+// What one line of a unified diff is, for colouring it.
+enum class DiffLine { Added, Removed, Hunk, FileHeader, Context };
+
+DiffLine classify_diff_line(std::string_view line);
+
+// How many lines were added and removed, for a one-line summary above the patch.
+struct DiffStat {
+    int added   = 0;
+    int removed = 0;
+
+    bool operator==(const DiffStat&) const = default;
+};
+
+DiffStat diff_stat(const std::string& diff);
 
 }  // namespace auspex

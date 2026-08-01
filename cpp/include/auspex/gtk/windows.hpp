@@ -8,6 +8,7 @@
 #pragma once
 
 #include <deque>
+#include <set>
 #include <memory>
 #include <string>
 #include <utility>
@@ -16,6 +17,8 @@
 #include <gtkmm/box.h>
 #include <gtkmm/button.h>
 #include <gtkmm/checkbutton.h>
+#include <gtkmm/alertdialog.h>
+#include <gtkmm/textview.h>
 #include <gtkmm/dropdown.h>
 #include <gtkmm/entry.h>
 #include <gtkmm/dropdown.h>
@@ -25,6 +28,7 @@
 #include <gtkmm/listbox.h>
 #include <gtkmm/scrolledwindow.h>
 #include <gtkmm/spinbutton.h>
+#include <gtkmm/alertdialog.h>
 #include <gtkmm/textview.h>
 #include <gtkmm/window.h>
 
@@ -216,11 +220,30 @@ private:
     Gtk::DropDown    pack_;
     std::vector<std::string> packs_;
 
-    // What it is doing.
-    Gtk::Label          run_heading_;
-    Gtk::ScrolledWindow run_scroller_;
-    Gtk::Box            run_box_{Gtk::Orientation::VERTICAL, 3};
+    // What it is doing, as lanes rather than a list.
+    //
+    // To-do / Doing / Done, which is how ollamadev-qt shows it and how the shape of
+    // a run reads at a glance: a list of eight rows with a word beside each one
+    // makes you count, three columns makes you look.
+    Gtk::Label run_heading_;
+    Gtk::Box   lanes_{Gtk::Orientation::HORIZONTAL, 10};
+    struct Lane {
+        Gtk::Box            column{Gtk::Orientation::VERTICAL, 4};
+        Gtk::Label          title;
+        Gtk::ScrolledWindow scroller;
+        Gtk::Box            body{Gtk::Orientation::VERTICAL, 4};
+    };
+    Lane todo_, doing_, done_;
     std::vector<std::unique_ptr<Gtk::Widget>> run_rows_;
+
+    // Steering a coder that is already running.
+    Gtk::Box    steer_row_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Entry  steer_;
+    Gtk::Button steer_send_{"Steer"};
+
+    // Which held changesets have their diff open. Kept across a refresh, or the
+    // board updating while you are reading a patch would close it under you.
+    std::set<int> expanded_;
 
     // What it is holding.
     Gtk::Label          board_heading_;
