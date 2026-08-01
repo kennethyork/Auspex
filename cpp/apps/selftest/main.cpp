@@ -95,6 +95,42 @@ void test_css() {
     check(css.find("alpha(#c0caf5, 0.2)") != std::string::npos,
           "scrollbar alpha() keeps its colour argument");
 
+    // Panel controls carry no chrome until you touch them. Twenty filled plates on
+    // one bar reads as a row of boxes rather than a row of things to press.
+    {
+        const auto at = css.find("window.auspex-panel button,");
+        check(at != std::string::npos, "panel buttons are given their own rule");
+        if (at != std::string::npos) {
+            const std::size_t end = css.find('}', at);
+            const std::string block = css.substr(at, end - at);
+            check(block.find("transparent") != std::string::npos,
+                  "and it clears their background");
+            // The stock theme paints buttons with a gradient. Clearing only the
+            // colour leaves the gradient, and the plate is still there.
+            check(block.find("background-image: none") != std::string::npos,
+                  "including the background IMAGE, not just the colour");
+        }
+        // Hover and checked must still fill, or there is no feedback at all and no
+        // way to see which toggle is on.
+        check(css.find("window.auspex-panel button:hover") != std::string::npos,
+              "hover still fills, or a control gives no feedback");
+        check(css.find("window.auspex-panel togglebutton:checked") != std::string::npos,
+              "and a latched toggle keeps its fill, which is what says it is on");
+
+        // Scoped, so a dialog's buttons still look like buttons.
+        check(css.find("\nbutton {") != std::string::npos,
+              "the generic button rule survives for ordinary windows");
+
+        // And it must come AFTER box.horizontal > button, which has exactly the
+        // same specificity. On a tie the later rule wins, and above it every plain
+        // panel button kept the plate this rule exists to remove.
+        const auto tie = css.find("box.horizontal > button");
+        check(tie != std::string::npos, "the rule it ties with is still there");
+        check(at > tie,
+              "and the panel rule comes after it, or the tie is lost and nothing "
+              "changes");
+    }
+
     // A box inside a button must not paint. The generic box rule puts the panel
     // colour behind anything in a box, which inside a rounded button reads as a
     // dark square patch around the icon -- seen on every control that pairs an icon

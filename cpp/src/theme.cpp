@@ -483,6 +483,55 @@ scrollbar slider:active {
     border-radius: 6px;
 }
 
+/* Panel controls carry no chrome of their own.
+ *
+ * LAST IN THE FILE, and that is the whole of why it works. `box.horizontal > button`
+ * further up has exactly the same specificity as these selectors -- one class, two
+ * elements -- so on a tie the later rule wins, and while these sat above it every
+ * plain button on the bar kept its plate. The menu buttons did not, because their
+ * inner button's parent is a menubutton rather than a box, which is what made the
+ * difference visible: paint them red and only those two changed.
+ *
+ * The generic button rule below gives every button a filled, rounded background,
+ * which on a bar of twenty controls draws twenty dark plates and makes the panel
+ * look like a row of boxes rather than a row of things to press. On the panel the
+ * background belongs to hover and to the pressed state -- that is when it means
+ * something -- and the rest of the time the icon and its word sit on the bar.
+ *
+ * Scoped to the panels: a dialog's buttons still look like buttons, because there
+ * the filled shape is what says "this is the one to press". */
+window.auspex-panel button,
+window.auspex-panel togglebutton,
+window.auspex-panel menubutton,
+window.auspex-panel menubutton > button {
+    background-color: transparent;
+    /* background-IMAGE as well as colour. The stock theme paints a button with a
+     * gradient, not a flat fill, so clearing only the colour leaves the gradient
+     * behind and the plate is still there -- which is exactly what happened the
+     * first time this was tried. */
+    background-image: none;
+    border-color: transparent;
+    border-image: none;
+    box-shadow: none;
+}
+
+window.auspex-panel button:hover,
+window.auspex-panel togglebutton:hover,
+window.auspex-panel menubutton:hover,
+window.auspex-panel menubutton > button:hover {
+    background-color: $button_hover;
+    background-image: none;
+}
+
+/* A latched control -- the tray while open, Auto while listening -- keeps its
+ * fill, because "this is currently on" is exactly what the fill is for. */
+window.auspex-panel togglebutton:checked,
+window.auspex-panel button:active,
+window.auspex-panel togglebutton:active {
+    background-color: $button_active;
+    background-image: none;
+}
+
 /* Monitor and Clock labels */
 .monitor-label {
     color: $panel_fg;
