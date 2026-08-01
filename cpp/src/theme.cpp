@@ -112,6 +112,26 @@ box {
     background-color: $panel_bg;
 }
 
+/* A box inside a button is LAYOUT, not a surface.
+ *
+ * The rule above paints every box on the desktop, and a control that holds an icon
+ * and a label together holds them in a box -- so each one got the panel colour
+ * painted behind its contents, as a dark square sitting inside a rounded button.
+ * Visible on the volume, network, settings, Speak, Text, Ask and Auto controls,
+ * every one of which is an icon and a word in a box.
+ *
+ * Images too: an icon paints its own background from the same inherited colour and
+ * leaves the same patch even where there is no box. */
+button box,
+button image,
+button label,
+menubutton box,
+menubutton image,
+togglebutton box,
+togglebutton image {
+    background-color: transparent;
+}
+
 .navigationview {
     background-color: $panel_bg;
 }

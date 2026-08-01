@@ -353,6 +353,7 @@ private:
     void show_chat();
     void show_board();
     void show_calendar();
+    void show_crew();
 
 public:
     // Wired by the shell to the DesktopWindow, which owns the canvas view. A
@@ -484,6 +485,7 @@ private:
     std::unique_ptr<ChatWindow>     chat_window_;
     std::unique_ptr<BoardWindow>    board_window_;
     std::unique_ptr<CalendarWindow> calendar_window_;
+    std::unique_ptr<CrewWindow>     crew_window_;
 
     bool                       watching_geometry_ = false;
     std::optional<std::string> window_id_;

@@ -1179,7 +1179,7 @@ void Panel::build_top() {
     // is not a feature that is switched off, it is one that does not exist.
     if (crew_available()) {
         crew_ = std::make_unique<CrewButton>();
-        crew_->set_board_handler([this] { show_board(); });
+        crew_->set_board_handler([this] { show_crew(); });
         box_.append(*crew_);
     }
 
@@ -1451,7 +1451,7 @@ void Panel::show_panel_menu(double x, double y) {
     add("Calendar", [this] { show_calendar(); });
     // Only when ollamadev is installed: a menu entry that always explains it
     // cannot work is worse than no entry.
-    if (crew_available()) add("Crew board", [this] { show_board(); });
+    if (crew_available()) add("Crew", [this] { show_crew(); });
     add("Open a terminal", [this] {
         if (!config_.terminal.empty()) launch(config_.terminal);
     });
@@ -1491,6 +1491,15 @@ void Panel::confirm_quit() {
         // the desktop window and the voice worker running.
         if (auto app = get_application()) app->quit();
     });
+}
+
+void Panel::show_crew() {
+    if (crew_window_) {
+        crew_window_->present();
+        return;
+    }
+    crew_window_ = std::make_unique<CrewWindow>();
+    crew_window_->present();
 }
 
 void Panel::show_calendar() {

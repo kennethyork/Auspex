@@ -95,6 +95,27 @@ void test_css() {
     check(css.find("alpha(#c0caf5, 0.2)") != std::string::npos,
           "scrollbar alpha() keeps its colour argument");
 
+    // A box inside a button must not paint. The generic box rule puts the panel
+    // colour behind anything in a box, which inside a rounded button reads as a
+    // dark square patch around the icon -- seen on every control that pairs an icon
+    // with a word.
+    {
+        const auto at = css.find("button box,");
+        check(at != std::string::npos, "boxes inside buttons are given a rule");
+        if (at != std::string::npos) {
+            const std::size_t end = css.find('}', at);
+            const std::string block = css.substr(at, end - at);
+            check(block.find("transparent") != std::string::npos,
+                  "and that rule makes them transparent");
+            check(block.find("button image") != std::string::npos,
+                  "images are covered too, since an icon paints its own background");
+        }
+        // The rule has to come AFTER the generic one or the cascade undoes it.
+        const auto generic = css.find("\nbox {");
+        check(generic != std::string::npos && at > generic,
+              "and it comes after the generic box rule, or it would be overridden");
+    }
+
     // The libadwaita selectors are the only way to reach those widgets from C++,
     // since libadwaitamm is not packaged. Losing them would silently unstyle the
     // settings window.

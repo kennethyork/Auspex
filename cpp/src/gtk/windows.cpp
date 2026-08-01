@@ -680,6 +680,304 @@ void CalendarWindow::go_today() {
 }
 
 // ---------------------------------------------------------------------------
+// CrewWindow
+// ---------------------------------------------------------------------------
+CrewWindow::CrewWindow() {
+    set_title("Auspex Crew");
+    add_css_class("auspex-window");
+    set_default_size(720, 720);
+    set_hide_on_close(true);
+
+    // ---- the task ----
+    task_label_.set_text("What should the crew build?");
+    task_label_.set_xalign(0.0f);
+    task_.set_placeholder_text("add rate limiting to the api…");
+    task_.set_hexpand(true);
+    // Enter starts it. A task is one line and reaching for the mouse to send it is
+    // friction on the thing this window exists to do.
+    task_.signal_activate().connect([this] { start(); });
+
+    start_.add_css_class("suggested-action");
+    start_.signal_clicked().connect([this] { start(); });
+
+    resume_.set_tooltip_text(
+        "Finish an interrupted run: keep what is done, re-plan what is left");
+    resume_.signal_clicked().connect([this] {
+        if (!spawn_detached(crew_resume_command())) {
+            status_.set_text("Could not reach the crew");
+            return;
+        }
+        status_.set_text("Resuming the most recent run…");
+    });
+
+    start_row_.append(start_);
+    start_row_.append(resume_);
+
+    // ---- the options ----
+    route_.set_tooltip_text("Pick each role's model by how hard its subtask is");
+    debate_.set_tooltip_text("An advocate, a skeptic and a judge vote on every changeset");
+    dedupe_.set_tooltip_text("Hold a coder whose work duplicates another's");
+    learn_.set_tooltip_text("Remember what this run teaches, for the next one");
+    options_.append(route_);
+    options_.append(debate_);
+    options_.append(dedupe_);
+    options_.append(learn_);
+
+    coders_label_.set_text("Coders");
+    coders_.set_range(0, 12);
+    coders_.set_increments(1, 2);
+    // Zero shows as "default" rather than as a cap of no coders, and is what leaves
+    // the engine's own number alone.
+    coders_.set_value(0);
+    coders_.set_tooltip_text("0 leaves ollamadev's own default alone");
+
+    pack_label_.set_text("Pack");
+    packs_ = crew_packs();
+    {
+        std::vector<Glib::ustring> labels;
+        labels.emplace_back("None");
+        for (const auto& pack : packs_) labels.emplace_back(pack);
+        pack_.set_model(Gtk::StringList::create(labels));
+        pack_.set_selected(0);
+    }
+    pack_.set_tooltip_text("Start from a saved team; the switches above still win");
+
+    second_row_.append(coders_label_);
+    second_row_.append(coders_);
+    second_row_.append(pack_label_);
+    second_row_.append(pack_);
+
+    // ---- what it is doing ----
+    run_heading_.set_xalign(0.0f);
+    run_heading_.add_css_class("subtitle");
+    run_scroller_.set_child(run_box_);
+    run_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    run_scroller_.set_max_content_height(200);
+    run_scroller_.set_propagate_natural_height(true);
+
+    // ---- what it is holding ----
+    board_heading_.set_xalign(0.0f);
+    board_heading_.add_css_class("subtitle");
+    board_scroller_.set_child(board_box_);
+    board_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    board_scroller_.set_vexpand(true);
+
+    status_.set_xalign(0.0f);
+    status_.add_css_class("subtitle");
+    status_.set_wrap(true);
+
+    root_.set_margin(14);
+    root_.append(task_label_);
+    root_.append(task_);
+    root_.append(options_);
+    root_.append(second_row_);
+    root_.append(start_row_);
+    root_.append(run_heading_);
+    root_.append(run_scroller_);
+    root_.append(board_heading_);
+    root_.append(board_scroller_);
+    root_.append(status_);
+    set_child(root_);
+
+    refresh_run();
+    refresh_board();
+
+    // Two seconds, and two stats when nothing has moved.
+    Glib::signal_timeout().connect(
+        [this] {
+            refresh_run();
+            refresh_board();
+            return true;
+        },
+        2000);
+}
+
+void CrewWindow::start() {
+    CrewOptions options;
+    options.route      = route_.get_active();
+    options.debate     = debate_.get_active();
+    options.dedupe     = dedupe_.get_active();
+    options.learn      = learn_.get_active();
+    options.max_coders = coders_.get_value_as_int();
+
+    // The pack is taken by INDEX into the list the engine gave us, never from typed
+    // text, so an unknown name cannot reach the command line -- ollamadev would
+    // treat it as a prompt rather than refusing it.
+    if (const auto index = pack_.get_selected(); index > 0 && index <= packs_.size()) {
+        options.pack = packs_[index - 1];
+    }
+
+    const auto argv = crew_run_command(std::string(task_.get_text()), options);
+    if (argv.empty()) {
+        status_.set_text("Give the crew something to do first");
+        return;
+    }
+
+    if (!spawn_detached(argv)) {
+        status_.set_text("Could not start ollamadev");
+        return;
+    }
+
+    // Detached rather than held: a crew run outlasts this window, and a run that
+    // died because its window was closed would be the worst possible behaviour for
+    // something that edits files.
+    status_.set_text("Started. Progress appears below as the Director plans.");
+    task_.set_text("");
+}
+
+void CrewWindow::refresh_run() {
+    const auto path = crew_state_path();
+    if (path.empty()) return;
+
+    std::error_code ec;
+    const auto stamp = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        run_heading_.set_text("No crew has run here yet.");
+        run_scroller_.set_visible(false);
+        return;
+    }
+    if (have_run_mtime_ && stamp == run_mtime_) return;
+    run_mtime_      = stamp;
+    have_run_mtime_ = true;
+
+    while (Gtk::Widget* child = run_box_.get_first_child()) run_box_.remove(*child);
+    run_rows_.clear();
+
+    const CrewRun run = current_crew_run(path);
+    const std::string label = crew_status_label(run);
+
+    run_heading_.set_text(label.empty()
+                              ? (run.task.empty() ? "The crew is idle."
+                                                  : "Idle. Last task: " + run.task)
+                              : label + " — " + run.task);
+    run_scroller_.set_visible(!run.subtasks.empty());
+
+    for (const auto& subtask : run.subtasks) {
+        auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
+
+        // The state in words rather than a colour alone: "done" and "running" are
+        // the two things being looked for, and a dot cannot be read at a glance
+        // without a legend.
+        auto* state = Gtk::make_managed<Gtk::Label>(
+            subtask.state.empty() ? "?" : subtask.state);
+        state->set_xalign(0.0f);
+        state->set_size_request(80, -1);
+        state->add_css_class(subtask.state == "done" ? "subtitle" : "recording");
+
+        auto* who = Gtk::make_managed<Gtk::Label>(subtask.role);
+        who->set_xalign(0.0f);
+        who->set_size_request(90, -1);
+        who->add_css_class("subtitle");
+
+        auto* what = Gtk::make_managed<Gtk::Label>(subtask.title);
+        what->set_xalign(0.0f);
+        what->set_hexpand(true);
+        what->set_wrap(true);
+
+        row->append(*state);
+        row->append(*who);
+        row->append(*what);
+        run_box_.append(*row);
+        run_rows_.push_back(std::move(row));
+    }
+}
+
+void CrewWindow::refresh_board() {
+    const auto path = board_state_path();
+    if (!path.empty()) {
+        std::error_code ec;
+        const auto stamp = std::filesystem::last_write_time(path, ec);
+        if (!ec) {
+            if (have_board_mtime_ && stamp == board_mtime_) return;
+            board_mtime_      = stamp;
+            have_board_mtime_ = true;
+        }
+    }
+
+    while (Gtk::Widget* child = board_box_.get_first_child()) board_box_.remove(*child);
+    board_rows_.clear();
+
+    const auto items = board_items();
+    if (items.empty()) {
+        board_heading_.set_text("Nothing is being held for review.");
+        board_scroller_.set_visible(false);
+        return;
+    }
+
+    board_heading_.set_text(std::to_string(items.size()) +
+                            (items.size() == 1 ? " change held for review"
+                                               : " changes held for review"));
+    board_scroller_.set_visible(true);
+
+    for (const auto& item : items) {
+        auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 4);
+        row->add_css_class("code-block");
+
+        auto* summary = Gtk::make_managed<Gtk::Label>(
+            "#" + std::to_string(item.n) + "  " + item.summary);
+        summary->set_xalign(0.0f);
+        summary->set_wrap(true);
+
+        // The Auditor's reason gets equal weight to the summary. It is the sentence
+        // that decides whether you accept, and burying it makes the buttons a coin
+        // flip.
+        auto* reason = Gtk::make_managed<Gtk::Label>(item.reason);
+        reason->set_xalign(0.0f);
+        reason->set_wrap(true);
+
+        auto* files = Gtk::make_managed<Gtk::Label>(
+            std::to_string(item.files) + (item.files == 1 ? " file" : " files"));
+        files->set_xalign(0.0f);
+        files->add_css_class("subtitle");
+
+        auto* buttons = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
+        buttons->set_halign(Gtk::Align::END);
+        auto* accept = Gtk::make_managed<Gtk::Button>("Accept");
+        accept->add_css_class("suggested-action");
+        auto* discard = Gtk::make_managed<Gtk::Button>("Discard");
+        const int n = item.n;
+        accept->signal_clicked().connect([this, n] { decide(n, true); });
+        discard->signal_clicked().connect([this, n] { decide(n, false); });
+        buttons->append(*discard);
+        buttons->append(*accept);
+
+        row->append(*summary);
+        if (!item.reason.empty()) row->append(*reason);
+        row->append(*files);
+        row->append(*buttons);
+
+        board_box_.append(*row);
+        board_rows_.push_back(std::move(row));
+    }
+}
+
+void CrewWindow::decide(int n, bool accept) {
+    // Checked against the board that actually exists, not trusted from the button.
+    // The buttons are built from a real board so this cannot normally fail -- but
+    // the board can change between drawing a row and pressing it, and accepting the
+    // wrong changeset is not something to leave to timing.
+    const auto items = board_items();
+    if (!board_item(items, n)) {
+        status_.set_text("Change " + std::to_string(n) + " is no longer on the board");
+        have_board_mtime_ = false;
+        refresh_board();
+        return;
+    }
+
+    const auto argv = accept ? crew_accept_command(n) : crew_discard_command(n);
+    if (argv.empty() || !spawn_detached(argv)) {
+        status_.set_text("Could not reach the crew");
+        return;
+    }
+
+    status_.set_text((accept ? "Accepting change " : "Discarding change ") +
+                     std::to_string(n));
+    // Forced, because accepting one changeset can release or invalidate another and
+    // the file may not have been rewritten yet.
+    have_board_mtime_ = false;
+}
+
+// ---------------------------------------------------------------------------
 // ChatWindow
 // ---------------------------------------------------------------------------
 ChatWindow::ChatWindow(const Config& config, VoiceController& voice)

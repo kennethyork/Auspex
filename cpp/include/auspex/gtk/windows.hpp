@@ -20,6 +20,7 @@
 #include <gtkmm/entry.h>
 #include <gtkmm/dropdown.h>
 #include <gtkmm/grid.h>
+#include <gtkmm/checkbutton.h>
 #include <gtkmm/label.h>
 #include <gtkmm/listbox.h>
 #include <gtkmm/scrolledwindow.h>
@@ -169,6 +170,72 @@ private:
     };
     std::vector<Cell> cells_;
     std::vector<std::unique_ptr<Gtk::Widget>> day_rows_;
+};
+
+// The crew, run from inside Auspex.
+//
+// Before this, starting a crew meant opening a terminal on the canvas and typing at
+// ollamadev -- which works, and is not integration. This is the front end: a task,
+// the options that are worth choosing, what the crew is doing right now, and the
+// changesets it is holding, in one window.
+//
+// The ENGINE is still ollamadev. Nothing here reimplements the Director, the
+// worktrees or the Auditor; it builds an argv, starts it, and reads the state files
+// the engine already writes. See crew.hpp for why that division is deliberate.
+class CrewWindow : public Gtk::Window {
+public:
+    CrewWindow();
+
+private:
+    void start();
+    void refresh_run();
+    void refresh_board();
+    void decide(int n, bool accept);
+
+    Gtk::Box root_{Gtk::Orientation::VERTICAL, 12};
+
+    // What to do.
+    Gtk::Label  task_label_;
+    Gtk::Entry  task_;
+    Gtk::Box    start_row_{Gtk::Orientation::HORIZONTAL, 8};
+    Gtk::Button start_{"Start the crew"};
+    Gtk::Button resume_{"Resume"};
+
+    // The brain options. All opt-in, and a plain run is unchanged by them -- which
+    // is why they are switches rather than a mode: each buys something at a cost in
+    // time and tokens, and the honest default is none of them.
+    Gtk::Box         options_{Gtk::Orientation::HORIZONTAL, 14};
+    Gtk::CheckButton route_{"Route models"};
+    Gtk::CheckButton debate_{"Debate"};
+    Gtk::CheckButton dedupe_{"Dedupe"};
+    Gtk::CheckButton learn_{"Learn"};
+    Gtk::Box         second_row_{Gtk::Orientation::HORIZONTAL, 14};
+    Gtk::Label       coders_label_;
+    Gtk::SpinButton  coders_;
+    Gtk::Label       pack_label_;
+    Gtk::DropDown    pack_;
+    std::vector<std::string> packs_;
+
+    // What it is doing.
+    Gtk::Label          run_heading_;
+    Gtk::ScrolledWindow run_scroller_;
+    Gtk::Box            run_box_{Gtk::Orientation::VERTICAL, 3};
+    std::vector<std::unique_ptr<Gtk::Widget>> run_rows_;
+
+    // What it is holding.
+    Gtk::Label          board_heading_;
+    Gtk::ScrolledWindow board_scroller_;
+    Gtk::Box            board_box_{Gtk::Orientation::VERTICAL, 8};
+    std::vector<std::unique_ptr<Gtk::Widget>> board_rows_;
+
+    Gtk::Label status_;
+
+    // Both watched by modification time; see BoardWindow for why the two files
+    // answer different questions.
+    std::filesystem::file_time_type run_mtime_{};
+    std::filesystem::file_time_type board_mtime_{};
+    bool have_run_mtime_   = false;
+    bool have_board_mtime_ = false;
 };
 
 // Conversation window. Replaces llm_menu.py, including its per-message actions:
