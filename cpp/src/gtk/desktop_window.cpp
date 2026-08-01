@@ -1184,11 +1184,35 @@ void DesktopWindow::draw_position(const Cairo::RefPtr<Cairo::Context>& cr, int w
                               "    " + std::to_string(canvas_.size()) +
                               (canvas_.size() == 1 ? " window" : " windows");
 
-    set_rgb(cr, parse_hex(palette.subtitle_fg), 0.75);
     cr->select_font_face("monospace", Cairo::ToyFontFace::Slant::NORMAL,
                          Cairo::ToyFontFace::Weight::NORMAL);
     cr->set_font_size(13);
-    cr->move_to(width - kMinimapWidth - kMinimapMargin, height - kMinimapMargin - 16);
+
+    // ABOVE the minimap, not at the bottom of the window.
+    //
+    // The desktop window is the whole monitor, but the bottom of it is covered by
+    // the panel -- so a readout placed relative to the window's own height was
+    // drawn underneath the panel and cut in half. Anchoring to the minimap keeps it
+    // in the one part of the corner that is known to be clear, whatever height the
+    // panel is set to.
+    const double minimap_top = height - kMinimapHeight - kMinimapMargin - 40;
+    const double x = width - kMinimapWidth - kMinimapMargin;
+    const double y = minimap_top - 8;
+
+    // A backing plate. The text sits on whatever the wallpaper happens to be, and
+    // dark grey on a sunlit photograph is not readable at any size -- which is what
+    // it was doing before, in the corner, over trees.
+    Cairo::TextExtents extents;
+    cr->get_text_extents(label, extents);
+
+    constexpr double pad = 6.0;
+    set_rgb(cr, parse_hex(palette.entry_bg), 0.82);
+    cr->rectangle(x - pad, y - extents.height - pad,
+                  extents.width + pad * 2, extents.height + pad * 2);
+    cr->fill();
+
+    set_rgb(cr, parse_hex(palette.panel_fg), 0.95);
+    cr->move_to(x, y);
     cr->show_text(label);
 }
 
