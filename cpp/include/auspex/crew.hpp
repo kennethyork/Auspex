@@ -142,6 +142,53 @@ std::string crew_status_label(const CrewRun& run);
 // doing about it right now.
 std::string crew_status_detail(const CrewRun& run);
 
+// --- starting a run ----------------------------------------------------------
+//
+// The brain options are all opt-in and a plain run is unchanged by them, which is
+// why they are a set of switches rather than a mode: each one buys something at a
+// cost in time and tokens, and the honest default is none of them.
+
+struct CrewOptions {
+    // 0 leaves the engine's own default (4) alone rather than restating it here,
+    // where it would go stale the moment ollamadev changes its mind.
+    int  max_coders = 0;
+
+    bool route  = false;   // pick each role's model by difficulty
+    bool debate = false;   // advocate/skeptic/judge vote per changeset
+    bool dedupe = false;   // hold coders whose work duplicates another's
+    bool learn  = false;   // remember what this run teaches
+
+    // A saved team. Empty for none.
+    std::string pack;
+
+    bool operator==(const CrewOptions&) const = default;
+};
+
+// The argv for `ollamadev crew "<task>" [flags]`.
+//
+// The task is ONE argv element however many spaces, quotes or semicolons are in it,
+// and it is the only free text here -- every other argument is a fixed flag or a
+// number. Empty when the task is blank, because ollamadev treats a missing prompt
+// as a request to start an interactive session rather than as an error.
+std::vector<std::string> crew_run_command(const std::string& task,
+                                          const CrewOptions& options);
+
+// Parses `ollamadev crew pack` / `crew role`, which both print two columns:
+// two leading spaces, a name, then a description. Only the name is wanted.
+std::vector<std::string> parse_crew_names(const std::string& output);
+
+// The saved teams and the personas the Director can assign.
+std::vector<std::string> crew_packs();
+std::vector<std::string> crew_roles();
+
+// Whether `pack` is one the engine actually knows.
+//
+// Validated for the same reason a timezone is: it becomes an argument to a command
+// that edits files, and "is it one the system itself listed" is the only check that
+// cannot be argued with. An unknown pack is not a harmless typo -- ollamadev treats
+// an unrecognised bare argument as a PROMPT.
+bool is_known_pack(const std::string& pack, const std::vector<std::string>& known);
+
 // The argv for each decision. Returned rather than run so the command can be
 // asserted in a test without a crew, and so the caller decides whether it runs on
 // the canvas or in the background.

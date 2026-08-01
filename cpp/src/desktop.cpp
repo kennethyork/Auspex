@@ -569,9 +569,24 @@ std::vector<WindowEntry> list_windows() {
 }
 
 bool is_shell_window(const WindowEntry& window) {
-    // Matches the title Panel sets ("Auspex Panel (top)"). "MAGI" is still matched
-    // so a stale pre-rename panel left running does not appear in the list.
-    return window.title.find("Auspex") != std::string::npos ||
+    // The SURFACES, not everything Auspex owns.
+    //
+    // This used to match any title containing "Auspex", which swept up the
+    // settings, the calendar, the board and the crew along with the panels -- so
+    // Auspex's own windows were the only ones on the desktop the grid would not
+    // arrange and the canvas would not manage. They are ordinary windows and should
+    // behave like ordinary windows.
+    //
+    // What genuinely must never be adopted is short and specific: the two panels,
+    // and the desktop substrate. Adopting the substrate would be the canvas trying
+    // to lay out the canvas.
+    const auto starts_with = [&window](std::string_view prefix) {
+        return window.title.rfind(prefix, 0) == 0;
+    };
+
+    return starts_with("Auspex Panel") ||
+           starts_with("Auspex Desktop") ||
+           // A stale pre-rename panel left running from an older build.
            window.title.find("MAGI") != std::string::npos ||
            window.title == "Desktop" ||
            window.title == "xfdesktop";

@@ -1,6 +1,7 @@
 #include "auspex/crew.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -83,6 +84,79 @@ std::optional<BoardItem> board_item(const std::vector<BoardItem>& items, int n) 
                                  [n](const BoardItem& item) { return item.n == n; });
     if (it == items.end()) return std::nullopt;
     return *it;
+}
+
+std::vector<std::string> crew_run_command(const std::string& task,
+                                          const CrewOptions& options) {
+    const std::string trimmed = trim(task);
+    // A blank task is not an empty run: ollamadev with no prompt starts an
+    // interactive session, which is not what a Start button means.
+    if (trimmed.empty()) return {};
+
+    std::vector<std::string> argv{"ollamadev", "crew", trimmed};
+
+    // Flags after the task. Each is a fixed string; the only value that varies is a
+    // number, formatted rather than passed through.
+    if (options.route)  argv.push_back("--route");
+    if (options.debate) argv.push_back("--debate");
+    if (options.dedupe) argv.push_back("--dedupe");
+    if (options.learn)  argv.push_back("--learn");
+
+    if (options.max_coders > 0) {
+        argv.push_back("--max");
+        argv.push_back(std::to_string(options.max_coders));
+    }
+
+    // The pack is checked by the caller against the engine's own list before it
+    // gets here; an empty one is simply left off.
+    if (!options.pack.empty()) {
+        argv.push_back("--pack");
+        argv.push_back(options.pack);
+    }
+
+    return argv;
+}
+
+std::vector<std::string> parse_crew_names(const std::string& output) {
+    std::vector<std::string> names;
+
+    for (const auto& line : split_lines(output)) {
+        // Two columns separated by runs of spaces, and the name is the first token.
+        // A line that does not begin with whitespace is a heading rather than an
+        // entry, which is how the engine separates built-ins from custom ones.
+        if (line.empty() || !std::isspace(static_cast<unsigned char>(line[0]))) continue;
+
+        const std::string entry = trim(line);
+        if (entry.empty()) continue;
+
+        std::string name;
+        for (const char c : entry) {
+            if (std::isspace(static_cast<unsigned char>(c))) break;
+            name.push_back(c);
+        }
+        if (!name.empty()) names.push_back(std::move(name));
+    }
+
+    return names;
+}
+
+std::vector<std::string> crew_packs() {
+    if (!crew_available()) return {};
+    const auto result = run({"ollamadev", "crew", "pack"});
+    if (!result.ok) return {};
+    return parse_crew_names(result.out);
+}
+
+std::vector<std::string> crew_roles() {
+    if (!crew_available()) return {};
+    const auto result = run({"ollamadev", "crew", "role"});
+    if (!result.ok) return {};
+    return parse_crew_names(result.out);
+}
+
+bool is_known_pack(const std::string& pack, const std::vector<std::string>& known) {
+    if (pack.empty()) return false;
+    return std::find(known.begin(), known.end(), pack) != known.end();
 }
 
 std::vector<std::string> crew_accept_command(int n) {

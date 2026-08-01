@@ -1870,6 +1870,44 @@ void test_minimize() {
     }
 }
 
+void test_shell_windows() {
+    std::cout << "shell surfaces\n";
+
+    using auspex::WindowEntry;
+    using auspex::is_shell_window;
+
+    const auto win = [](const char* title) {
+        WindowEntry w;
+        w.id = "0x1";
+        w.workspace = 0;
+        w.title = title;
+        return w;
+    };
+
+    // The surfaces. Adopting the desktop substrate would be the canvas trying to
+    // lay out the canvas.
+    check(is_shell_window(win("Auspex Panel (top)")), "the top panel is a surface");
+    check(is_shell_window(win("Auspex Panel (bottom)")), "and the bottom one");
+    check(is_shell_window(win("Auspex Desktop")), "and the desktop substrate");
+    check(is_shell_window(win("Desktop")), "as is the environment's own desktop");
+    check(is_shell_window(win("xfdesktop")), "under either name");
+    check(is_shell_window(win("MAGI Panel")), "and a stale panel from an older build");
+
+    // Auspex's ORDINARY windows. These used to be excluded by a title match on
+    // "Auspex", which made them the only windows on the desktop the grid would not
+    // arrange -- they are ordinary windows and should be treated as such.
+    check(!is_shell_window(win("Auspex Settings")), "settings is an ordinary window");
+    check(!is_shell_window(win("Auspex Calendar")), "so is the calendar");
+    check(!is_shell_window(win("Auspex Crew Board")), "and the board");
+    check(!is_shell_window(win("Auspex Launcher")), "and the launcher");
+    check(!is_shell_window(win("Auspex")), "and the chat window, titled just Auspex");
+
+    // Someone else's window that happens to mention it.
+    check(!is_shell_window(win("Terminal - editing auspex/panel.cpp")),
+          "a window merely mentioning the name is not a surface");
+    check(!is_shell_window(win("Firefox")), "and nor is anything else");
+}
+
 void test_crew_run_state() {
     std::cout << "crew run state\n";
 
@@ -2005,7 +2043,101 @@ void test_crew_run_state() {
     // changing means the crew is still working. A board that watched only one would
     // either miss arrivals or be unable to say why it is empty.
     {
-        check(!board_state_path().empty(), "the board has a file to watch");
+
+    // Starting a run. The task is the only free text, and it stays ONE argv element
+    // however many spaces, quotes or semicolons are in it.
+    {
+        const auto plain = crew_run_command("add rate limiting to the api", {});
+        check_eq(plain.size(), std::size_t{3}, "a plain run is three arguments");
+        if (plain.size() == 3) {
+            check_eq(plain[0], std::string("ollamadev"), "the engine");
+            check_eq(plain[1], std::string("crew"), "the subcommand");
+            check_eq(plain[2], std::string("add rate limiting to the api"),
+                     "and the task, whole");
+        }
+
+        // Shell metacharacters are not special here -- nothing is ever handed to a
+        // shell -- but the task must still arrive as one argument rather than four.
+        const auto nasty = crew_run_command("fix \"it\"; rm -rf /", {});
+        check_eq(nasty.size(), std::size_t{3}, "a hostile task is still one argument");
+        if (nasty.size() == 3) {
+            check_eq(nasty[2], std::string("fix \"it\"; rm -rf /"), "kept verbatim");
+        }
+
+        // A blank task must not start anything: ollamadev with no prompt opens an
+        // interactive session, which is not what a Start button means.
+        check(crew_run_command("", {}).empty(), "a blank task starts nothing");
+        check(crew_run_command("   ", {}).empty(), "and neither does whitespace");
+
+        CrewOptions options;
+        options.route      = true;
+        options.debate     = true;
+        options.dedupe     = true;
+        options.learn      = true;
+        options.max_coders = 6;
+        options.pack       = "tested";
+
+        const auto full = crew_run_command("build the thing", options);
+        const auto has = [&full](const std::string& flag) {
+            return std::find(full.begin(), full.end(), flag) != full.end();
+        };
+        check(has("--route"),  "route is passed");
+        check(has("--debate"), "debate is passed");
+        check(has("--dedupe"), "dedupe is passed");
+        check(has("--learn"),  "learn is passed");
+        check(has("--max"),    "a coder cap is passed");
+        check(has("6"),        "with its number");
+        check(has("--pack"),   "a pack is passed");
+        check(has("tested"),   "by name");
+
+        // The task stays immediately after the subcommand: flags follow it, and a
+        // task that drifted behind a flag would be read as that flag's value.
+        check_eq(full[2], std::string("build the thing"),
+                 "the task stays third, ahead of every flag");
+
+        // Zero means "leave the engine's default alone" rather than "--max 0",
+        // which would be a cap of no coders at all.
+        CrewOptions unset;
+        const auto defaults = crew_run_command("t", unset);
+        check(std::find(defaults.begin(), defaults.end(), "--max") == defaults.end(),
+              "an unset coder cap is left off entirely");
+        check(std::find(defaults.begin(), defaults.end(), "--pack") == defaults.end(),
+              "and so is an unset pack");
+    }
+
+    // Packs and roles are listed as two columns; only the name is wanted, and a
+    // heading line is not an entry.
+    {
+        const std::string listing =
+            "  amptest           amplify x3 - 2 coders\n"
+            "  bugfix            focus: find and fix the bug  (built-in)\n"
+            "  web-app           focus: a web application  (built-in)\n"
+            "Custom packs:\n"
+            "  trio              coder: qwen2.5-coder:7b\n";
+
+        const auto names = parse_crew_names(listing);
+        check_eq(names.size(), std::size_t{4}, "four entries, and the heading is not one");
+        if (names.size() == 4) {
+            check_eq(names[0], std::string("amptest"), "the name alone");
+            check_eq(names[1], std::string("bugfix"), "without its description");
+            check_eq(names[3], std::string("trio"), "including custom ones");
+        }
+
+        check(parse_crew_names("").empty(), "no output is no packs");
+        check(parse_crew_names("Nothing indented\n").empty(),
+              "an unindented line is a heading, not an entry");
+
+        // A pack name reaches a command that edits files, so it is checked against
+        // the engine's own list rather than a pattern -- an unrecognised bare
+        // argument is treated by ollamadev as a PROMPT, not as an error.
+        check(is_known_pack("tested", names) == false,
+              "a pack not in the list is refused");
+        check(is_known_pack("bugfix", names), "one that is in it is accepted");
+        check(!is_known_pack("", names), "empty is not a pack");
+        check(!is_known_pack("bugfix", {}), "with no list, nothing is known");
+    }
+
+                check(!board_state_path().empty(), "the board has a file to watch");
         check(board_state_path() != crew_state_path(),
               "and it is not the same file as the run state");
         check_eq(board_state_path().filename(), fs::path("current.json"),
@@ -3684,6 +3816,7 @@ int main(int argc, char** argv) {
     test_fit_and_geometry();
     test_monitors_current();
     test_minimize();
+    test_shell_windows();
     test_crew_run_state();
     test_crew();
     test_notifications_and_pins();
