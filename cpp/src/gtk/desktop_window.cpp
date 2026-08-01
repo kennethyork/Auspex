@@ -740,6 +740,32 @@ void DesktopWindow::reconcile() {
             // that must not be mistaken for a drag.
             const auto expected = canvas_.placement_of(id);
             if (!expected) continue;
+
+            // Learn RESIZES as well as moves.
+            //
+            // note_screen_move only ever taught the canvas about position, so a
+            // window resized by hand kept whatever size the canvas last gave it.
+            // That is not a cosmetic staleness: resolve() decides visibility from
+            // the size it believes, so a window the canvas still thinks is 1920
+            // wide is judged not to fit and gets parked -- and since the whole
+            // canvas is re-placed whenever anything moves, moving one window made
+            // the OTHER one vanish.
+            //
+            // Applied unconditionally rather than behind the move tolerance: a
+            // resize is not a drag, and there is no reading of a window's own size
+            // that the canvas should prefer to the window's.
+            {
+                const double z = canvas_.zoom() > 0 ? canvas_.zoom() : 1.0;
+                const int observed_w = static_cast<int>(found->second.width  / z);
+                const int observed_h = static_cast<int>(found->second.height / z);
+                if (observed_w > 0 && observed_h > 0 &&
+                    (observed_w != expected->width || observed_h != expected->height)) {
+                    CanvasPlacement resized = *expected;
+                    resized.width  = observed_w;
+                    resized.height = observed_h;
+                    canvas_.place(id, resized);
+                }
+            }
             // Compare in SCREEN coordinates. At a zoom other than 1.0 the old
             // comparison used unscaled canvas coordinates, so every resize looked
             // like a manual drag on the next reconcile tick. note_screen_move()
@@ -750,6 +776,7 @@ void DesktopWindow::reconcile() {
                 (expected->x - canvas_.viewport().x) * zoom);
             const int expected_y = static_cast<int>(
                 (expected->y - canvas_.viewport().y) * zoom);
+            // Position only -- the size was just reconciled above.
             if (std::abs(screen_x - expected_x) <= kMoveTolerance &&
                 std::abs(screen_y - expected_y) <= kMoveTolerance) {
                 continue;
