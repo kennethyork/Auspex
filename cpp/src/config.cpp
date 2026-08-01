@@ -92,6 +92,7 @@ Config Config::load(const fs::path& path) {
     assign_if(j, "enable_effects",    cfg.enable_effects);
     assign_if(j, "enable_ai",         cfg.enable_ai);
     assign_if(j, "clock_24_hour",     cfg.clock_24_hour);
+    assign_if(j, "grid_mode",         cfg.grid_mode);
 
     // Only strings, and only ones that look like an entry id. A config file is
     // hand-edited, and a stray number here should be skipped rather than turned

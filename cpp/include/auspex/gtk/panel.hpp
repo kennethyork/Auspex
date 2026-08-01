@@ -323,6 +323,9 @@ public:
     void set_zoom_handler(sigc::slot<void(double)> handler) {
         on_zoom_ = std::move(handler);
     }
+    void set_mode_handler(sigc::slot<void(bool)> handler) {
+        on_mode_ = std::move(handler);
+    }
     void set_window_restore_handler(sigc::slot<void(const std::string&)> handler) {
         if (windows_) windows_->set_restore_handler(std::move(handler));
     }
@@ -338,6 +341,7 @@ public:
 
 private:
     sigc::slot<void(double)> on_zoom_;
+    sigc::slot<void(bool)>   on_mode_;
     sigc::slot<void(PanelPosition, int)> on_geometry_;
     sigc::slot<void(int, int)> on_pan_;
     void install_status_handler();
@@ -371,6 +375,13 @@ private:
     // middle of the arrows -- see panel.cpp for why the zoom buttons that used to be
     // up here are gone.
     Gtk::Button                          zoom_reset_{"1:1"};
+
+    // Grid or canvas. A toggle rather than two buttons: it is one question with two
+    // answers, and the pressed state is what says which you are in.
+    Gtk::ToggleButton                    grid_mode_;
+    Gtk::Box                             grid_mode_box_{Gtk::Orientation::HORIZONTAL, 4};
+    Gtk::Image                           grid_mode_icon_;
+    Gtk::Label                           grid_mode_label_;
     std::unique_ptr<WorkspaceSwitcher>   workspaces_;
     std::unique_ptr<WindowList>          windows_;
     std::unique_ptr<PinnedLaunchers>     pinned_;

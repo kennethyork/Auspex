@@ -70,6 +70,12 @@ public:
     // Bound to F, and run automatically whenever a window opens or closes.
     void fit_all();
 
+    // True for grid, false for canvas. Switching TO grid lays out immediately --
+    // asking for the grid and being told it will happen next time a window opens
+    // would be a control that appears not to work.
+    void set_grid_mode(bool grid);
+    bool grid_mode() const { return auto_fit_; }
+
     // Restores a task-list window and makes sure it rejoins the visible layout
     // immediately rather than waiting off-canvas for the next reconciliation tick.
     void restore_managed_window(const std::string& window_id);
@@ -122,7 +128,6 @@ private:
     // used to make windows vanish and reappear. Their ghosts have no such limit:
     // they are drawn by Auspex, on Auspex's own surface, and can slide off the edge
     // exactly as a window would on a canvas that really was unbounded.
-    void draw_ghosts(const Cairo::RefPtr<Cairo::Context>& cr, int width, int height) const;
     void draw_minimap(const Cairo::RefPtr<Cairo::Context>& cr, int width, int height) const;
     void draw_position(const Cairo::RefPtr<Cairo::Context>& cr, int width, int height) const;
 
@@ -190,7 +195,24 @@ private:
     // Keep every window fitted on screen as the set of them changes. On by
     // default: an unfitted canvas hides windows off-viewport with nothing to say
     // they are there, which is a bad first impression of an infinite space.
+    // Grid mode, or canvas mode.
+    //
+    // Grid is what this has always done: opening or closing a window re-lays the
+    // whole screen so the windows share it. Canvas leaves them exactly where they
+    // are put and lets the plane be panned around them -- which is what an infinite
+    // canvas is for, and is impossible while something keeps tidying up behind you.
+    //
+    // The same flag drives both, because they are the same question asked once:
+    // does the desktop arrange windows, or do you.
     bool      auto_fit_ = true;
+
+    // The canvas layout as it was when grid mode was switched on.
+    //
+    // Grid mode re-lays every window, which throws away placement the user arranged
+    // by hand. Without this, flipping to Grid and back leaves the grid's own layout
+    // behind and the arrangement is simply gone -- so the switch would only be safe
+    // to press if you did not care where anything was.
+    std::map<std::string, CanvasPlacement> canvas_layout_;
     FitLayout last_fit_{};
 
     sigc::slot<void(const Rect&)> on_monitor_changed_;

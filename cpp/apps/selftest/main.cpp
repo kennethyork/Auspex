@@ -2562,6 +2562,16 @@ void test_timekeeping() {
         }
         check(auspex::Config::load(path).clock_24_hour, "and true is read back");
 
+        // Grid or canvas, remembered the same way. Grid is the default because it
+        // is what the desktop has always done.
+        check(auspex::Config::load(path).grid_mode,
+              "a config that says nothing leaves the desktop arranging windows");
+        {
+            std::ofstream out(path, std::ios::trunc);
+            out << "{\"grid_mode\": false}\n";
+        }
+        check(!auspex::Config::load(path).grid_mode, "canvas mode is remembered");
+
         fs::remove(path, ec);
     }
 

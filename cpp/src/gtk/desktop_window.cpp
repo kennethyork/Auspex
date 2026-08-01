@@ -84,6 +84,11 @@ double floor_to_step(double value, double step) {
 // ---------------------------------------------------------------------------
 DesktopWindow::DesktopWindow(const Config& config, Canvas& canvas, const Rect& monitor)
     : config_(config), canvas_(canvas), monitor_(monitor) {
+    // The mode the user left it in. Doing this before the first adoption pass
+    // matters: starting in grid mode would tidy the screen once before canvas mode
+    // took effect, undoing placement chosen in a previous session.
+    auto_fit_ = config.grid_mode;
+
     // Before anything is placed. The first adoption pass runs during construction,
     // and without this it would park windows against a null union -- straight onto
     // the monitor next door, which is the behaviour this exists to stop.
@@ -267,6 +272,43 @@ void DesktopWindow::fit_all() {
     area_.queue_draw();
 }
 
+void DesktopWindow::set_grid_mode(bool grid) {
+    if (auto_fit_ == grid) return;
+
+    if (grid) {
+        // Remember the arrangement before the grid overwrites it.
+        canvas_layout_.clear();
+        for (const auto& id : canvas_.managed_ids()) {
+            if (auto placement = canvas_.placement_of(id)) {
+                canvas_layout_[id] = *placement;
+            }
+        }
+        auto_fit_ = true;
+        fit_all();
+        return;
+    }
+
+    auto_fit_ = false;
+
+    // Put back what was there. Only for windows that still exist -- anything opened
+    // while the grid was on keeps the place the grid gave it, because there is no
+    // earlier position for it to go back to.
+    bool restored = false;
+    for (const auto& id : canvas_.managed_ids()) {
+        const auto found = canvas_layout_.find(id);
+        if (found == canvas_layout_.end()) continue;
+        canvas_.place(id, found->second);
+        restored = true;
+    }
+
+    if (restored) {
+        last_positions_ = canvas_.resolve(/*include_life_size=*/true);
+        apply_positions(last_positions_, monitor_, screen());
+        needs_redraw_ = true;
+        area_.queue_draw();
+    }
+}
+
 void DesktopWindow::set_panel_height(PanelPosition position, int height) {
     height = std::max(0, height);
     int& current = position == PanelPosition::Top ? panel_top_ : panel_bottom_;
@@ -389,7 +431,16 @@ void DesktopWindow::reset_zoom() {
     canvas_.set_viewport(viewport);
 
     canvas_.reset_zoom();
-    fit_all();
+
+    // Only tidies in grid mode. In canvas mode this is "back to life size and back
+    // to the origin", and re-laying the windows would be the grid reasserting
+    // itself over placement the user chose by hand.
+    if (auto_fit_) {
+        fit_all();
+    } else {
+        last_positions_ = canvas_.resolve(/*include_life_size=*/true);
+        apply_positions(last_positions_, monitor_, screen());
+    }
 
     needs_redraw_ = true;
     area_.queue_draw();
@@ -672,6 +723,25 @@ void DesktopWindow::reconcile() {
         for (const auto& id : sync.adopt) {
             const auto found = geometry_of.find(id);
             if (found == geometry_of.end()) continue;
+
+            // In canvas mode a newly adopted window keeps the position it already
+            // has. Adoption otherwise hands it the next free grid slot, which is
+            // right when the desktop arranges windows and wrong when it does not --
+            // and if that slot happened to fall on the next page of canvas, the
+            // window was parked off screen the moment it was adopted.
+            if (!auto_fit_) {
+                const double zoom = canvas_.zoom() > 0 ? canvas_.zoom() : 1.0;
+                CanvasPlacement where;
+                where.x = static_cast<int>((found->second.x - monitor_.x) / zoom) +
+                          canvas_.viewport().x;
+                where.y = static_cast<int>((found->second.y - monitor_.y) / zoom) +
+                          canvas_.viewport().y;
+                where.width  = static_cast<int>(found->second.width / zoom);
+                where.height = static_cast<int>(found->second.height / zoom);
+                canvas_.place(id, where);
+                continue;
+            }
+
             if (auto placement = canvas_.placement_of(id)) {
                 // Divided by the zoom, because placement sizes are CANVAS units and
                 // the geometry just read is screen pixels. Storing the observed size
@@ -790,7 +860,10 @@ void DesktopWindow::on_draw(const Cairo::RefPtr<Cairo::Context>& cr, int width,
     }
 
     draw_grid(cr, width, height);
-    draw_ghosts(cr, width, height);
+    // No ghosts. There used to be a tinted rectangle showing where a parked window
+    // "belonged" -- but a coloured box on the wallpaper marking a window that is not
+    // there is clutter suggesting something is broken, when in fact the canvas is
+    // working exactly as intended. The minimap already says where things are.
     draw_minimap(cr, width, height);
     draw_position(cr, width, height);
 }
@@ -843,75 +916,6 @@ void DesktopWindow::draw_grid(const Cairo::RefPtr<Cairo::Context>& cr, int width
     }
 }
 
-void DesktopWindow::draw_ghosts(const Cairo::RefPtr<Cairo::Context>& cr, int width,
-                                int height) const {
-    const Palette& palette = theme_by_name(config_.theme);
-    const Viewport v       = canvas_.viewport();
-    const double   zoom    = canvas_.zoom();
-
-    cr->select_font_face("sans", Cairo::ToyFontFace::Slant::NORMAL,
-                         Cairo::ToyFontFace::Weight::NORMAL);
-    cr->set_font_size(13);
-
-    // Clipped to the same band the windows live in, so a ghost cannot be drawn
-    // underneath a panel where it would be invisible anyway.
-    const auto area = current_workarea();
-    const int  top    = area ? std::max(0, area->y - monitor_.y) : 0;
-    const int  bottom = area ? std::min(height, (area->y + area->height) - monitor_.y)
-                             : height;
-    cr->save();
-    cr->rectangle(0, top, width, std::max(0, bottom - top));
-    cr->clip();
-
-    for (const auto& id : canvas_.managed_ids()) {
-        if (canvas_.is_hidden(id)) continue;
-
-        // Only windows the canvas had to park. A window that is on screen is drawn
-        // by itself and does not want an outline over the top of it.
-        const auto shown = std::find_if(
-            last_positions_.begin(), last_positions_.end(),
-            [&](const ScreenPosition& p) { return p.id == id && p.visible; });
-        if (shown != last_positions_.end()) continue;
-
-        const auto placement = canvas_.placement_of(id);
-        if (!placement || placement->width <= 0 || placement->height <= 0) continue;
-
-        const double x = (placement->x - v.x) * zoom;
-        const double y = (placement->y - v.y) * zoom;
-        const double w = placement->width  * zoom;
-        const double h = placement->height * zoom;
-
-        // Off the far side of the canvas in either direction: nothing to suggest.
-        if (x + w < -40 || y + h < -40 || x > width + 40 || y > height + 40) continue;
-
-        set_rgb(cr, parse_hex(palette.accent), 0.14);
-        cr->rectangle(x, y, w, h);
-        cr->fill();
-
-        // Dashed, so it reads as "this is not here yet" rather than as a window
-        // that failed to draw.
-        set_rgb(cr, parse_hex(palette.accent), 0.55);
-        cr->set_line_width(2.0);
-        cr->set_dash(std::vector<double>{8.0, 6.0}, 0.0);
-        cr->rectangle(x + 1, y + 1, w - 2, h - 2);
-        cr->stroke();
-        cr->unset_dash();
-
-        if (const auto title = titles_.find(id);
-            title != titles_.end() && !title->second.empty() && w > 80) {
-            set_rgb(cr, parse_hex(palette.panel_fg), 0.75);
-            cr->save();
-            cr->rectangle(x, y, w, h);
-            cr->clip();                     // a long title cannot escape its ghost
-            cr->move_to(x + 10, y + 24);
-            cr->show_text(title->second);
-            cr->restore();
-        }
-    }
-
-    cr->restore();
-}
-
 void DesktopWindow::draw_minimap(const Cairo::RefPtr<Cairo::Context>& cr, int width,
                                  int height) const {
     const Palette& palette = theme_by_name(config_.theme);
@@ -949,16 +953,41 @@ void DesktopWindow::draw_minimap(const Cairo::RefPtr<Cairo::Context>& cr, int wi
                          box_y + 8 + (cy - min_y) * scale};
     };
 
-    // Every managed window, whether or not it is currently on screen -- that is the
-    // point of a minimap on an infinite canvas.
-    set_rgb(cr, parse_hex(palette.accent), 0.65);
+    // Every managed window, whether or not it is currently on screen. That is the
+    // point of a minimap on an infinite canvas, and since the on-canvas outlines
+    // were removed it is the ONLY thing that says where a window has gone.
     for (const auto& id : canvas_.managed_ids()) {
         const auto placement = canvas_.placement_of(id);
         if (!placement) continue;
+
+        // The window's own size, not the grid tile. In canvas mode windows are
+        // whatever size the user made them, and drawing them all as identical tiles
+        // makes the map a picture of a layout that does not exist.
+        const double w = placement->width  > 0 ? placement->width  : tile_width_;
+        const double h = placement->height > 0 ? placement->height : tile_height_;
+
         const auto [mx, my] = to_map(placement->x, placement->y);
-        cr->rectangle(mx, my, std::max(2.0, tile_width_ * scale),
-                      std::max(2.0, tile_height_ * scale));
-        cr->fill();
+        const double mw = std::max(2.0, w * scale);
+        const double mh = std::max(2.0, h * scale);
+
+        // On screen is solid; off screen is an outline. Without the difference the
+        // map shows five windows and the desktop shows two, with nothing to say
+        // which three are merely elsewhere.
+        const auto shown = std::find_if(
+            last_positions_.begin(), last_positions_.end(),
+            [&](const ScreenPosition& p) { return p.id == id && p.visible; });
+
+        if (shown != last_positions_.end()) {
+            set_rgb(cr, parse_hex(palette.accent), 0.65);
+            cr->rectangle(mx, my, mw, mh);
+            cr->fill();
+        } else {
+            set_rgb(cr, parse_hex(palette.accent), 0.75);
+            cr->set_line_width(1.0);
+            cr->rectangle(mx + 0.5, my + 0.5, std::max(1.0, mw - 1),
+                          std::max(1.0, mh - 1));
+            cr->stroke();
+        }
     }
 
     // Where you are.

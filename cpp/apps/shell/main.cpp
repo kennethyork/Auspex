@@ -112,6 +112,8 @@ int main(int argc, char** argv) {
         // middle of them, 1:1. A factor of 0 means "back to the grid at life size",
         // and it drives the same canvas the desktop surface does, so the panel and
         // the wallpaper can never disagree about where things are.
+        bottom->set_mode_handler([&](bool grid) { desktop->set_grid_mode(grid); });
+
         bottom->set_zoom_handler([&](double factor) {
             if (factor <= 0.0) desktop->reset_zoom();
             else               desktop->zoom_by(factor);

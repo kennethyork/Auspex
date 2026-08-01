@@ -24,6 +24,11 @@ struct Config {
     // run by whatever reads it.
     std::vector<std::string> pinned;
 
+    // Grid mode arranges windows for you; canvas mode leaves them where you put
+    // them and lets you pan around instead. True is grid, which is what the desktop
+    // has always done.
+    bool        grid_mode        = true;
+
     // Panel clock format. True is 24-hour, which is what the shell has always
     // shown; the setting exists because that is not what everyone reads quickly.
     bool        clock_24_hour    = true;

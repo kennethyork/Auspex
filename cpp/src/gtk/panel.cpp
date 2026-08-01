@@ -1160,6 +1160,26 @@ void Panel::build_bottom() {
     zoom_reset_.set_tooltip_text("Back to the grid at life size");
     zoom_reset_.signal_clicked().connect([this] { if (on_zoom_) on_zoom_(0.0); });
 
+    // The mode switch sits with the canvas controls, because it decides what they
+    // do: in grid mode the layout is the desktop's, in canvas mode it is yours.
+    grid_mode_.set_active(config_.grid_mode);
+    grid_mode_icon_.set_from_icon_name("view-grid-symbolic");
+    grid_mode_label_.set_text(config_.grid_mode ? "Grid" : "Canvas");
+    grid_mode_box_.append(grid_mode_icon_);
+    grid_mode_box_.append(grid_mode_label_);
+    grid_mode_.set_child(grid_mode_box_);
+    grid_mode_.set_tooltip_text(
+        "Grid arranges your windows to fill the screen; canvas leaves them where "
+        "you drag them and lets you pan around");
+    grid_mode_.signal_toggled().connect([this] {
+        const bool grid = grid_mode_.get_active();
+        grid_mode_label_.set_text(grid ? "Grid" : "Canvas");
+        grid_mode_icon_.set_from_icon_name(grid ? "view-grid-symbolic"
+                                                : "view-paged-symbolic");
+        if (on_mode_) on_mode_(grid);
+    });
+    pan_box_.append(grid_mode_);
+
     pan_box_.append(pan_left_);
     pan_box_.append(pan_up_);
     pan_box_.append(zoom_reset_);
@@ -1268,14 +1288,6 @@ void Panel::build_bottom() {
     // uses them, where holding IS the natural gesture because you are already
     // there and the recording is a moment long.
 
-    if (!config_.terminal.empty()) {
-        terminal_icon_.set_from_icon_name("utilities-terminal-symbolic");
-    terminal_.set_tooltip_text("Open a terminal");
-        terminal_.set_child(terminal_icon_);
-        terminal_.signal_clicked().connect([this] { launch(config_.terminal); });
-        button_box_.append(terminal_);
-    }
-
     // Always-on listening. VAD decides utterance boundaries, so no button is held
     // and no fixed window applies.
     // media-record, not another microphone: the dictate button beside it already
@@ -1303,6 +1315,17 @@ void Panel::build_bottom() {
         }
     });
     button_box_.append(ear_);
+
+    // The terminal sits last, after the voice controls. It is the one button here
+    // that is not part of talking to the machine, so it does not belong in the
+    // middle of the ones that are.
+    if (!config_.terminal.empty()) {
+        terminal_icon_.set_from_icon_name("utilities-terminal-symbolic");
+        terminal_.set_child(terminal_icon_);
+        terminal_.set_tooltip_text("Open a terminal");
+        terminal_.signal_clicked().connect([this] { launch(config_.terminal); });
+        button_box_.append(terminal_);
+    }
 
     box_.append(button_box_);
 
