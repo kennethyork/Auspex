@@ -1223,7 +1223,10 @@ void Panel::build_bottom() {
     // Deliberately NOT routed through the command parser. Dictation is the one voice
     // path where the words are the point -- "open my downloads" typed into a document
     // must land as those words and not open anything.
-    to_text_icon_.set_from_icon_name("insert-text-symbolic");
+    // A microphone, not insert-text-symbolic. This button dictates: the sound goes
+    // in and the words come out, and the icon should say the first half. The text
+    // glyph rendered as a small "a" in a box, which reads as a font setting.
+    to_text_icon_.set_from_icon_name("audio-input-microphone-symbolic");
     to_text_label_.set_text("Text");
     to_text_box_.append(to_text_icon_);
     to_text_box_.append(to_text_label_);
