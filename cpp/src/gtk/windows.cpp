@@ -205,6 +205,11 @@ BoardWindow::BoardWindow() {
     set_hide_on_close(true);
 
     heading_.set_xalign(0.0f);
+    running_.add_css_class("subtitle");
+    running_.set_xalign(0.0f);
+    running_.set_wrap(true);
+    running_.set_visible(false);
+
     heading_.add_css_class("subtitle");
 
     scroller_.set_child(list_);
@@ -218,12 +223,60 @@ BoardWindow::BoardWindow() {
     buttons_.append(close_);
 
     root_.set_margin(12);
+    root_.append(running_);
     root_.append(heading_);
     root_.append(scroller_);
     root_.append(buttons_);
     set_child(root_);
 
     signal_map().connect([this] { refresh(); });
+    refresh();
+
+    // Two seconds, and only two stats when nothing has moved. A changeset takes
+    // tens of seconds to arrive, so this is already finer than what it watches.
+    Glib::signal_timeout().connect(
+        [this] {
+            watch();
+            return true;
+        },
+        2000);
+}
+
+void BoardWindow::watch() {
+    std::error_code ec;
+    bool changed = false;
+
+    // The board itself: something landed, or a decision took effect.
+    if (const auto path = board_state_path(); !path.empty()) {
+        const auto stamp = std::filesystem::last_write_time(path, ec);
+        if (!ec && (!have_board_mtime_ || stamp != board_mtime_)) {
+            board_mtime_      = stamp;
+            have_board_mtime_ = true;
+            changed = true;
+        }
+    }
+
+    // The run: worth watching separately so the line at the top of the window can
+    // say a crew is still working even when nothing has landed yet. Those are very
+    // different things to be looking at an empty board for.
+    if (const auto path = crew_state_path(); !path.empty()) {
+        const auto stamp = std::filesystem::last_write_time(path, ec);
+        if (!ec && (!have_crew_mtime_ || stamp != crew_mtime_)) {
+            crew_mtime_      = stamp;
+            have_crew_mtime_ = true;
+            changed = true;
+        }
+    }
+
+    if (!changed) return;
+
+    const CrewRun run = current_crew_run();
+    const std::string status = crew_status_label(run);
+    running_.set_visible(!status.empty());
+    if (!status.empty()) {
+        running_.set_text(status + " \u2014 " + crew_status_detail(run));
+    }
+
     refresh();
 }
 

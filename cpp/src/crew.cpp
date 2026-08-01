@@ -118,6 +118,13 @@ std::filesystem::path crew_state_path() {
     return {};
 }
 
+std::filesystem::path board_state_path() {
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        return std::filesystem::path(home) / ".ollamadev" / "board" / "current.json";
+    }
+    return {};
+}
+
 CrewRun parse_crew_run(const std::string& json_text) {
     CrewRun run;
     if (json_text.empty()) return run;

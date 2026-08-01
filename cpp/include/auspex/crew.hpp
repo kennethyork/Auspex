@@ -105,6 +105,14 @@ struct CrewRun {
 // $HOME/.ollamadev/crew/current.json.
 std::filesystem::path crew_state_path();
 
+// $HOME/.ollamadev/board/current.json -- the board's own file.
+//
+// Watched rather than polled with `ollamadev board --json`, which is a subprocess:
+// asking it every couple of seconds for the whole of a session would cost more than
+// the feature is worth. The file's modification time answers "has anything landed"
+// for the price of a stat, and the command is only run when the answer is yes.
+std::filesystem::path board_state_path();
+
 // Parses that file. Anything malformed yields a run that is not `known`, rather
 // than a half-populated one that would report a wrong count.
 CrewRun parse_crew_run(const std::string& json_text);

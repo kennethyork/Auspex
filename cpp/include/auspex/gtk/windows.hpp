@@ -80,6 +80,20 @@ public:
 private:
     void decide(int n, bool accept);
 
+    // Refreshes itself while a crew is working.
+    //
+    // Changesets land while you are looking at the window, and a board that only
+    // updates when reopened is a board you have to remember to distrust. Driven by
+    // the modification times of the two files the engine already maintains, so a
+    // quiet minute costs two stats rather than two subprocesses.
+    void watch();
+
+    std::filesystem::file_time_type board_mtime_{};
+    std::filesystem::file_time_type crew_mtime_{};
+    bool have_board_mtime_ = false;
+    bool have_crew_mtime_  = false;
+    Gtk::Label   running_;
+
     Gtk::Box            root_{Gtk::Orientation::VERTICAL, 8};
     Gtk::Label          heading_;
     Gtk::ScrolledWindow scroller_;

@@ -1999,6 +1999,22 @@ void test_crew_run_state() {
         fs::remove(path, ec);
         check(!crew_state_path().empty(), "there is always a path to look at");
     }
+
+    // The two files the board window watches. They are DIFFERENT files, and the
+    // difference is the point: the board changing means something landed, the run
+    // changing means the crew is still working. A board that watched only one would
+    // either miss arrivals or be unable to say why it is empty.
+    {
+        check(!board_state_path().empty(), "the board has a file to watch");
+        check(board_state_path() != crew_state_path(),
+              "and it is not the same file as the run state");
+        check_eq(board_state_path().filename(), fs::path("current.json"),
+                 "both are the engine's own current.json");
+        check_eq(board_state_path().parent_path().filename(), fs::path("board"),
+                 "the board's lives under board/");
+        check_eq(crew_state_path().parent_path().filename(), fs::path("crew"),
+                 "and the run's under crew/");
+    }
 }
 
 void test_crew() {
