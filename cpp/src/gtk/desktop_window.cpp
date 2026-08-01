@@ -811,10 +811,27 @@ void DesktopWindow::reconcile() {
             // negative offset would otherwise be misfiled.
             const int centre_x = geometry.x + geometry.width / 2;
             const int centre_y = geometry.y + geometry.height / 2;
-            if (centre_x >= monitor_.x && centre_x < monitor_.x + monitor_.width &&
-                centre_y >= monitor_.y && centre_y < monitor_.y + monitor_.height) {
-                on_this_monitor.push_back(id);
+
+            const bool ours =
+                centre_x >= monitor_.x && centre_x < monitor_.x + monitor_.width &&
+                centre_y >= monitor_.y && centre_y < monitor_.y + monitor_.height;
+
+            // A window that is on NO monitor is stranded, and the canvas is the only
+            // thing that can bring it back. This is not a hypothetical: parking puts
+            // a window below every screen, and if the shell restarts while one is
+            // parked it is off-monitor, so the old test refused to adopt it -- the
+            // window was invisible, unreachable, and reappeared in the adoption plan
+            // on every tick forever, which re-placed the whole canvas once a second
+            // for as long as the session lasted.
+            bool stranded = true;
+            if (const auto bounds = screen_bounds()) {
+                stranded = centre_x < bounds->x || centre_x >= bounds->x + bounds->width ||
+                           centre_y < bounds->y || centre_y >= bounds->y + bounds->height;
+            } else {
+                stranded = false;   // cannot tell; do not claim other people's windows
             }
+
+            if (ours || stranded) on_this_monitor.push_back(id);
         }
         sync.adopt = std::move(on_this_monitor);
     }
@@ -841,7 +858,16 @@ void DesktopWindow::reconcile() {
             // right when the desktop arranges windows and wrong when it does not --
             // and if that slot happened to fall on the next page of canvas, the
             // window was parked off screen the moment it was adopted.
-            if (!auto_fit_) {
+            // Canvas mode keeps a window where it is -- but only if where it is, is
+            // somewhere you can see. A window rescued from off screen has no
+            // position worth preserving, so it gets a slot like any new one.
+            const bool visible_now =
+                found->second.x >= monitor_.x &&
+                found->second.y >= monitor_.y &&
+                found->second.x < monitor_.x + monitor_.width &&
+                found->second.y < monitor_.y + monitor_.height;
+
+            if (!auto_fit_ && visible_now) {
                 const double zoom = canvas_.zoom() > 0 ? canvas_.zoom() : 1.0;
                 CanvasPlacement where;
                 where.x = static_cast<int>((found->second.x - monitor_.x) / zoom) +
