@@ -400,10 +400,6 @@ private:
     Gtk::Box                          speak_box_{Gtk::Orientation::HORIZONTAL, 4};
     Gtk::Image                        speak_icon_;
     Gtk::Label                        speak_label_;
-    Gtk::Button                       dictate_;
-    Gtk::Box                          dictate_box_{Gtk::Orientation::HORIZONTAL, 4};
-    Gtk::Image                        dictate_icon_;
-    Gtk::Label                        dictate_label_;
 
     // Voice to text, as a TOGGLE rather than a press-and-hold.
     //
@@ -431,7 +427,6 @@ private:
     Gtk::Box                          ear_box_{Gtk::Orientation::HORIZONTAL, 4};
     Gtk::Image                        ear_icon_;
     Gtk::Label                        ear_label_;
-    Glib::RefPtr<Gtk::GestureClick>   dictate_gesture_;
 
     // Held so a second click re-presents the existing window rather than stacking
     // duplicates; reset when the window is closed.

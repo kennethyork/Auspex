@@ -1988,21 +1988,68 @@ void test_notifications_and_pins() {
         write(root / "launcher-10" / "1000-1.desktop", "Thunar", "thunar %U");
         write(root / "not-a-launcher" / "1000-1.desktop", "Ignored", "ignored");
 
-        const auto pins = import_xfce_launchers(root);
-        check_eq(pins.size(), std::size_t{2},
-                 "one pin per launcher, not one per file in it");
-        if (pins.size() == 2) {
-            // launcher-10 sorts before launcher-2 as text, which is what the
-            // directory order gives; both are present and that is what matters.
-            const bool has_firefox =
-                pins[0].name == "Firefox" || pins[1].name == "Firefox";
-            const bool has_thunar =
-                pins[0].name == "Thunar" || pins[1].name == "Thunar";
-            check(has_firefox, "Firefox is imported");
-            check(has_thunar, "Thunar is imported");
-            check(pins[0].exec.find('%') == std::string::npos,
-                  "and the field codes are already stripped");
+        // Matching a launcher back to the installed application. This is the whole
+        // difficulty: xfce4-panel writes its OWN copy of the .desktop file, named
+        // after a timestamp, so the id in it resolves against nothing. Found on
+        // Kenny's machine before it cost him anything -- every imported pin would
+        // have silently vanished at exactly the moment xfce4-panel was turned off.
+        {
+            std::vector<DesktopEntry> installed;
+            DesktopEntry real_firefox;
+            real_firefox.name = "Firefox Web Browser";
+            real_firefox.exec = "firefox";
+            real_firefox.id   = "firefox.desktop";
+            installed.push_back(real_firefox);
+
+            DesktopEntry real_thunar;
+            real_thunar.name = "Thunar File Manager";
+            real_thunar.exec = "/usr/bin/thunar";
+            real_thunar.id   = "thunar.desktop";
+            installed.push_back(real_thunar);
+
+            check_eq(exec_program("firefox %u"), std::string("firefox"),
+                     "the program is the first word, without its field codes");
+            check_eq(exec_program("/usr/bin/thunar %U"), std::string("thunar"),
+                     "and without its directory");
+            check_eq(exec_program(""), std::string(""), "nothing has no program");
+
+            // xfce4-panel's copy: a timestamp id, a slightly different name.
+            DesktopEntry copy;
+            copy.name = "Firefox";
+            copy.exec = "firefox %u";
+            copy.id   = "17711108861.desktop";
+            const auto matched = match_installed(copy, installed);
+            check(matched.has_value(), "the panel's copy finds the real application");
+            if (matched) {
+                check_eq(matched->id, std::string("firefox.desktop"),
+                         "and takes the INSTALLED id, which is the one that resolves");
+            }
+
+            // A launcher whose binary was uninstalled matches nothing, and is
+            // dropped rather than becoming a pin that cannot resolve.
+            DesktopEntry gone;
+            gone.name = "Long Gone";
+            gone.exec = "nolongerinstalled";
+            check(!match_installed(gone, installed).has_value(),
+                  "an application that is not installed matches nothing");
+
+            // Falls back to the name when the program differs, which happens when a
+            // launcher was written against an older packaging of the same app.
+            DesktopEntry renamed;
+            renamed.name = "Thunar File Manager";
+            renamed.exec = "some-old-wrapper";
+            const auto by_name = match_installed(renamed, installed);
+            check(by_name.has_value(), "a differing program falls back to the name");
+            if (by_name) {
+                check_eq(by_name->id, std::string("thunar.desktop"), "and resolves");
+            }
         }
+
+        // The import itself needs real installed applications to match against, so
+        // it is exercised here only for the parts that do not depend on the system.
+        const auto pins = import_xfce_launchers(root);
+        check(pins.size() <= 2,
+              "one pin per launcher at most, never one per file in it");
 
         check(import_xfce_launchers(root / "nowhere").empty(),
               "a missing directory imports nothing rather than failing");

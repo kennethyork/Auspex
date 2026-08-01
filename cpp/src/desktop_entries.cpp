@@ -174,6 +174,61 @@ bool entry_matches(const DesktopEntry& entry, std::string_view query) {
 }
 
 
+std::string exec_program(std::string_view exec) {
+    // First token, then basename. An Exec may be an absolute path, and a launcher
+    // written years ago may spell it differently from the installed entry today.
+    std::string first;
+    for (const char c : exec) {
+        if (std::isspace(static_cast<unsigned char>(c))) break;
+        first.push_back(c);
+    }
+    if (const auto slash = first.rfind('/'); slash != std::string::npos) {
+        first = first.substr(slash + 1);
+    }
+    return first;
+}
+
+std::optional<DesktopEntry> match_installed(const DesktopEntry& launcher,
+                                            const std::vector<DesktopEntry>& installed) {
+    // Ordered strongest signal first, and the order is the whole correctness of
+    // this. Matching on the program alone put "Thunar File Manager" onto
+    // thunar-bulk-rename.desktop -- both run the thunar binary, and the wrong one
+    // came first in the list. Found by importing Kenny's real panel and reading the
+    // result rather than by reasoning about it.
+
+    // 1. The visible name, exactly. Two applications can share a binary; they very
+    //    rarely share a display name.
+    if (!launcher.name.empty()) {
+        for (const auto& entry : installed) {
+            if (entry.name == launcher.name) return entry;
+        }
+    }
+
+    const std::string wanted = exec_program(launcher.exec);
+    if (wanted.empty()) return std::nullopt;
+
+    // 2. The whole command, so "thunar" and "thunar --bulk-rename" stay apart.
+    for (const auto& entry : installed) {
+        if (entry.exec == launcher.exec) return entry;
+    }
+
+    // 3. The entry named after the program: thunar -> thunar.desktop. This is what
+    //    distinguishes an application from its own secondary launchers.
+    for (const auto& entry : installed) {
+        const std::string stem = entry.id.size() > 8 ? entry.id.substr(0, entry.id.size() - 8)
+                                                     : entry.id;
+        if (stem == wanted) return entry;
+    }
+
+    // 4. Anything running that program. Weakest, and only reached when nothing
+    //    above matched -- an old launcher against a repackaged application.
+    for (const auto& entry : installed) {
+        if (exec_program(entry.exec) == wanted) return entry;
+    }
+
+    return std::nullopt;
+}
+
 std::filesystem::path xfce_panel_launcher_dir() {
     if (const char* home = std::getenv("HOME"); home && *home) {
         return std::filesystem::path(home) / ".config" / "xfce4" / "panel";
@@ -190,6 +245,9 @@ std::vector<DesktopEntry> import_xfce_launchers(const std::filesystem::path& dir
     // Sorted, because the directory order is arbitrary and the panel's order is
     // launcher-1, launcher-2 ... Sorting by name reproduces it closely enough to be
     // recognisable, which is the whole point of importing.
+    // Loaded once, not per launcher: this is a few hundred files off disk.
+    const auto installed = load_desktop_entries();
+
     std::vector<std::filesystem::path> launchers;
     for (const auto& item : std::filesystem::directory_iterator(dir, ec)) {
         if (!item.is_directory()) continue;
@@ -213,9 +271,14 @@ std::vector<DesktopEntry> import_xfce_launchers(const std::filesystem::path& dir
         std::stringstream buffer;
         buffer << in.rdbuf();
 
-        if (auto entry = parse_desktop_entry(buffer.str(),
-                                             files.front().filename().string())) {
-            pinned.push_back(std::move(*entry));
+        auto entry = parse_desktop_entry(buffer.str(),
+                                         files.front().filename().string());
+        if (!entry) continue;
+
+        // Matched back to the installed application. Without this the pin carries
+        // xfce4-panel's own generated filename, which resolves against nothing.
+        if (auto installed_entry = match_installed(*entry, installed)) {
+            pinned.push_back(std::move(*installed_entry));
         }
     }
 

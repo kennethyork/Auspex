@@ -51,7 +51,30 @@ std::string strip_field_codes(std::string_view exec);
 // changed; xfce4-panel is left exactly as it was.
 std::filesystem::path xfce_panel_launcher_dir();
 
+// Matches a launcher against the installed applications.
+//
+// This is the whole difficulty of importing. xfce4-panel does not reference an
+// installed application: it WRITES ITS OWN copy of the .desktop file, named after a
+// timestamp -- "17711108861.desktop". Storing that as a pin gives an id that
+// resolves against nothing, so the row silently comes back empty, and it comes back
+// empty at exactly the moment xfce4-panel has been turned off and there is nothing
+// to compare against.
+//
+// So the copy is matched back to the real thing: first on the program its Exec
+// runs, compared by basename so /usr/bin/firefox and firefox are the same
+// application, then on the visible name. Returns the INSTALLED entry, whose id does
+// resolve.
+std::optional<DesktopEntry> match_installed(const DesktopEntry& launcher,
+                                            const std::vector<DesktopEntry>& installed);
+
+// The first word of an Exec line, without its directory. "firefox %u" -> "firefox".
+std::string exec_program(std::string_view exec);
+
 // The pinned applications xfce4-panel is configured with, in directory order.
+//
+// Only those that could be matched to an installed application are returned: a pin
+// that cannot resolve is worse than a pin that is missing, because it looks like it
+// worked.
 //
 // Only the FIRST .desktop file in each launcher directory is taken. The others are
 // that launcher's right-click actions -- "Open a New Private Window" and the like --

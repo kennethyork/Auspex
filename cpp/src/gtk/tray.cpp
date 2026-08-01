@@ -907,13 +907,26 @@ void SystemTray::become_host() {
 void SystemTray::try_become_watcher() {
     static const GDBusInterfaceVTable vtable = {
         // Method call.
-        [](GDBusConnection* bus, const gchar*, const gchar*, const gchar*,
+        [](GDBusConnection* bus, const gchar* sender, const gchar*, const gchar*,
            const gchar* method, GVariant* parameters,
            GDBusMethodInvocation* invocation, gpointer user_data) {
             auto* self = static_cast<SystemTray*>(user_data);
             const gchar* service = nullptr;
             g_variant_get(parameters, "(&s)", &service);
-            const std::string name = service != nullptr ? service : "";
+
+            // The argument may be a bus name OR an object path, and when it is a
+            // path the bus name is whoever SENT the call. blueman registers as
+            // "/org/blueman/sni" and says nothing about itself; ignoring the sender
+            // made that a malformed name, so it was dropped and the tray stayed
+            // empty with nothing to say why.
+            //
+            // Found the moment Auspex became the only watcher on the desktop: every
+            // application using the path form -- which is the common one --
+            // registered into nothing.
+            std::string name = service != nullptr ? service : "";
+            if (!name.empty() && name.front() == '/' && sender != nullptr) {
+                name = std::string(sender) + name;
+            }
 
             if (std::string(method) == "RegisterStatusNotifierItem") {
                 self->add_item(name);

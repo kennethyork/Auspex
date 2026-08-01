@@ -1258,24 +1258,15 @@ void Panel::build_bottom() {
         [this] { voice_.submit(VoiceController::Action::AskAloud); });
     button_box_.append(ask_);
 
-    // Press-and-hold dictation: recording lasts exactly as long as the button is
-    // down, restoring the gesture behaviour of widgets/voice.py. A GestureClick is
-    // used rather than signal_clicked because we need press and release separately.
-    dictate_icon_.set_from_icon_name("audio-input-microphone-symbolic");
-    dictate_label_.set_text("Hold");
-    dictate_box_.append(dictate_icon_);
-    dictate_box_.append(dictate_label_);
-    dictate_.set_child(dictate_box_);
-    dictate_gesture_ = Gtk::GestureClick::create();
-    dictate_gesture_->signal_pressed().connect([this](int, double, double) {
-        voice_.press_hold(VoiceController::Action::Dictate);
-    });
-    dictate_gesture_->signal_released().connect([this](int, double, double) {
-        voice_.release_hold();
-    });
-    dictate_.add_controller(dictate_gesture_);
-    dictate_.set_tooltip_text("Hold to dictate into the focused window");
-    button_box_.append(dictate_);
+    // No press-and-hold button. It dictated into the focused window, which is
+    // exactly what the toggle beside it does -- two controls, one behaviour, and
+    // the only difference was whether you held the mouse down for the length of a
+    // sentence. The toggle is the one that survives; holding a button steady while
+    // composing is not something to ask of anyone.
+    //
+    // press_hold/release_hold are untouched: the chat window's Talk button still
+    // uses them, where holding IS the natural gesture because you are already
+    // there and the recording is a moment long.
 
     if (!config_.terminal.empty()) {
         terminal_icon_.set_from_icon_name("utilities-terminal-symbolic");
