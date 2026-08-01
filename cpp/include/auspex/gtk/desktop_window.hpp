@@ -74,6 +74,21 @@ public:
     // asking for the grid and being told it will happen next time a window opens
     // would be a control that appears not to work.
     void set_grid_mode(bool grid);
+
+    // Zoom keeping the canvas point under (px, py) fixed.
+    //
+    // This is what makes a wheel feel like a canvas rather than a slider: the thing
+    // you are pointing at is the thing that stays still. The panel's buttons and
+    // the keyboard deliberately do NOT use it -- an explicit control should do the
+    // same thing wherever the mouse happens to be resting.
+    void zoom_at(double factor, double px, double py);
+
+    // Frames everything that is open WITHOUT moving any of it.
+    //
+    // Distinct from fit_all(), which rearranges windows into a grid. This only
+    // changes where you are looking and how far away, which is the only kind of
+    // "fit" that means anything in canvas mode.
+    void fit_view();
     bool grid_mode() const { return auto_fit_; }
 
     // Restores a task-list window and makes sure it rejoins the visible layout
@@ -206,13 +221,33 @@ private:
     // does the desktop arrange windows, or do you.
     bool      auto_fit_ = true;
 
-    // The canvas layout as it was when grid mode was switched on.
+    // One remembered layout per mode.
     //
-    // Grid mode re-lays every window, which throws away placement the user arranged
-    // by hand. Without this, flipping to Grid and back leaves the grid's own layout
-    // behind and the arrangement is simply gone -- so the switch would only be safe
-    // to press if you did not care where anything was.
+    // Each mode gives back what YOU left in it. Grid is not simply re-fitted on
+    // return, because a fit throws away any window you moved or resized while you
+    // were in grid mode -- the grid decides the starting arrangement, not the
+    // permanent one. Canvas obviously has to be remembered, since its whole point
+    // is placement chosen by hand.
+    //
+    // Empty means "never been in that mode": grid then fits for the first time, and
+    // canvas leaves everything exactly where it is.
     std::map<std::string, CanvasPlacement> canvas_layout_;
+    std::map<std::string, CanvasPlacement> grid_layout_;
+
+    // Where the pointer last was over the canvas, for pointer-anchored zoom. A
+    // scroll event does not carry a position, so it has to be remembered.
+    double last_pointer_x_ = 0;
+    double last_pointer_y_ = 0;
+
+    // The minimap's on-screen rectangle and the canvas region it covers, recorded
+    // while drawing so a click on it can be turned back into a place to go.
+    //
+    // mutable because draw_minimap is const: it is a drawing routine and should
+    // stay one. What it records here is a note of where it put things, not a change
+    // to what the desktop is.
+    mutable double minimap_x_ = 0, minimap_y_ = 0, minimap_w_ = 0, minimap_h_ = 0;
+    mutable double minimap_scale_ = 1.0;
+    mutable int    minimap_min_x_ = 0, minimap_min_y_ = 0;
     FitLayout last_fit_{};
 
     sigc::slot<void(const Rect&)> on_monitor_changed_;

@@ -9,6 +9,8 @@
 #include <gdkmm/general.h>
 #include <glibmm/main.h>
 #include <gtkmm/eventcontrollerkey.h>
+#include <gtkmm/eventcontrollermotion.h>
+#include <gtkmm/gestureclick.h>
 #include <gtkmm/eventcontrollerscroll.h>
 #include <gtkmm/gesturedrag.h>
 
@@ -186,24 +188,79 @@ void DesktopWindow::install_gestures() {
     });
     area_.add_controller(drag);
 
+    // The pointer's position, remembered. A scroll event carries a direction but
+    // not a place, and zooming toward the pointer needs the place.
+    {
+        auto motion = Gtk::EventControllerMotion::create();
+        motion->signal_motion().connect([this](double x, double y) {
+            last_pointer_x_ = x;
+            last_pointer_y_ = y;
+        });
+        area_.add_controller(motion);
+    }
+
     auto scroll = Gtk::EventControllerScroll::create();
     scroll->set_flags(Gtk::EventControllerScroll::Flags::BOTH_AXES);
     scroll->signal_scroll().connect(
         [this, scroll](double dx, double dy) {
+            const auto state = scroll->get_current_event_state();
+
             // Ctrl+scroll zooms, plain scroll pans -- the convention every map and
             // drawing program uses, so it needs no explaining.
-            if ((scroll->get_current_event_state() & Gdk::ModifierType::CONTROL_MASK) ==
+            if ((state & Gdk::ModifierType::CONTROL_MASK) ==
                 Gdk::ModifierType::CONTROL_MASK) {
-                zoom_by(dy < 0 ? 1.15 : 1.0 / 1.15);
+                zoom_at(dy < 0 ? 1.15 : 1.0 / 1.15, last_pointer_x_, last_pointer_y_);
                 return true;
             }
+
             const int step_x = static_cast<int>(monitor_.width * kStepFraction);
             const int step_y = static_cast<int>(monitor_.height * kStepFraction);
+
+            // Shift turns a wheel sideways. A plain mouse only reports a vertical
+            // axis, so without this half the canvas is unreachable by wheel.
+            if ((state & Gdk::ModifierType::SHIFT_MASK) == Gdk::ModifierType::SHIFT_MASK) {
+                pan_by(static_cast<int>((dy != 0 ? dy : dx) * step_x), 0);
+                return true;
+            }
+
             pan_by(static_cast<int>(dx * step_x), static_cast<int>(dy * step_y));
             return true;
         },
         /*after=*/false);
     area_.add_controller(scroll);
+
+    // A click on the minimap goes there. On a plane bigger than the screen, a map
+    // you can only read is half a map.
+    {
+        auto click = Gtk::GestureClick::create();
+        click->set_button(GDK_BUTTON_PRIMARY);
+        Gtk::GestureClick* raw = click.get();
+        click->signal_pressed().connect([this, raw](int, double x, double y) {
+            if (minimap_w_ <= 0 || minimap_scale_ <= 0) return;
+            if (x < minimap_x_ || x > minimap_x_ + minimap_w_) return;
+            if (y < minimap_y_ || y > minimap_y_ + minimap_h_) return;
+
+            // Back through the same mapping the drawing used, then centred: you
+            // clicked a place, not a corner.
+            const double cx = minimap_min_x_ + (x - minimap_x_ - 8) / minimap_scale_;
+            const double cy = minimap_min_y_ + (y - minimap_y_ - 8) / minimap_scale_;
+
+            const double zoom = canvas_.zoom() > 0 ? canvas_.zoom() : 1.0;
+            Viewport v = canvas_.viewport();
+            v.x = static_cast<int>(std::lround(cx - monitor_.width  / (2.0 * zoom)));
+            v.y = static_cast<int>(std::lround(cy - monitor_.height / (2.0 * zoom)));
+            canvas_.set_viewport(v);
+
+            // Claimed, so the drag gesture does not also read this as the start of
+            // a pan and slide the canvas back out from under the jump.
+            raw->set_state(Gtk::EventSequenceState::CLAIMED);
+
+            needs_redraw_ = true;
+            area_.queue_draw();
+            apply_now();
+        });
+        area_.add_controller(click);
+    }
 
     auto keys = Gtk::EventControllerKey::create();
     keys->signal_key_pressed().connect(
@@ -216,8 +273,11 @@ void DesktopWindow::install_gestures() {
                 case GDK_KEY_Up:    pan_by(0, -step_y); return true;
                 case GDK_KEY_Down:  pan_by(0, step_y);  return true;
                 case GDK_KEY_Home:  go_home();          return true;
+                // Frames what is open without moving it. Re-tiling on a keypress
+                // would rearrange the desktop when all that was asked for was to
+                // see it.
                 case GDK_KEY_f:
-                case GDK_KEY_F:     fit_all();          return true;
+                case GDK_KEY_F:     fit_view();         return true;
                 case GDK_KEY_plus:
                 case GDK_KEY_equal:
                 case GDK_KEY_KP_Add:      zoom_by(1.15);  return true;
@@ -275,28 +335,24 @@ void DesktopWindow::fit_all() {
 void DesktopWindow::set_grid_mode(bool grid) {
     if (auto_fit_ == grid) return;
 
-    if (grid) {
-        // Remember the arrangement before the grid overwrites it.
-        canvas_layout_.clear();
-        for (const auto& id : canvas_.managed_ids()) {
-            if (auto placement = canvas_.placement_of(id)) {
-                canvas_layout_[id] = *placement;
-            }
-        }
-        auto_fit_ = true;
-        fit_all();
-        return;
+    // Save the mode being left, always. Whichever way you are going, what is on the
+    // screen now is what that mode should give back next time.
+    auto& leaving = auto_fit_ ? grid_layout_ : canvas_layout_;
+    leaving.clear();
+    for (const auto& id : canvas_.managed_ids()) {
+        if (auto placement = canvas_.placement_of(id)) leaving[id] = *placement;
     }
 
-    auto_fit_ = false;
+    auto_fit_ = grid;
 
-    // Put back what was there. Only for windows that still exist -- anything opened
-    // while the grid was on keeps the place the grid gave it, because there is no
-    // earlier position for it to go back to.
+    // Restore the mode being entered. Only windows that still exist -- anything
+    // opened since keeps where it is, because it has no earlier position to return
+    // to.
+    const auto& entering = grid ? grid_layout_ : canvas_layout_;
     bool restored = false;
     for (const auto& id : canvas_.managed_ids()) {
-        const auto found = canvas_layout_.find(id);
-        if (found == canvas_layout_.end()) continue;
+        const auto found = entering.find(id);
+        if (found == entering.end()) continue;
         canvas_.place(id, found->second);
         restored = true;
     }
@@ -306,7 +362,12 @@ void DesktopWindow::set_grid_mode(bool grid) {
         apply_positions(last_positions_, monitor_, screen());
         needs_redraw_ = true;
         area_.queue_draw();
+        return;
     }
+
+    // Nothing to restore. Grid lays out for the first time; canvas leaves the screen
+    // alone, which is the whole of what canvas mode promises.
+    if (grid) fit_all();
 }
 
 void DesktopWindow::set_panel_height(PanelPosition position, int height) {
@@ -409,6 +470,57 @@ void DesktopWindow::zoom_by(double factor) {
     // using it here left the real windows stuck at the previous smaller size.
     last_positions_ = canvas_.resolve(/*include_life_size=*/true);
     apply_positions(last_positions_, monitor_, screen());
+}
+
+void DesktopWindow::zoom_at(double factor, double px, double py) {
+    const double before = canvas_.zoom();
+    const Viewport v    = canvas_.viewport();
+
+    // The canvas point currently under the pointer. Held fixed across the zoom,
+    // which is the whole of what "zoom toward the pointer" means.
+    const double cx = v.x + px / before;
+    const double cy = v.y + py / before;
+
+    if (!canvas_.zoom_by(factor)) return;   // clamped; nothing moved
+
+    const double after = canvas_.zoom();
+    Viewport next = canvas_.viewport();
+    next.x = static_cast<int>(std::lround(cx - px / after));
+    next.y = static_cast<int>(std::lround(cy - py / after));
+    canvas_.set_viewport(next);
+
+    last_positions_ = canvas_.resolve(/*include_life_size=*/true);
+    apply_positions(last_positions_, monitor_, screen());
+    needs_redraw_ = true;
+    area_.queue_draw();
+}
+
+void DesktopWindow::fit_view() {
+    const auto content = canvas_.content_bounds(tile_width_, tile_height_);
+    if (!content || content->width <= 0 || content->height <= 0) return;
+
+    // A margin, so the outermost window is not flush against the screen edge with
+    // no space to show it is the outermost one.
+    constexpr double kMargin = 0.92;
+    const double fit_x = (monitor_.width  * kMargin) / content->width;
+    const double fit_y = (monitor_.height * kMargin) / content->height;
+    const double want  = std::min(fit_x, fit_y);
+
+    // set_zoom clamps, so the viewport is computed from what the zoom ACTUALLY
+    // became rather than from what was asked for -- otherwise everything is framed
+    // for a magnification the canvas refused.
+    canvas_.set_zoom(want);
+    const double zoom = canvas_.zoom() > 0 ? canvas_.zoom() : 1.0;
+
+    Viewport v = canvas_.viewport();
+    v.x = content->x - static_cast<int>((monitor_.width  / zoom - content->width) / 2);
+    v.y = content->y - static_cast<int>((monitor_.height / zoom - content->height) / 2);
+    canvas_.set_viewport(v);
+
+    last_positions_ = canvas_.resolve(/*include_life_size=*/true);
+    apply_positions(last_positions_, monitor_, screen());
+    needs_redraw_ = true;
+    area_.queue_draw();
 }
 
 void DesktopWindow::reset_zoom() {
@@ -938,6 +1050,14 @@ void DesktopWindow::draw_minimap(const Cairo::RefPtr<Cairo::Context>& cr, int wi
     const double box_x = width - kMinimapWidth - kMinimapMargin;
     const double box_y = height - kMinimapHeight - kMinimapMargin - 40;
 
+    // Remembered so a click on the map can be turned back into a place to go. Kept
+    // here rather than recomputed in the click handler because the two would then
+    // be two descriptions of the same rectangle, free to disagree.
+    minimap_x_ = box_x;
+    minimap_y_ = box_y;
+    minimap_w_ = kMinimapWidth;
+    minimap_h_ = kMinimapHeight;
+
     set_rgb(cr, parse_hex(palette.entry_bg), 0.85);
     cr->rectangle(box_x, box_y, kMinimapWidth, kMinimapHeight);
     cr->fill();
@@ -948,6 +1068,10 @@ void DesktopWindow::draw_minimap(const Cairo::RefPtr<Cairo::Context>& cr, int wi
 
     const double scale = std::min((kMinimapWidth - 16) / span_x,
                                   (kMinimapHeight - 16) / span_y);
+    minimap_scale_ = scale;
+    minimap_min_x_ = min_x;
+    minimap_min_y_ = min_y;
+
     const auto to_map = [&](double cx, double cy) {
         return std::pair{box_x + 8 + (cx - min_x) * scale,
                          box_y + 8 + (cy - min_y) * scale};
