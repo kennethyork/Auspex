@@ -20,6 +20,7 @@
 #include "auspex/projects.hpp"
 #include "auspex/roles.hpp"
 #include "auspex/router.hpp"
+#include "auspex/symbols.hpp"
 #include "auspex/verify.hpp"
 #include "auspex/json_util.hpp"
 
@@ -1219,6 +1220,18 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
     }
 
     std::string hint = relevant_files_note(config, options.project, options.task);
+
+    // Where the names in the task are actually DEFINED.
+    //
+    // relevant_files_note above is cosine distance over embedded line windows: it
+    // answers "what reads like this", which is the right tool for "where is the
+    // retry logic" and the wrong one for "where is parse_plan". This answers the
+    // second question exactly, needs no embedding model and no index, and is the
+    // difference between a coder opening the right file first and hunting.
+    if (const std::string names = symbols_note(options.project, options.task);
+        !names.empty()) {
+        hint += names + "\n";
+    }
     if (!hint.empty()) note("research: the index suggests where to look");
 
     // The Researcher. A read-only pass that reports what the index cannot: the

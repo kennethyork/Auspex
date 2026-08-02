@@ -138,6 +138,10 @@ const std::vector<std::string>& sandbox_excludes() {
         kBaselineFile,
         // Dependencies somebody else installed.
         "node_modules", "vendor", "third_party", "Pods", ".bundle",
+        // CMake FetchContent puts fetched projects here. It is somebody else's
+        // source, it is large, and a symbol search that includes it answers "where
+        // is update()" with a file in a vendored LLM runtime.
+        "_deps",
         // BUILD OUTPUT. Measured on a real Qt project: build 47M, .build 146M,
         // dist 106M -- three hundred megabytes that would be copied into every
         // coder's sandbox and re-read on every turn, to find nothing a coder

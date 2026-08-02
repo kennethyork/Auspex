@@ -44,6 +44,7 @@
 #include "auspex/linters.hpp"
 #include "auspex/roles.hpp"
 #include "auspex/usage.hpp"
+#include "auspex/symbols.hpp"
 #include "auspex/verify.hpp"
 #include "auspex/panel_dock.hpp"
 #include "auspex/process.hpp"
@@ -7109,6 +7110,174 @@ void test_starter_skills() {
 }
 
 // ---------------------------------------------------------------------------
+// Symbols
+//
+// Rules shaped like regexes rot silently, so every language is pinned against
+// text here rather than against whatever happens to be on disk.
+// ---------------------------------------------------------------------------
+void test_symbols() {
+    using namespace auspex;
+    std::cout << "\nsymbols\n";
+
+    // ---- Python ----
+    {
+        const auto found = symbols_in("calc.py",
+                                      "LIMIT = 47\n"
+                                      "\n"
+                                      "class Cart:\n"
+                                      "    def add(self, item):\n"
+                                      "        total = 1\n"
+                                      "        return item\n"
+                                      "\n"
+                                      "async def fetch(url):\n"
+                                      "    pass\n");
+        const auto named = [&](const std::string& n) {
+            return std::find_if(found.begin(), found.end(), [&](const Symbol& s) {
+                       return s.name == n;
+                   }) != found.end();
+        };
+        check(named("Cart"), "a class");
+        check(named("add"), "a method");
+        check(named("fetch"), "an async function");
+        check(named("LIMIT"), "a module-level constant");
+        check(!named("total"),
+              "but not a local -- it is not somewhere anyone can be sent");
+    }
+
+    // ---- C++ ----
+    {
+        const auto found = symbols_in("thing.cpp",
+                                      "struct Point {\n"
+                                      "    int x;\n"
+                                      "};\n"
+                                      "\n"
+                                      "int add(int a, int b) {\n"
+                                      "    if (a > b) {\n"
+                                      "        return a;\n"
+                                      "    }\n"
+                                      "    return b;\n"
+                                      "}\n");
+        const auto named = [&](const std::string& n) {
+            return std::find_if(found.begin(), found.end(), [&](const Symbol& s) {
+                       return s.name == n;
+                   }) != found.end();
+        };
+        check(named("Point"), "a struct");
+        check(named("add"), "a function definition");
+        check(!named("if"),
+              "and `if (a > b) {` is not a function called if -- the keyword list "
+              "is what stops every control-flow line becoming a symbol");
+    }
+
+    // ---- a signature that wraps ----
+    //
+    // Found on this repository: safe_join() came back "not found" because its
+    // parameters run onto a second line, which is the house style here and in
+    // most C++. An index that silently misses things is worse than none.
+    {
+        const auto found = symbols_in(
+            "sandbox.cpp",
+            "std::optional<std::filesystem::path> safe_join(const std::filesystem::path& base,\n"
+            "                                               const std::string& relative) {\n"
+            "    return {};\n"
+            "}\n");
+        check(!found.empty(), "a wrapped signature is still found");
+        if (!found.empty()) {
+            check_eq(found[0].name, std::string("safe_join"), "by its real name");
+            check_eq(found[0].line, 1,
+                     "reported at the FIRST line, which is where a person looks");
+        }
+    }
+
+    // ---- a declaration is not a definition ----
+    {
+        const auto header = symbols_in("thing.hpp", "int add(int a, int b);\n");
+        const auto has_add =
+            std::any_of(header.begin(), header.end(),
+                        [](const Symbol& s) { return s.name == "add"; });
+        check(!has_add,
+              "a prototype is not reported -- sending a coder to the header to "
+              "change behaviour is a wrong answer, not a partial one");
+    }
+
+    // ---- the other languages ----
+    {
+        const auto go = symbols_in("x.go",
+                                   "func Handle(w http.ResponseWriter) {}\n"
+                                   "type Server struct {\n}\n"
+                                   "func (s *Server) Start() error { return nil }\n");
+        check(go.size() >= 3, "Go functions, methods and types");
+
+        const auto rust = symbols_in("x.rs",
+                                     "pub fn parse(s: &str) -> Result<(), ()> {\n}\n"
+                                     "pub struct Config {\n}\n");
+        check(rust.size() >= 2, "Rust functions and structs");
+
+        const auto js = symbols_in("x.js",
+                                   "export function go(a) {}\n"
+                                   "const run = async (x) => {};\n"
+                                   "class Thing {}\n");
+        check(js.size() >= 3, "JS functions, arrow consts and classes");
+    }
+
+    // ---- commented-out code is not a definition ----
+    {
+        const auto found = symbols_in("x.py", "# def old_thing():\n#     pass\n");
+        check(found.empty(),
+              "a commented-out definition is not one -- it is the commonest false "
+              "positive there is");
+    }
+
+    // ---- languages with no rules say nothing ----
+    {
+        check(!has_symbol_rules("notes.txt"), "no rules for prose");
+        check(symbols_in("notes.txt", "def not_really():\n").empty(),
+              "and nothing is reported for it, rather than a guess");
+    }
+
+    // ---- what a task is searched for ----
+    {
+        const auto names = candidate_names("fix the parse_plan function in director");
+        check(std::find(names.begin(), names.end(), "parse_plan") != names.end(),
+              "an identifier in the task is a candidate");
+        check(std::find(names.begin(), names.end(), "the") == names.end(),
+              "and ordinary English is not");
+        check(std::find(names.begin(), names.end(), "function") == names.end(),
+              "including words that are identifier-shaped but always noise");
+
+        // The asymmetry that decides this list: a false lead is a wrong file
+        // opened, a missed lead costs one `list` call.
+        const auto verbs = candidate_names("and update parse_plan, then rename it");
+        check(std::find(verbs.begin(), verbs.end(), "update") == verbs.end(),
+              "a verb in a task sentence is not a symbol to go looking for");
+        check(std::find(verbs.begin(), verbs.end(), "rename") == verbs.end(),
+              "even when some project somewhere defines a function of that name");
+        check(std::find(verbs.begin(), verbs.end(), "parse_plan") != verbs.end(),
+              "while the actual name survives");
+        if (names.size() > 1) {
+            check(names[0].size() >= names[1].size(),
+                  "longest first, so a cap drops the vague names");
+        }
+    }
+
+    // ---- end to end, on this repository ----
+    {
+        const std::filesystem::path root = "/home/kennethhy/Documents/Auspex";
+        std::error_code ec;
+        if (std::filesystem::is_directory(root, ec)) {
+            const auto found = find_symbol(root, "classify_difficulty");
+            check(!found.empty(), "a real function in this project is found");
+            if (!found.empty()) {
+                check(found[0].path.find("router") != std::string::npos,
+                      "in the file it actually lives in");
+            }
+            check(find_symbol(root, "definitely_not_a_real_symbol_here").empty(),
+                  "and a name that does not exist is not invented");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Verify
 //
 // Detection is pure -- a list of filenames in, a command out -- so the rules can
@@ -8777,6 +8946,36 @@ int main(int argc, char** argv) {
     }
 
     // What the configured hooks are, and where they are read from.
+    // Where a name is defined, and what mentions it. No model, no index.
+    if (args.size() >= 2 && args[0] == "--where") {
+        const std::filesystem::path root =
+            args.size() >= 3 ? std::filesystem::path(args[2])
+                             : std::filesystem::current_path();
+        const auto exact = auspex::find_symbol(root, args[1]);
+        if (exact.empty()) {
+            std::cout << "no definition of " << args[1] << "\n";
+            for (const auto& s : auspex::find_symbols_like(root, args[1], 10)) {
+                std::cout << "  did you mean " << s.name << "?  " << s.path << ":"
+                          << s.line << "\n";
+            }
+            return 1;
+        }
+        for (const auto& s : exact) {
+            std::cout << "  " << s.path << ":" << s.line << "  ("
+                      << auspex::symbol_kind_name(s.kind) << ")  " << s.signature
+                      << "\n";
+        }
+        const auto uses = auspex::find_references(root, args[1], 20);
+        if (!uses.empty()) {
+            std::cout << "\nmentioned in:\n";
+            for (const auto& r : uses) {
+                std::cout << "  " << r.path << ":" << r.line << "  "
+                          << r.text.substr(0, 76) << "\n";
+            }
+        }
+        return 0;
+    }
+
     if (!args.empty() && args[0] == "--hooks") {
         std::cout << "hooks from " << auspex::hooks_path().string() << "\n";
         std::cout << auspex::render_hooks(auspex::load_hooks());
@@ -9143,6 +9342,7 @@ int main(int argc, char** argv) {
     test_mcp();
     test_roles();
     test_starter_skills();
+    test_symbols();
     test_verify();
     test_usage();
     test_linters();

@@ -244,6 +244,7 @@ add_library(auspex-core STATIC
     src/auditor.cpp
     src/crew_run.cpp
     src/code_index.cpp
+    src/symbols.cpp
     src/skills.cpp
     src/project_starters.cpp
     src/mcp.cpp
