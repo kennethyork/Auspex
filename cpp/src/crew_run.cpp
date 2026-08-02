@@ -18,6 +18,7 @@
 #include "auspex/ollama_client.hpp"
 #include "auspex/skills.hpp"
 #include "auspex/projects.hpp"
+#include "auspex/roles.hpp"
 #include "auspex/router.hpp"
 
 using json = nlohmann::json;
@@ -1089,7 +1090,30 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     // Discovered once for the run, not per coder: the set does not change while a
     // crew works, and re-walking two directories on every turn would be waste.
     SkillSet skills;
-    skills.skills  = all_skills(options.project);
+    skills.skills = all_skills(options.project);
+
+    // The shipped starters, matched against what this run was actually asked to
+    // do. Skills used to help only if you had already written some, which meant
+    // the feature did nothing on a fresh install -- and the coders that need
+    // instruction most are the small local ones whose owners have not yet written
+    // a house style document.
+    //
+    // Written into the PROJECT's .auspex/skills, so they persist and can be
+    // edited: a starter you disagree with should be changeable, and the next run
+    // will leave your version alone. Anything you already had wins outright.
+    if (options.starter_skills) {
+        const auto matched = skills_for_focus(options.task);
+        const auto written =
+            materialize_skills(matched, options.project, skills.skills);
+        if (!written.empty()) {
+            // Re-read, so the ones just written are discovered exactly like any
+            // other project skill rather than by a second code path.
+            skills.skills = all_skills(options.project);
+            note("research: matched " + std::to_string(written.size()) +
+                 " starter skill(s) to this task");
+        }
+    }
+
     skills.catalog = skills_catalog(skills.skills);
     if (!skills.empty()) {
         note("research: " + std::to_string(skills.skills.size()) + " skill(s) available");
@@ -1237,8 +1261,16 @@ RunResult run_crew(const Config& config, const RunOptions& options,
                         attempt.subtask.title + " " + attempt.subtask.detail);
                     coder_model = route_model(config, coder_model, how.tier);
                 }
+                // A read-only role is REFUSED, not asked. run_tool() turns down
+                // every writing verb, so a reviewer that decides to edit something
+                // is told no rather than trusted -- which is what ollamadev cannot
+                // do, because its permission mode is process-global and coders run
+                // concurrently. Auspex's limits are per coder, so it can.
+                CoderLimits limits = options.coder;
+                if (role_is_read_only(attempt.subtask.role)) limits.read_only = true;
+
                 attempt.outcome = run_coder(config, attempt.subtask, sandbox,
-                                            options.coder, coder_model,
+                                            limits, coder_model,
                                             steer_mailbox(result.run_id,
                                                           attempt.subtask.n),
                                             skills, mcp);

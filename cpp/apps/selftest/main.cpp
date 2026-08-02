@@ -41,6 +41,7 @@
 #include "auspex/eval.hpp"
 #include "auspex/hooks.hpp"
 #include "auspex/linters.hpp"
+#include "auspex/roles.hpp"
 #include "auspex/usage.hpp"
 #include "auspex/panel_dock.hpp"
 #include "auspex/process.hpp"
@@ -6403,6 +6404,313 @@ void test_code_index() {
 }
 
 // ---------------------------------------------------------------------------
+// Role personas
+//
+// Until these existed the Director's role choice changed exactly one word of the
+// coder's prompt. These check that the choice now means something, and that the
+// read-only role is a refusal rather than a request.
+// ---------------------------------------------------------------------------
+void test_roles() {
+    using namespace auspex;
+    std::cout << "\nrole personas\n";
+
+    // ---- there is one for every role the Director may name ----
+    //
+    // A persona for a role the Director cannot name would never be used; a role
+    // with no persona is silently a label again. Both are caught here.
+    {
+        const auto personas = builtin_personas();
+        for (const auto& role : director_roles()) {
+            const auto found =
+                std::find_if(personas.begin(), personas.end(),
+                             [&](const RolePersona& p) { return p.name == role; });
+            check(found != personas.end(), "there is a persona for " + role);
+            if (found != personas.end()) {
+                check(!found->prompt.empty(), "and it says something: " + role);
+                check(!found->description.empty(),
+                      "and the Director is told what it means: " + role);
+            }
+        }
+        check_eq(personas.size(), director_roles().size(),
+                 "and no persona for a role the Director cannot choose");
+    }
+
+    // ---- the reviewer may not write ----
+    {
+        check(role_is_read_only("reviewer", {}), "the reviewer is read-only");
+        check(!role_is_read_only("coder", {}), "the coder is not");
+        check(!role_is_read_only("tester", {}), "nor is the tester");
+    }
+
+    // ---- read-only is ENFORCED, not requested ----
+    //
+    // The thing ollamadev cannot do: its permission mode is process-global and
+    // crew coders run concurrently, so its reviewer is asked not to write. Auspex
+    // limits are per coder, so the tool refuses.
+    {
+        std::error_code ec;
+        const std::filesystem::path root = "/tmp/auspex-readonly-role";
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+
+        CoderLimits limits;
+        limits.read_only = role_is_read_only("reviewer", {});
+
+        ToolCall write;
+        write.tool = CoderTool::Write;
+        write.path = "notes.txt";
+        write.contents = "hello";
+
+        const ToolResult refused = run_tool(write, root, limits);
+        check(!refused.ok, "a reviewer's write is refused");
+        check(!std::filesystem::exists(root / "notes.txt"),
+              "and nothing is written -- the refusal is in the tool, not the prompt");
+
+        ToolCall listing;
+        listing.tool = CoderTool::List;
+        check(run_tool(listing, root, limits).ok,
+              "while reading still works, which is the whole job");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- an invented role does not strand a subtask ----
+    {
+        check_eq(persona_for("not-a-real-role", {}).name, std::string("coder"),
+                 "an unknown role falls back to coder");
+        check_eq(persona_for("", {}).name, std::string("coder"),
+                 "and so does no role at all");
+        check_eq(persona_for("REVIEWER", {}).name, std::string("reviewer"),
+                 "the name is matched case-insensitively");
+    }
+
+    // ---- the persona reaches the prompt ----
+    {
+        PlannedSubtask tester;
+        tester.title = "Add tests for the parser";
+        tester.role = "tester";
+        const std::string prompt = coder_prompt(tester, {}, {}, {});
+        check(prompt.find("AUTOMATED TESTS") != std::string::npos,
+              "a tester is told to write tests");
+        check(prompt.find("production code") != std::string::npos,
+              "and told what not to touch");
+
+        PlannedSubtask refactorer;
+        refactorer.title = "Tidy the parser";
+        refactorer.role = "refactor";
+        const std::string other = coder_prompt(refactorer, {}, {}, {});
+        check(other.find("observable behaviour") != std::string::npos,
+              "and a refactorer is told behaviour must not change");
+        check(other != prompt,
+              "-- two roles genuinely produce different prompts, which is the "
+              "whole point");
+    }
+
+    // ---- user overrides ----
+    {
+        const auto parsed = parse_persona(
+            R"({"name":"tester","prompt":"Use only property-based tests."})", "tester");
+        check(parsed.has_value(), "a role file parses");
+        check_eq(parsed->name, std::string("tester"), "with its name");
+        check(parsed->custom, "and is marked as not built-in");
+
+        // The merge rule that matters: a file setting only the prompt must not
+        // silently turn a read-only role into a writing one.
+        RolePersona reviewer = persona_for("reviewer", {});
+        check(reviewer.read_only, "the built-in reviewer is read-only");
+
+        const auto prompt_only =
+            parse_persona(R"({"name":"reviewer","prompt":"Look harder."})", "reviewer");
+        check(prompt_only.has_value(), "a prompt-only override parses");
+        check(!prompt_only->permission_stated,
+              "and records that it said nothing about permission");
+        check(merge_persona(reviewer, *prompt_only).read_only,
+              "so merging it keeps the built-in's read-only setting -- a permission "
+              "must never change by omission");
+        check_eq(merge_persona(reviewer, *prompt_only).prompt,
+                 std::string("Look harder."), "while the prompt IS replaced");
+
+        const auto explicit_write = parse_persona(
+            R"({"name":"reviewer","permission":"write"})", "reviewer");
+        check(explicit_write.has_value(), "an explicit permission parses");
+        check(explicit_write->permission_stated, "and is recorded as stated");
+        check(!merge_persona(reviewer, *explicit_write).read_only,
+              "and is honoured -- saying so is how you change it");
+
+        check(!parse_persona("not json", "x").has_value(), "unreadable JSON yields none");
+        check(!parse_persona(R"({"prompt":"x"})", "").has_value(),
+              "and a role with no name at all is not a role");
+
+        // The same rule through the real disk path, not just through merge_persona.
+        std::error_code ec;
+        const std::filesystem::path dir = "/tmp/auspex-role-overrides";
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+        {
+            std::ofstream out(dir / "reviewer.json");
+            out << R"({"name":"reviewer","prompt":"Look harder."})";
+        }
+        check(role_is_read_only("reviewer", dir),
+              "a prompt-only role file on disk leaves the reviewer read-only");
+        check_eq(persona_for("reviewer", dir).prompt, std::string("Look harder."),
+                 "with the new prompt in place");
+        check_eq(persona_for("reviewer", dir).description,
+                 persona_for("reviewer", {}).description,
+                 "and the description it did not mention kept");
+
+        {
+            std::ofstream out(dir / "auditor-helper.json");
+            out << R"({"name":"auditor-helper","description":"mine",)"
+                   R"("prompt":"Check twice.","permission":"readonly"})";
+        }
+        const auto with_new = all_personas(dir);
+        const bool added = std::any_of(
+            with_new.begin(), with_new.end(),
+            [](const RolePersona& p) { return p.name == "auditor-helper"; });
+        check(added, "a role file with a new name adds a role");
+
+        std::filesystem::remove_all(dir, ec);
+    }
+
+    // ---- the Director is told what the roles mean ----
+    {
+        const std::string catalog = role_catalog(builtin_personas());
+        check(catalog.find("reviewer") != std::string::npos, "the catalogue lists roles");
+        check(catalog.find("never edits") != std::string::npos,
+              "and marks the one that cannot write -- 'reviewer' reads like a coder "
+              "otherwise");
+
+        const std::string prompt = director_prompt("do a thing", {}, 4);
+        check(prompt.find("never edits") != std::string::npos,
+              "and the Director's prompt carries it");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The starter skill library
+// ---------------------------------------------------------------------------
+void test_starter_skills() {
+    using namespace auspex;
+    std::cout << "\nstarter skills\n";
+
+    // ---- the library ----
+    {
+        const auto& library = starter_skills();
+        check(library.size() >= 10, "there is a library");
+        for (const auto& spec : library) {
+            check(!spec.name.empty(), "every starter is named");
+            check(!spec.description.empty(), "and described: " + spec.name);
+            check(!spec.body.empty(), "and says something: " + spec.name);
+            check(!spec.triggers.empty(), "and can be matched: " + spec.name);
+            for (const auto& trigger : spec.triggers) {
+                // Matched against a lowercased focus, so an upper-case letter here
+                // is a trigger that can never fire.
+                std::string lower = trigger;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) {
+                                   return static_cast<char>(std::tolower(c));
+                               });
+                check(trigger == lower,
+                      "triggers are lowercase, or they could never match: " + trigger);
+            }
+        }
+    }
+
+    // ---- matching ----
+    {
+        const auto sql = skills_for_focus("fix the SQL injection in the user query");
+        check(!sql.empty(), "a task about SQL matches something");
+        const bool has_sql =
+            std::any_of(sql.begin(), sql.end(),
+                        [](const SkillSpec& s) { return s.name == "sql-and-data"; });
+        check(has_sql, "and it is the SQL skill");
+
+        const auto tests = skills_for_focus("add unit tests for the parser");
+        const bool has_testing =
+            std::any_of(tests.begin(), tests.end(),
+                        [](const SkillSpec& s) { return s.name == "testing"; });
+        check(has_testing, "a task about tests matches the testing skill");
+
+        check(skills_for_focus("").empty(), "an empty focus matches nothing");
+        check(skills_for_focus("rename a variable", 0).empty(),
+              "and a cap of zero matches nothing -- silence, not everything");
+    }
+
+    // ---- the specific match beats the vague one ----
+    //
+    // The reason score is trigger LENGTH. "api" occurs in a great many tasks;
+    // "screen reader" occurs in one kind. When the cap bites, the vague match is
+    // the one that should go.
+    {
+        const auto matched =
+            skills_for_focus("make the api page work with a screen reader", 1);
+        check_eq(matched.size(), std::size_t{1}, "the cap is respected");
+        if (!matched.empty()) {
+            check_eq(matched[0].name, std::string("accessibility"),
+                     "and the longest, most specific trigger wins over 'api'");
+        }
+    }
+
+    // ---- the same task picks the same skills twice ----
+    {
+        const auto first = skills_for_focus("build a responsive landing page");
+        const auto second = skills_for_focus("build a responsive landing page");
+        check(first == second, "matching is stable");
+    }
+
+    // ---- writing them out ----
+    {
+        std::error_code ec;
+        const std::filesystem::path root = "/tmp/auspex-starter-skills";
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+
+        const auto matched = skills_for_focus("add unit tests", 2);
+        const auto written = materialize_skills(matched, root);
+        check(!written.empty(), "starters are written into the project");
+        check(std::filesystem::exists(root / ".auspex" / "skills" / "testing" /
+                                      "SKILL.md"),
+              "at the path a project skill lives at");
+
+        // The real check: they are then discovered by the ordinary skill path,
+        // not by a second one that could drift from it.
+        const auto discovered = all_skills(root);
+        const bool found =
+            std::any_of(discovered.begin(), discovered.end(),
+                        [](const Skill& s) { return s.name == "testing"; });
+        check(found, "and found by all_skills() like any other project skill");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- a skill you wrote is never clobbered ----
+    {
+        std::error_code ec;
+        const std::filesystem::path root = "/tmp/auspex-skill-clobber";
+        std::filesystem::remove_all(root, ec);
+        const auto mine = root / ".auspex" / "skills" / "testing";
+        std::filesystem::create_directories(mine, ec);
+        {
+            std::ofstream out(mine / "SKILL.md");
+            out << "---\nname: testing\ndescription: my own rules\n---\n\nMINE.\n";
+        }
+
+        const auto matched = skills_for_focus("add unit tests", 3);
+        materialize_skills(matched, root, all_skills(root));
+
+        std::ifstream in(mine / "SKILL.md");
+        std::ostringstream buffer;
+        buffer << in.rdbuf();
+        check(buffer.str().find("MINE.") != std::string::npos,
+              "a skill you wrote is left exactly as it was");
+        check(buffer.str().find("Read an existing test") == std::string::npos,
+              "-- the shipped one does not overwrite it");
+
+        std::filesystem::remove_all(root, ec);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
 void test_usage() {
@@ -7085,6 +7393,101 @@ void test_eval() {
               "but a seed file that escapes the task directory is not written");
     }
 
+    // ---- the Auditor corpus ----
+    //
+    // The cases need no model to check; whether the Auditor gets them right needs
+    // one and lives behind --audit-eval. What is checked here is that the corpus
+    // is honest: balanced, and every case carrying the reason its answer is right.
+    {
+        const auto& cases = builtin_audit_cases();
+        check(cases.size() >= 10, "there is a corpus");
+
+        int should_land = 0, should_hold = 0;
+        for (const auto& item : cases) {
+            check(!item.name.empty(), "every case is named");
+            check(!item.rationale.empty(),
+                  "and says why its answer is right: " + item.name);
+            check(!item.subtask.title.empty(), "and what was asked: " + item.name);
+            (item.expected == Verdict::Accept ? should_land : should_hold)++;
+        }
+        // Both kinds, or the number measures nothing. A corpus of only holds is
+        // aced by an Auditor that holds everything, which is the useless one.
+        check(should_land >= 3, "with cases that should LAND");
+        check(should_hold >= 3, "and cases that should be HELD");
+
+        // Every case that should land must survive the checks that need no model,
+        // or it can never land however good the Auditor is -- the case would be
+        // measuring the deterministic pass instead.
+        for (const auto& item : cases) {
+            if (item.expected != Verdict::Accept) continue;
+            check(!deterministic_audit(item.changeset, {}).held(),
+                  "a case that should land is not held by a certain check: " + item.name);
+            check(!syntax_audit(item.changeset).held(),
+                  "nor by the parser: " + item.name);
+        }
+    }
+
+    // ---- the two errors are counted apart ----
+    //
+    // The whole point of this measurement. Averaging them hides the difference
+    // between an Auditor that wastes your work and one that breaks your project.
+    {
+        std::vector<AuditEvalResult> results;
+        // Should have landed, was held -> a false hold.
+        results.push_back({"a", Verdict::Accept, Verdict::Hold, false, false, {}, {},
+                           false, 0});
+        // Should have been held, landed -> a false accept.
+        results.push_back({"b", Verdict::Hold, Verdict::Accept, false, false, {}, {},
+                           false, 0});
+        results.push_back({"c", Verdict::Accept, Verdict::Accept, true, false, {}, {},
+                           false, 0});
+        results.push_back({"d", Verdict::Hold, Verdict::Hold, true, true, {}, {},
+                           true, 0});
+
+        const AuditEvalSummary summary = summarize_audit(results);
+        check_eq(summary.correct, 2, "two correct");
+        check_eq(summary.false_holds, 1, "one false hold");
+        check_eq(summary.false_accepts, 1, "one false accept");
+        check_eq(summary.decided_without_a_model, 1, "one decided without a model");
+        check_eq(summary.invented_quotes, 1, "one hold on invented evidence");
+        check_eq(summary.total(), 4, "and four in total");
+
+        const std::string report = render_audit_eval(results);
+        check(report.find("false holds:   1") != std::string::npos,
+              "the report names false holds");
+        check(report.find("false accepts: 1") != std::string::npos,
+              "and false accepts, separately -- never one averaged number");
+    }
+
+    // ---- an Auditor with one habit scores 50% either way ----
+    //
+    // The reason a single percentage cannot be the answer. Both of these are 50%
+    // on a balanced corpus, and only one of them can put broken code in a project.
+    {
+        std::vector<AuditEvalResult> holds_everything;
+        std::vector<AuditEvalResult> accepts_everything;
+        for (int i = 0; i < 2; ++i) {
+            holds_everything.push_back(
+                {"land", Verdict::Accept, Verdict::Hold, false, false, {}, {}, false, 0});
+            holds_everything.push_back(
+                {"hold", Verdict::Hold, Verdict::Hold, true, false, {}, {}, false, 0});
+            accepts_everything.push_back(
+                {"land", Verdict::Accept, Verdict::Accept, true, false, {}, {}, false, 0});
+            accepts_everything.push_back(
+                {"hold", Verdict::Hold, Verdict::Accept, false, false, {}, {}, false, 0});
+        }
+
+        const auto lazy = summarize_audit(holds_everything);
+        const auto reckless = summarize_audit(accepts_everything);
+        check(lazy.rate() > 49.0 && lazy.rate() < 51.0, "holding everything scores 50%");
+        check(reckless.rate() > 49.0 && reckless.rate() < 51.0,
+              "and so does accepting everything");
+        check_eq(lazy.false_holds, 2, "but one gets every should-land case wrong");
+        check_eq(reckless.false_accepts, 2,
+                 "and the other gets every should-hold case wrong");
+        check_eq(lazy.false_accepts, 0, "which is the distinction the rate loses");
+    }
+
     // ---- the suite is stable ----
     {
         const auto first = eval_suite({});
@@ -7531,6 +7934,51 @@ int main(int argc, char** argv) {
         return auspex::summarize_evals(results).failed == 0 ? 0 : 1;
     }
 
+    // Is the AUDITOR right? The corpus, against a real model.
+    //
+    //   auspex-selftest --audit-eval [model] [debate|panel]
+    //
+    // The two error kinds are reported separately and never averaged: an Auditor
+    // that holds everything and one that accepts everything both score 50%.
+    if (!args.empty() && args[0] == "--audit-eval") {
+        auspex::AuditEvalOptions options;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (args[i] == "debate") {
+                options.debate = true;
+            } else if (args[i] == "panel") {
+                options.voters = 3;
+            } else if (auspex::is_cli_backend(args[i])) {
+                options.backend = args[i];
+                options.model = args[i];
+            } else {
+                options.model = args[i];
+            }
+        }
+
+        const auto config = auspex::Config::load();
+        const auto& cases = auspex::builtin_audit_cases();
+        std::cout << "auditor: " << cases.size() << " cases against "
+                  << (options.model.empty() ? config.ollama_model : options.model)
+                  << (options.debate ? " (debate)" : "")
+                  << (options.voters > 1 ? " (panel of 3)" : "") << "\n\n";
+
+        const auto before = auspex::usage_snapshot();
+        const auto results = auspex::run_audit_cases(
+            config, cases, options, [](const auspex::AuditEvalResult& r) {
+                std::cout << "  [" << (r.correct ? " ok " : "WRONG") << "] " << r.name
+                          << "\n"
+                          << std::flush;
+            });
+
+        std::cout << "\n" << auspex::render_audit_eval(results);
+        std::cout << "\n"
+                  << auspex::usage_report(auspex::usage_since(before), "what it cost");
+        return auspex::summarize_audit(results).correct ==
+                       static_cast<int>(results.size())
+                   ? 0
+                   : 1;
+    }
+
     // What the configured hooks are, and where they are read from.
     if (!args.empty() && args[0] == "--hooks") {
         std::cout << "hooks from " << auspex::hooks_path().string() << "\n";
@@ -7877,6 +8325,8 @@ int main(int argc, char** argv) {
     test_code_index();
     test_skills();
     test_mcp();
+    test_roles();
+    test_starter_skills();
     test_usage();
     test_linters();
     test_hooks();

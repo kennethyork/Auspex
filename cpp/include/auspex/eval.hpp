@@ -35,7 +35,10 @@
 #include <string>
 #include <vector>
 
+#include "auspex/auditor.hpp"
 #include "auspex/config.hpp"
+#include "auspex/director.hpp"
+#include "auspex/sandbox.hpp"
 
 namespace auspex {
 
@@ -159,5 +162,87 @@ struct EvalSummary {
 
 EvalSummary summarize_evals(const std::vector<EvalResult>& results);
 std::string render_evals(const std::vector<EvalResult>& results);
+
+// --- measuring the Auditor ----------------------------------------------------
+//
+// The suite above measures the coder. This measures the reviewer, which on this
+// project is the part that has been wrong most often and the part I have been
+// wrong ABOUT most often -- I called the Auditor "working well" once while it was
+// holding correct Python with a self-contradicting reason.
+//
+// THE GROUND TRUTH IS AUTHORED, NOT ASKED FOR. Each case is a changeset where the
+// right verdict is beyond argument: the code does what the subtask asked, or it
+// demonstrably does not. If a case is arguable it does not belong here, because
+// then a disagreement measures the case rather than the Auditor.
+//
+// THE TWO ERRORS ARE NOT THE SAME ERROR, so they are never averaged into one
+// number. A false HOLD wastes a coder's work and trains you to click through
+// holds. A false ACCEPT lands broken code in your project. An Auditor that holds
+// everything scores 50% and is useless; one that accepts everything scores 50%
+// and is dangerous. Only the split tells them apart.
+
+struct AuditCase {
+    std::string    name;
+    PlannedSubtask subtask;
+    Changeset      changeset;
+    Verdict        expected = Verdict::Hold;
+    // Why that is the right answer. Printed when a case fails, so the person
+    // reading knows whether to doubt the Auditor or the case.
+    std::string    rationale;
+};
+
+// The corpus. Some cases are decidable without a model -- a secret, a syntax
+// error, an empty changeset -- and those are kept deliberately: they are the
+// checks most likely to regress silently, and they cost nothing to run.
+const std::vector<AuditCase>& builtin_audit_cases();
+
+struct AuditEvalResult {
+    std::string name;
+    Verdict     expected = Verdict::Hold;
+    Verdict     got      = Verdict::Hold;
+    bool        correct  = false;
+    // True when the verdict came from a deterministic check rather than a model.
+    bool        certain  = false;
+    std::string reason;      // what the Auditor said
+    std::string rationale;   // what the case says is true
+    // The Auditor quoted a line that is not in the diff it reviewed. Counted
+    // separately: a hold on invented evidence is a different failure from a hold
+    // on a real disagreement, and only one of them is fixable by a better prompt.
+    bool        invented_quote = false;
+    int         milliseconds = 0;
+};
+
+struct AuditEvalSummary {
+    int correct = 0;
+    // Held something that should have landed. Wastes work; makes holds noise.
+    int false_holds = 0;
+    // Landed something that should have been held. The expensive one.
+    int false_accepts = 0;
+    int decided_without_a_model = 0;
+    int invented_quotes = 0;
+
+    int total() const { return correct + false_holds + false_accepts; }
+    double rate() const {
+        return total() == 0 ? 0.0 : (100.0 * correct) / static_cast<double>(total());
+    }
+};
+
+struct AuditEvalOptions {
+    std::string model;     // empty falls back to the config's
+    std::string backend;   // an agent CLI, or empty for Auspex's own loop
+    bool        debate = false;   // three calls per case instead of one
+    int         voters = 1;       // a panel, when > 1
+};
+
+AuditEvalResult run_audit_case(const Config& config, const AuditCase& item,
+                               const AuditEvalOptions& options = {});
+
+std::vector<AuditEvalResult> run_audit_cases(
+    const Config& config, const std::vector<AuditCase>& cases,
+    const AuditEvalOptions& options = {},
+    const std::function<void(const AuditEvalResult&)>& on_result = {});
+
+AuditEvalSummary summarize_audit(const std::vector<AuditEvalResult>& results);
+std::string render_audit_eval(const std::vector<AuditEvalResult>& results);
 
 }  // namespace auspex

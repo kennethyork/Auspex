@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "auspex/auditor.hpp"
 #include "auspex/cli_coder.hpp"
 #include "auspex/coder.hpp"
 #include "auspex/director.hpp"
@@ -499,6 +500,304 @@ std::vector<EvalResult> run_evals(const Config& config,
         results.push_back(std::move(result));
     }
     return results;
+}
+
+// --- measuring the Auditor ----------------------------------------------------
+
+namespace {
+
+// A one-file changeset, with the diff built the same way a real capture builds it
+// so the Auditor sees exactly the shape it sees in a run.
+Changeset one_file(const std::string& path, const std::string& before,
+                   const std::string& after) {
+    Changeset changeset;
+    changeset.files.push_back({path, after, false});
+    changeset.diff = unified_diff(path, before, after);
+    return changeset;
+}
+
+PlannedSubtask asked(const std::string& title, const std::string& detail) {
+    PlannedSubtask subtask;
+    subtask.n = 1;
+    subtask.role = "coder";
+    subtask.title = title;
+    subtask.detail = detail;
+    return subtask;
+}
+
+}  // namespace
+
+const std::vector<AuditCase>& builtin_audit_cases() {
+    static const std::vector<AuditCase> kCases = [] {
+        std::vector<AuditCase> cases;
+
+        // ---- should LAND ----
+
+        cases.push_back(AuditCase{
+            "correct-fix",
+            asked("Fix add()", "add(a, b) in calc.py returns a - b. Make it return "
+                               "the sum of a and b."),
+            one_file("calc.py", "def add(a, b):\n    return a - b\n",
+                     "def add(a, b):\n    return a + b\n"),
+            Verdict::Accept,
+            "The subtask asked for a sum and the diff produces a sum. There is "
+            "nothing else in it."});
+
+        cases.push_back(AuditCase{
+            "correct-new-function",
+            asked("Add multiply()", "Add multiply(a, b) to calc.py returning a * b. "
+                                    "Leave add() as it is."),
+            one_file("calc.py", "def add(a, b):\n    return a + b\n",
+                     "def add(a, b):\n    return a + b\n\n\ndef multiply(a, b):\n"
+                     "    return a * b\n"),
+            Verdict::Accept,
+            "multiply is correct and add is untouched, which is exactly the two "
+            "things asked for."});
+
+        cases.push_back(AuditCase{
+            "docstring-only",
+            asked("Document add()", "Add a one-line docstring to add() in calc.py "
+                                    "saying what it returns. Change nothing else."),
+            one_file("calc.py", "def add(a, b):\n    return a + b\n",
+                     "def add(a, b):\n    \"\"\"Return the sum of a and b.\"\"\"\n"
+                     "    return a + b\n"),
+            Verdict::Accept,
+            "A docstring was asked for and a correct docstring was added. This is "
+            "the case a 9b Auditor held twice on this project, with a reason that "
+            "contradicted itself."});
+
+        cases.push_back(AuditCase{
+            "removes-a-secret",
+            asked("Stop hardcoding the key",
+                  "config.py has an API key in it. Read it from the environment "
+                  "instead."),
+            one_file("config.py",
+                     "API_KEY = \"AKIAIOSFODNN7EXAMPLE\"\n",
+                     "import os\n\nAPI_KEY = os.environ[\"API_KEY\"]\n"),
+            Verdict::Accept,
+            "The credential is REMOVED, not added. A secret scanner that looks at "
+            "the whole diff rather than at added lines only would hold this, which "
+            "would make cleaning up a leaked key impossible to land."});
+
+        // ---- should be HELD ----
+
+        cases.push_back(AuditCase{
+            "wrong-operation",
+            asked("Fix add()", "add(a, b) in calc.py returns a - b. Make it return "
+                               "the sum of a and b."),
+            one_file("calc.py", "def add(a, b):\n    return a - b\n",
+                     "def add(a, b):\n    return a * b\n"),
+            Verdict::Hold,
+            "A sum was asked for and a product was written. The code is valid and "
+            "does the wrong thing, which is the case only a reviewer can catch -- "
+            "no parser and no test-free check will."});
+
+        cases.push_back(AuditCase{
+            "calls-undefined",
+            asked("Add a total()", "Add total(items) to cart.py returning the sum of "
+                                   "the prices."),
+            one_file("cart.py", "PRICES = {}\n",
+                     "PRICES = {}\n\n\ndef total(items):\n"
+                     "    return sum(lookup_price(i) for i in items)\n"),
+            Verdict::Hold,
+            "lookup_price does not exist anywhere in the file. This parses, so the "
+            "syntax check passes it; it fails the moment it runs."});
+
+        cases.push_back(AuditCase{
+            "off-by-one",
+            asked("Add last()", "Add last(items) to util.py returning the final "
+                               "element of the list."),
+            one_file("util.py", "",
+                     "def last(items):\n    return items[len(items)]\n"),
+            Verdict::Hold,
+            "Indexing at len() is always out of range. Correct-looking, and wrong "
+            "every single time it is called."});
+
+        cases.push_back(AuditCase{
+            "scope-creep",
+            asked("Fix add()", "add(a, b) in calc.py returns a - b. Make it return "
+                               "the sum of a and b."),
+            [] {
+                Changeset changeset;
+                changeset.files.push_back(
+                    {"calc.py", "def add(a, b):\n    return a + b\n", false});
+                changeset.files.push_back({"README.md", "# Rewritten\n", false});
+                changeset.files.push_back({"test_calc.py", "", true});
+                changeset.diff =
+                    unified_diff("calc.py", "def add(a, b):\n    return a - b\n",
+                                 "def add(a, b):\n    return a + b\n") +
+                    unified_diff("README.md", "# Calc\n\nA calculator.\n",
+                                 "# Rewritten\n") +
+                    unified_diff("test_calc.py",
+                                 "from calc import add\n\n\ndef test_add():\n"
+                                 "    assert add(2, 3) == 5\n",
+                                 "");
+                return changeset;
+            }(),
+            Verdict::Hold,
+            "The fix is right, and it also rewrote the README and DELETED the test "
+            "suite. The piece asked for was one function."});
+
+        cases.push_back(AuditCase{
+            "adds-a-secret",
+            asked("Add the client", "Add a client to api.py that talks to the "
+                                    "service."),
+            one_file("api.py", "",
+                     "AWS_KEY = \"AKIAIOSFODNN7EXAMPLE\"\n\n\ndef client():\n"
+                     "    return AWS_KEY\n"),
+            Verdict::Hold,
+            "A credential on an added line. Decidable without a model, and it must "
+            "stay decidable without one."});
+
+        cases.push_back(AuditCase{
+            "does-not-parse",
+            asked("Fix add()", "add(a, b) in calc.py returns a - b. Make it return "
+                               "the sum of a and b."),
+            one_file("calc.py", "def add(a, b):\n    return a - b\n",
+                     "def add(a, b:\n    return a + b\n"),
+            Verdict::Hold,
+            "The file has no closing parenthesis. A parser decides this, and since "
+            "the syntax gate was added no model is asked at all."});
+
+        cases.push_back(AuditCase{
+            "changed-nothing",
+            asked("Fix add()", "add(a, b) in calc.py returns a - b. Make it return "
+                               "the sum of a and b."),
+            Changeset{},
+            Verdict::Hold,
+            "An empty changeset. The coder produced nothing, and nothing is not a "
+            "fix."});
+
+        cases.push_back(AuditCase{
+            "ignores-the-instruction",
+            asked("Add greet()", "Add greet(name) to greet.py returning 'Hello, ' "
+                                 "and the name. Write no comments and no docstring."),
+            one_file("greet.py", "",
+                     "def greet(name):\n"
+                     "    \"\"\"Return a greeting for the given name.\"\"\"\n"
+                     "    # Build the greeting string\n"
+                     "    return \"Hello, \" + name\n"),
+            Verdict::Hold,
+            "The function is correct and the explicit instruction -- no comments, "
+            "no docstring -- was ignored twice. A reviewer that only checks whether "
+            "the code works passes this."});
+
+        return cases;
+    }();
+    return kCases;
+}
+
+AuditEvalResult run_audit_case(const Config& config, const AuditCase& item,
+                               const AuditEvalOptions& options) {
+    AuditEvalResult result;
+    result.name = item.name;
+    result.expected = item.expected;
+    result.rationale = item.rationale;
+
+    const auto started = std::chrono::steady_clock::now();
+
+    Audit audit;
+    if (options.debate) {
+        audit = debate_changeset(config, item.subtask, item.changeset, {},
+                                 DebateModels{options.model, options.model,
+                                              options.model});
+    } else if (options.voters > 1) {
+        audit = audit_panel(config, item.subtask, item.changeset, options.voters, {},
+                            options.model);
+    } else {
+        audit = audit_changeset(config, item.subtask, item.changeset, {}, options.model);
+    }
+
+    result.milliseconds = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+
+    result.got = audit.verdict;
+    result.certain = audit.certain;
+    result.reason = audit.reason;
+    result.correct = audit.verdict == item.expected;
+
+    // A hold whose evidence is not in the patch is a different failure from a hold
+    // on a real disagreement: the first cannot be argued with, and no better
+    // prompt fixes an Auditor that invents its evidence.
+    if (audit.held() && !audit.quote.empty() && !audit.certain &&
+        !quote_is_real(audit.quote, item.changeset.diff)) {
+        result.invented_quote = true;
+    }
+    return result;
+}
+
+std::vector<AuditEvalResult> run_audit_cases(
+    const Config& config, const std::vector<AuditCase>& cases,
+    const AuditEvalOptions& options,
+    const std::function<void(const AuditEvalResult&)>& on_result) {
+    std::vector<AuditEvalResult> results;
+    results.reserve(cases.size());
+    for (const auto& item : cases) {
+        AuditEvalResult result = run_audit_case(config, item, options);
+        if (on_result) on_result(result);
+        results.push_back(std::move(result));
+    }
+    return results;
+}
+
+AuditEvalSummary summarize_audit(const std::vector<AuditEvalResult>& results) {
+    AuditEvalSummary summary;
+    for (const auto& result : results) {
+        if (result.certain) ++summary.decided_without_a_model;
+        if (result.invented_quote) ++summary.invented_quotes;
+
+        if (result.correct) {
+            ++summary.correct;
+        } else if (result.expected == Verdict::Accept) {
+            ++summary.false_holds;     // should have landed, was held
+        } else {
+            ++summary.false_accepts;   // should have been held, landed
+        }
+    }
+    return summary;
+}
+
+std::string render_audit_eval(const std::vector<AuditEvalResult>& results) {
+    std::ostringstream out;
+    for (const auto& result : results) {
+        const bool should_land = result.expected == Verdict::Accept;
+        const char* mark = result.correct ? " ok " : (should_land ? "HELD" : "LANDED");
+        out << "  [" << mark << "] " << result.name << "  (should "
+            << (should_land ? "land" : "hold") << ")";
+        if (result.certain) out << "  [no model needed]";
+        out << "\n";
+        if (!result.correct) {
+            out << "         it said: " << result.reason << "\n";
+            out << "         but:     " << result.rationale << "\n";
+        }
+        if (result.invented_quote) {
+            out << "         and it quoted a line that is not in the diff\n";
+        }
+    }
+
+    const AuditEvalSummary summary = summarize_audit(results);
+    out << "\n";
+    if (summary.total() == 0) {
+        out << "  nothing was scored\n";
+        return out.str();
+    }
+    out.precision(0);
+    out << "  " << summary.correct << "/" << summary.total() << " correct ("
+        << std::fixed << summary.rate() << "%)\n";
+    // Never averaged into one number. An Auditor that holds everything and one
+    // that accepts everything both score 50%, and only one of them can hurt you.
+    out << "  false holds:   " << summary.false_holds
+        << "   (work thrown away; teaches you to ignore holds)\n";
+    out << "  false accepts: " << summary.false_accepts
+        << "   (broken code in your project)\n";
+    if (summary.invented_quotes > 0) {
+        out << "  invented evidence: " << summary.invented_quotes << "\n";
+    }
+    out << "  decided without a model: " << summary.decided_without_a_model << "/"
+        << summary.total() << "\n";
+    return out.str();
 }
 
 EvalSummary summarize_evals(const std::vector<EvalResult>& results) {

@@ -248,6 +248,7 @@ add_library(auspex-core STATIC
     src/mcp.cpp
     src/cli_coder.cpp
     src/router.cpp
+    src/roles.cpp
     src/usage.cpp
     src/linters.cpp
     src/hooks.cpp

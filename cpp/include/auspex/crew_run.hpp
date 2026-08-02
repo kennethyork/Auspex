@@ -122,6 +122,14 @@ struct RunOptions {
     // that should be asked for.
     bool        route = false;
 
+    // Write the shipped starter skills that match this task into the project.
+    //
+    // ON by default, unlike most things here, because the failure mode is mild
+    // and the alternative is a feature that does nothing until you have written
+    // your own skills. It writes files into .auspex/skills, which is the one
+    // reason somebody might want it off.
+    bool        starter_skills = true;
+
     bool        research = true;
     std::string researcher_backend = "ollama";
     std::string researcher_model;

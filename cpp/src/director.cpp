@@ -7,6 +7,7 @@
 
 #include "auspex/ollama_client.hpp"
 #include "auspex/process.hpp"
+#include "auspex/roles.hpp"
 
 using json = nlohmann::json;
 
@@ -64,12 +65,12 @@ std::string director_prompt(const std::string& task,
            "parallel in separate copies of the project.\n"
            "- Two pieces must not edit the same file.\n"
            "- Every piece must be worth doing on its own.\n"
-           "- role must be one of: ";
-    for (std::size_t i = 0; i < director_roles().size(); ++i) {
-        if (i) out << ", ";
-        out << director_roles()[i];
-    }
-    out << "\n\n";
+           "- role must be one of these, and the role decides how the piece is "
+           "done:\n";
+    // With descriptions, not as a bare list of words. The Director was previously
+    // choosing between six nouns and had to guess what they meant; "reviewer"
+    // in particular reads like a coder unless you are told it never edits.
+    out << role_catalog(all_personas()) << "\n";
 
     // The file listing, not the contents. The Director decides how to cut a job
     // up; for that it needs to know what exists. Contents would spend the whole

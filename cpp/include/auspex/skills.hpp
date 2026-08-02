@@ -59,4 +59,50 @@ std::optional<Skill> find_skill(const std::filesystem::path& project,
 // nothing is added to the prompt at all rather than an empty heading.
 std::string skills_catalog(const std::vector<Skill>& skills);
 
+// --- the starter library ------------------------------------------------------
+//
+// Skills only helped if you had already written some, which meant the feature did
+// nothing at all on a fresh install -- and the coders that need instruction most
+// are exactly the small local models whose owners have not yet written a house
+// style document. These ship in the binary.
+//
+// MATCHED TO THE TASK, not loaded wholesale. A crew fixing a SQL query has no use
+// for the accessibility skill, and putting all of them in the catalogue would
+// spend the context this feature exists to save. Each starter carries trigger
+// words; the ones whose triggers appear in the task text get written into the
+// sandbox, where the coder discovers them exactly like a project skill.
+//
+// A USER SKILL OF THE SAME NAME ALWAYS WINS, and is never overwritten. Somebody
+// who has written their own `testing` skill has said what they want; shipping one
+// over the top of it would be the library deciding it knows better.
+struct SkillSpec {
+    std::string              name;
+    // Lowercase. Matched as substrings of the task text.
+    std::vector<std::string> triggers;
+    std::string              description;
+    std::string              body;
+
+    bool operator==(const SkillSpec&) const = default;
+};
+
+const std::vector<SkillSpec>& starter_skills();
+
+// The starters whose triggers appear in `focus`, most specific first, capped.
+//
+// Specificity is the LENGTH of the longest matching trigger: "database migration"
+// occurring is a far stronger signal than "api", so when the cap bites it is the
+// vague matches that are dropped. A cap of 0, or an empty focus, matches nothing
+// -- silence rather than everything, because the failure mode of a wrong guess
+// here is a coder reading five irrelevant documents.
+std::vector<SkillSpec> skills_for_focus(const std::string& focus, int cap = 4);
+
+// Write each spec to `base/.auspex/skills/<name>/SKILL.md`. Returns the names now
+// available there.
+//
+// Skips any name the user already defines (in `home_skills`, and at the target),
+// so a personal skill is never clobbered by a shipped one.
+std::vector<std::string> materialize_skills(const std::vector<SkillSpec>& specs,
+                                            const std::filesystem::path& base,
+                                            const std::vector<Skill>& user_skills = {});
+
 }  // namespace auspex

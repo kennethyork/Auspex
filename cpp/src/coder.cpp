@@ -10,6 +10,7 @@
 #include "auspex/process.hpp"
 #include "auspex/code_index.hpp"
 #include "auspex/sandbox.hpp"
+#include "auspex/roles.hpp"
 
 using json = nlohmann::json;
 
@@ -175,10 +176,17 @@ std::string coder_prompt(const PlannedSubtask& subtask,
                          const McpAccess& mcp) {
     std::ostringstream out;
 
-    out << "You are a " << (subtask.role.empty() ? "coder" : subtask.role)
-        << " working alone on one piece of a larger job.\n"
+    out << "You are working alone on one piece of a larger job.\n"
            "You are in a private copy of the project. Nothing you do here touches "
            "anyone else's work.\n\n";
+
+    // The role, with what it means. "You are a tester" is a label; the persona is
+    // the part that changes what gets written -- match the existing framework,
+    // do not touch production code, and so on.
+    if (const std::string role = persona_block(persona_for(subtask.role));
+        !role.empty()) {
+        out << role << "\n";
+    }
 
     out << "Your piece:\n" << subtask.title << "\n";
     if (!subtask.detail.empty()) out << subtask.detail << "\n";
@@ -195,10 +203,10 @@ std::string coder_prompt(const PlannedSubtask& subtask,
     // The tools, spelled exactly as they must be answered.
     out << "Answer with ONE JSON object per turn, naming one tool:\n"
            "  {\"tool\":\"list\"}                                   what files exist\n"
-           "  {\"tool\":\"read\",\"path\":\"src/x.py\"}                 read a file\n"
-           "  {\"tool\":\"write\",\"path\":\"src/x.py\",\"contents\":\"…\"}  replace a file "
+           "  {\"tool\":\"read\",\"path\":\"file.py\"}                 read a file\n"
+           "  {\"tool\":\"write\",\"path\":\"file.py\",\"contents\":\"…\"}  replace a file "
            "entirely, or create it\n"
-           "  {\"tool\":\"delete\",\"path\":\"src/x.py\"}               remove a file\n"
+           "  {\"tool\":\"delete\",\"path\":\"file.py\"}               remove a file\n"
            "  {\"tool\":\"finish\",\"note\":\"what you did\"}          when the piece is "
            "done\n";
     if (limits.allow_run) {
@@ -249,6 +257,10 @@ std::string coder_prompt(const PlannedSubtask& subtask,
            "- write replaces the WHOLE file. Read it first unless you are creating "
            "it.\n"
            "- Paths are relative to the project root. No leading slash, no \"..\".\n"
+           "- Put a file where the piece says, next to the files already \n"
+           "  here. Do NOT invent a directory: writing src/thing.py when the \n"
+           "  project has no src/ is the single most common way this goes \n"
+           "  wrong, and the file is then in the wrong place.\n"
            "- Only these tools. There is no shell.\n"
            "- Do the piece you were given and nothing else.\n"
            "- Finish as soon as it is done. You have "
@@ -319,7 +331,7 @@ std::string researcher_prompt(const std::string& task,
 
     out << "Answer with ONE JSON object per turn:\n"
            "  {\"tool\":\"list\"}                       what files exist\n"
-           "  {\"tool\":\"read\",\"path\":\"src/x.py\"}     read one\n"
+           "  {\"tool\":\"read\",\"path\":\"file.py\"}     read one\n"
            "  {\"tool\":\"finish\",\"note\":\"…\"}         your report, when you have "
            "seen enough\n\n";
 
