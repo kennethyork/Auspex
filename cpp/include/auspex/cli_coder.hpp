@@ -26,6 +26,7 @@
 // the hard way and guessing at them produces a coder that hangs.
 #pragma once
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -61,7 +62,19 @@ bool prompt_on_stdin(const std::string& backend);
 std::string cli_coder_prompt(const PlannedSubtask& subtask,
                              const std::string& lessons = {});
 
-// Runs one. Blocking.
+// One-shot text from an agent CLI: prompt in, its answer out.
+//
+// The same tools, used as a completion rather than as a coder. That is what lets
+// the Director and the Auditor run on Claude or Codex too -- they need a reply,
+// not file edits, and `claude -p` gives exactly that.
+//
+// Run in a directory it may read but has no reason to write. Empty on failure,
+// which every caller already treats as "the model did not answer".
+std::string ask_cli(const std::string& backend, const std::string& model,
+                    const std::string& prompt, const std::filesystem::path& cwd = {},
+                    int timeout_seconds = 300);
+
+// Runs one as a CODER. Blocking.
 //
 // Reports as a CoderOutcome so the rest of the engine cannot tell the difference:
 // `steps` is empty because the agent's turns are its own business, and `finished`

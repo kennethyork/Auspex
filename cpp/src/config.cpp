@@ -104,6 +104,9 @@ Config Config::load(const fs::path& path) {
             if (!id.empty()) cfg.pinned.push_back(std::move(id));
         }
     }
+    assign_if(j, "crew_director_backend", cfg.crew_director_backend);
+    assign_if(j, "crew_coder_backend",    cfg.crew_coder_backend);
+    assign_if(j, "crew_auditor_backend",  cfg.crew_auditor_backend);
     assign_if(j, "crew_director_model", cfg.crew_director_model);
     assign_if(j, "crew_coder_model",    cfg.crew_coder_model);
     assign_if(j, "crew_auditor_model",  cfg.crew_auditor_model);

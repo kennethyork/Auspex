@@ -14,7 +14,7 @@ const std::vector<std::string>& coder_backends() {
     // backend and a launchable agent are the same thing named once.
     static const std::vector<std::string> kBackends{
         "ollama", "claude", "codex", "gemini", "cursor-agent", "opencode", "qwen",
-        "aider",
+        "aider", "goose", "amp", "crush", "droid",
     };
     return kBackends;
 }
@@ -98,6 +98,28 @@ std::vector<std::string> cli_coder_argv(const std::string& backend,
         return argv;
     }
 
+    if (backend == "goose") {
+        argv.insert(argv.end(), {"run", "--text", prompt});
+        return argv;
+    }
+
+    if (backend == "amp") {
+        argv.insert(argv.end(), {"-x", prompt});
+        return argv;
+    }
+
+    if (backend == "crush") {
+        argv.insert(argv.end(), {"run", "-q", prompt});
+        return argv;
+    }
+
+    if (backend == "droid") {
+        argv.insert(argv.end(), {"exec", "-o", "text"});
+        if (!m.empty()) argv.insert(argv.end(), {"--model", m});
+        argv.push_back(prompt);
+        return argv;
+    }
+
     if (backend == "aider") {
         argv.insert(argv.end(), {"--yes", "--no-pretty", "--no-stream"});
         if (!m.empty()) argv.insert(argv.end(), {"--model", m});
@@ -127,6 +149,25 @@ std::string cli_coder_prompt(const PlannedSubtask& subtask,
            "fix unrelated things, and do not commit -- another reviewer reads your "
            "changes before they land anywhere real.\n";
     return out.str();
+}
+
+std::string ask_cli(const std::string& backend, const std::string& model,
+                    const std::string& prompt, const std::filesystem::path& cwd,
+                    int timeout_seconds) {
+    if (!is_cli_backend(backend) || trim(prompt).empty()) return {};
+
+    const auto argv = cli_coder_argv(backend, model, prompt);
+    if (argv.empty()) return {};
+
+    const std::string stdin_text = prompt_on_stdin(backend) ? prompt : std::string{};
+    const LimitedResult ran = run_limited(argv, cwd.string(), timeout_seconds,
+                                          /*max_output=*/32'000, stdin_text);
+
+    // Output whether or not it exited zero. These tools return non-zero for
+    // reasons that have nothing to do with whether they answered -- a warning, a
+    // rate-limit note -- and throwing away a good reply over an exit code would
+    // fail a Director that actually planned.
+    return trim(ran.output);
 }
 
 CoderOutcome run_cli_coder(const Config& config, const PlannedSubtask& subtask,

@@ -5705,6 +5705,37 @@ void test_crew_run() {
         check(!nowhere.error.empty(), "with a reason");
     }
 
+    // ---- one backend per coder ----
+    //
+    // The difference between "several coders" and several DIFFERENT coders: two
+    // models of the same family tend to make the same mistake, and the whole point
+    // of fanning out is that they do not.
+    {
+        RunOptions options;
+        options.coder_backend = "ollama";
+
+        check_eq(options.backend_for_coder(1), std::string("ollama"),
+                 "with no list, everyone uses the one backend");
+        check_eq(options.backend_for_coder(9), std::string("ollama"), "however many");
+
+        options.coder_backends = {"claude", "codex", "gemini"};
+        check_eq(options.backend_for_coder(1), std::string("claude"), "coder 1");
+        check_eq(options.backend_for_coder(2), std::string("codex"),  "coder 2");
+        check_eq(options.backend_for_coder(3), std::string("gemini"), "coder 3");
+        // A list shorter than the plan repeats rather than running out: two coders
+        // on claude is a sensible thing to ask for.
+        check_eq(options.backend_for_coder(4), std::string("claude"),
+                 "and it wraps rather than running out");
+
+        // 1-based, like everything else a person says about a coder.
+        check_eq(options.backend_for_coder(0), std::string("claude"),
+                 "a zero is treated as the first");
+
+        options.coder_backends = {"claude", ""};
+        check_eq(options.backend_for_coder(2), std::string("ollama"),
+                 "a blank entry falls back rather than becoming a broken backend");
+    }
+
     // ---- counting votes ----
     //
     // A TIE HOLDS, and that is the point of counting rather than a flaw in it: if

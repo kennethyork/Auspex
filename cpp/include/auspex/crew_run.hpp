@@ -105,6 +105,24 @@ struct RunOptions {
     // which is usually a frontier model.
     std::string coder_backend = "ollama";
 
+    // The Director and the Auditor can be agent CLIs too. They need a reply
+    // rather than file edits, and `claude -p` gives exactly that -- so the role
+    // that most needs a capable model is not stuck on whatever Ollama serves.
+    std::string director_backend = "ollama";
+    std::string auditor_backend  = "ollama";
+
+    // One backend per coder, round-robin, so a plan of three can run on three
+    // different providers at once. Empty falls back to coder_backend for all of
+    // them.
+    //
+    // This is the difference between "several coders" and several DIFFERENT
+    // coders: two models of the same family tend to make the same mistake, and
+    // the point of fanning out is that they do not.
+    std::vector<std::string> coder_backends;
+
+    // The backend for coder `n` (1-based), after the fallbacks.
+    std::string backend_for_coder(int n) const;
+
     // Advocate / skeptic / judge on every changeset instead of one Auditor.
     // Three model calls per piece rather than one.
     bool debate = false;

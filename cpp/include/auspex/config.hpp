@@ -53,6 +53,16 @@ struct Config {
     std::string crew_director_model;
     std::string crew_coder_model;
     std::string crew_auditor_model;
+
+    // WHICH AGENT does each role, not just which model. "ollama" (or empty) is
+    // Auspex's own loop; any agent CLI id hands the role to that tool.
+    //
+    // This is a bigger lever than the model names above it: a role on claude or
+    // codex is running whatever frontier model its owner configured, while a role
+    // on ollama is capped at what Ollama serves.
+    std::string crew_director_backend;
+    std::string crew_coder_backend;
+    std::string crew_auditor_backend;
     std::string ollama_endpoint  = "http://127.0.0.1:11434";
     std::string whisper_endpoint = "http://127.0.0.1:5000/transcribe";
     int         sample_rate      = 16000;

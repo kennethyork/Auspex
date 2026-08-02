@@ -26,6 +26,7 @@
 #include "auspex/audio.hpp"
 #include "auspex/autostart.hpp"
 #include "auspex/crew.hpp"
+#include "auspex/cli_coder.hpp"
 #include "auspex/crew_run.hpp"
 #include "auspex/gtk/voice.hpp"
 #include "auspex/ollama_client.hpp"
@@ -932,6 +933,12 @@ void CrewWindow::start() {
     options.security = security_.get_active();
     if (amplify_.get_value_as_int() > 0) options.amplify = amplify_.get_value_as_int();
 
+    options.director_backend = config.crew_director_backend.empty()
+                                   ? "ollama" : config.crew_director_backend;
+    options.coder_backend    = config.crew_coder_backend.empty()
+                                   ? "ollama" : config.crew_coder_backend;
+    options.auditor_backend  = config.crew_auditor_backend.empty()
+                                   ? "ollama" : config.crew_auditor_backend;
     options.director_model = config.crew_director_model;
     options.coder_model    = config.crew_coder_model;
     options.auditor_model  = config.crew_auditor_model;
@@ -1564,13 +1571,23 @@ BrainWindow::BrainWindow() {
                 "confident wrong reasons, which makes the whole crew pointless.");
         }
 
+        entry->backends.set_tooltip_text(
+            "Which agent does this role. \"ollama\" is Auspex's own loop; the rest "
+            "hand the role to that CLI, running whatever model it is configured "
+            "with.");
+
         entry->models.property_selected().signal_changed().connect([this] {
+            if (loading_) return;
+            save_models();
+        });
+        entry->backends.property_selected().signal_changed().connect([this] {
             if (loading_) return;
             save_models();
         });
 
         roles_.attach(entry->label, 0, row);
-        roles_.attach(entry->models, 1, row);
+        roles_.attach(entry->backends, 1, row);
+        roles_.attach(entry->models, 2, row);
         rows_.push_back(std::move(entry));
         ++row;
     }
@@ -1618,7 +1635,39 @@ void BrainWindow::reload() {
     models_ = available_models();
     const Config config = Config::load();
 
+    // Ollama plus every agent CLI actually installed. Offering one that is not
+    // there would be a role that fails at the moment it is needed rather than at
+    // the moment it is chosen.
+    backends_.clear();
+    backends_.push_back("ollama");
+    for (const auto& id : coder_backends()) {
+        if (id == "ollama") continue;
+        if (!resolve_agent_binary(id == "cursor-agent" ? "cursor-agent" : id).empty()) {
+            backends_.push_back(id);
+        }
+    }
+
     loading_ = true;
+    for (auto& entry : rows_) {
+        {
+            std::vector<Glib::ustring> labels;
+            for (const auto& id : backends_) labels.emplace_back(id);
+            entry->backends.set_model(Gtk::StringList::create(labels));
+        }
+
+        const std::string chosen_backend =
+            entry->key == "director" ? config.crew_director_backend
+            : entry->key == "coder"  ? config.crew_coder_backend
+                                     : config.crew_auditor_backend;
+        guint backend_index = 0;
+        for (std::size_t i = 0; i < backends_.size(); ++i) {
+            if (backends_[i] == chosen_backend) {
+                backend_index = static_cast<guint>(i);
+                break;
+            }
+        }
+        entry->backends.set_selected(backend_index);
+    }
     for (auto& entry : rows_) {
         // "Default" first, so a role can be put back to following ollama_model
         // without having to know what that is.
@@ -1668,6 +1717,17 @@ void BrainWindow::save_models() {
                 ? std::string{}
                 : models_[index - 1];
         document["crew_" + entry->key + "_model"] = value;
+
+        const auto backend_index = entry->backends.get_selected();
+        const std::string backend =
+            (backend_index == GTK_INVALID_LIST_POSITION ||
+             backend_index >= backends_.size())
+                ? std::string{}
+                : backends_[backend_index];
+        // "ollama" is stored as empty, which is what the engine reads as its own
+        // loop -- one spelling of the default rather than two.
+        document["crew_" + entry->key + "_backend"] =
+            backend == "ollama" ? std::string{} : backend;
     }
 
     std::error_code ec;

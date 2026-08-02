@@ -41,6 +41,13 @@ const std::vector<AgentDefinition>& definitions() {
          {"ollamadev", "ollama dev", "olama dev", "llama dev", "ollamadev cli"}},
         {"qwen", "Qwen Code", "qwen", {"qwen", "qwen code", "quinn", "qwen coder"}},
         {"aider", "Aider", "aider", {"aider", "eider", "aide"}},
+        // Known to ollamadev and resolvable here, so a coder backend can name
+        // them. Not installed on this machine, which available_agents() reports
+        // rather than guessing at.
+        {"goose", "Goose", "goose", {"goose", "block goose"}},
+        {"amp", "Amp", "amp", {"amp", "sourcegraph amp"}},
+        {"crush", "Crush", "crush", {"crush", "charm crush"}},
+        {"droid", "Droid", "droid", {"droid", "factory droid"}},
     };
     return kAgents;
 }

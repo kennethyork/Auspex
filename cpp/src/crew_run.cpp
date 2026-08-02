@@ -175,6 +175,16 @@ Changeset load_changeset(const std::filesystem::path& dir) {
 }
 
 // ---------------------------------------------------------------------------
+std::string RunOptions::backend_for_coder(int n) const {
+    if (coder_backends.empty()) return coder_backend;
+    // Round-robin, 1-based. A list shorter than the plan repeats rather than
+    // running out -- two coders on claude is a sensible thing to ask for.
+    const std::size_t index =
+        static_cast<std::size_t>(n > 0 ? n - 1 : 0) % coder_backends.size();
+    const std::string picked = coder_backends[index];
+    return picked.empty() ? coder_backend : picked;
+}
+
 std::string RunOptions::model_for(const std::string& role) const {
     // Role first, then the run-wide model, then (by returning empty) the config's.
     if (role == "director" && !director_model.empty()) return director_model;
@@ -997,12 +1007,24 @@ RunResult run_crew(const Config& config, const RunOptions& options,
         note("plan: " + std::to_string(options.amplify) +
              " plans, keeping the shape most of them agree on");
     }
-    const Plan plan =
-        options.amplify > 1
-            ? plan_amplified(config, options.task, files, options.max_subtasks,
-                             options.amplify, options.model_for("director"), hint)
-            : plan_task(config, options.task, files, options.max_subtasks,
-                        options.model_for("director"), hint);
+    Plan plan;
+    if (is_cli_backend(options.director_backend)) {
+        // The same prompt, answered by an agent CLI instead of Ollama. Run in the
+        // project so it can look around if it wants to; it is planning, not
+        // editing, and the Auditor still reads whatever the coders produce.
+        note("plan: asking " + options.director_backend);
+        const std::string reply =
+            ask_cli(options.director_backend, options.model_for("director"),
+                    director_prompt(options.task, files, options.max_subtasks, hint),
+                    options.project);
+        plan = parse_plan(reply, options.max_subtasks);
+    } else if (options.amplify > 1) {
+        plan = plan_amplified(config, options.task, files, options.max_subtasks,
+                              options.amplify, options.model_for("director"), hint);
+    } else {
+        plan = plan_task(config, options.task, files, options.max_subtasks,
+                         options.model_for("director"), hint);
+    }
     if (!plan.ok()) {
         result.error = plan.error;
         publish(/*active=*/false);
@@ -1065,10 +1087,11 @@ RunResult run_crew(const Config& config, const RunOptions& options,
             // same either way -- the changeset is captured from the sandbox, the
             // Auditor reviews it, the overlap guard and secret gate apply. Handing
             // the work to a stronger agent does not hand it the project.
-            if (is_cli_backend(options.coder_backend)) {
+            const std::string backend =
+                options.backend_for_coder(attempt.subtask.n);
+            if (is_cli_backend(backend)) {
                 attempt.outcome = run_cli_coder(config, attempt.subtask, sandbox,
-                                                options.coder_backend,
-                                                options.model_for("coder"),
+                                                backend, options.model_for("coder"),
                                                 /*timeout_seconds=*/900, lessons);
             } else {
                 attempt.outcome = run_coder(config, attempt.subtask, sandbox,
@@ -1084,7 +1107,26 @@ RunResult run_crew(const Config& config, const RunOptions& options,
             // the next.
             // Which review, in order of cost. Debate is three calls; a panel is
             // `amplify` calls; the plain Auditor is one.
-            if (options.debate) {
+            if (is_cli_backend(options.auditor_backend)) {
+                // Certain checks first, as always -- there is nothing an agent
+                // could say that makes a leaked credential acceptable.
+                attempt.audit = deterministic_audit(attempt.changeset, options.audit);
+                if (!attempt.audit.held()) {
+                    const std::string reply = ask_cli(
+                        options.auditor_backend, options.model_for("auditor"),
+                        auditor_prompt(attempt.subtask, attempt.changeset,
+                                       options.audit),
+                        options.project);
+                    attempt.audit = parse_audit(reply);
+                    if (attempt.audit.held() && !attempt.audit.quote.empty() &&
+                        !quote_is_real(attempt.audit.quote, attempt.changeset.diff)) {
+                        attempt.audit.notes.push_back(
+                            "the Auditor quoted a line that is not in this diff, so "
+                            "its reason may be invented: \"" + attempt.audit.quote +
+                            "\"");
+                    }
+                }
+            } else if (options.debate) {
                 attempt.audit = debate_changeset(config, attempt.subtask,
                                                  attempt.changeset, options.audit,
                                                  options.model_for("auditor"));

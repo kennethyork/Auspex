@@ -430,11 +430,16 @@ private:
     Gtk::Grid  roles_;
     struct RoleRow {
         Gtk::Label    label;
+        // WHICH AGENT, then which model. Backend first because it is the bigger
+        // lever: a role on claude runs whatever frontier model its owner
+        // configured, while a role on ollama is capped at what Ollama serves.
+        Gtk::DropDown backends;
         Gtk::DropDown models;
         std::string   key;     // "director" | "coder" | "auditor"
     };
     std::vector<std::unique_ptr<RoleRow>> rows_;
     std::vector<std::string> models_;
+    std::vector<std::string> backends_;
     bool loading_ = false;
 
     // The pipeline, with the live stage marked.
