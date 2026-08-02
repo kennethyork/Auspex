@@ -108,6 +108,17 @@ struct RunOptions {
     // The Director and the Auditor can be agent CLIs too. They need a reply
     // rather than file edits, and `claude -p` gives exactly that -- so the role
     // that most needs a capable model is not stuck on whatever Ollama serves.
+    // The Researcher: a read-only pass BEFORE the Director that reports where
+    // things live and what the conventions are. Its findings go to the Director
+    // and to every coder.
+    //
+    // On by default, unlike the other options, because it is the one that makes
+    // the rest of the run better rather than more thorough -- a Director planning
+    // against a filename list is guessing at structure.
+    bool        research = true;
+    std::string researcher_backend = "ollama";
+    std::string researcher_model;
+
     std::string director_backend = "ollama";
     std::string auditor_backend  = "ollama";
 
@@ -283,6 +294,7 @@ std::optional<CrewPack> find_pack(const std::string& name);
 enum class FacultyState {
     Always,      // part of every run; nothing to turn on
     Optional,    // exists, and is off unless asked for
+    Guard,       // always on AND cannot be turned off -- a refusal, not a stage
     Missing,     // ollamadev has it, Auspex does not (yet)
 };
 

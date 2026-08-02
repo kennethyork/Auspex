@@ -8,6 +8,7 @@
 
 #include "auspex/ollama_client.hpp"
 #include "auspex/process.hpp"
+#include "auspex/code_index.hpp"
 #include "auspex/sandbox.hpp"
 
 using json = nlohmann::json;
@@ -300,6 +301,102 @@ std::string coder_prompt(const PlannedSubtask& subtask,
     return out.str();
 }
 
+std::string researcher_prompt(const std::string& task,
+                              const std::vector<std::string>& files,
+                              const std::vector<CoderStep>& steps,
+                              const CoderLimits& limits) {
+    std::ostringstream out;
+
+    out << "You are the Researcher. Investigate this project and report what a team "
+           "of coders needs to know before they start.\n\n";
+
+    out << "Report:\n"
+           "- where the relevant things live\n"
+           "- the conventions actually in use here, not the ones you would prefer\n"
+           "- the files this work will need to touch\n\n";
+
+    out << "You may only look. There is no verb here that changes anything.\n\n";
+
+    out << "Answer with ONE JSON object per turn:\n"
+           "  {\"tool\":\"list\"}                       what files exist\n"
+           "  {\"tool\":\"read\",\"path\":\"src/x.py\"}     read one\n"
+           "  {\"tool\":\"finish\",\"note\":\"…\"}         your report, when you have "
+           "seen enough\n\n";
+
+    out << "Finish within " << limits.max_steps
+        << " steps. The note you finish with IS the report -- write it for somebody "
+           "who has not seen the code.\n\n";
+
+    out << "The task the team was given:\n" << task << "\n\n";
+
+    if (!files.empty()) {
+        out << "Files here:\n";
+        constexpr std::size_t kMaxListed = 200;
+        const std::size_t shown = std::min(files.size(), kMaxListed);
+        for (std::size_t i = 0; i < shown; ++i) out << "  " << files[i] << "\n";
+        if (files.size() > shown) {
+            out << "  ... and " << (files.size() - shown) << " more\n";
+        }
+        out << "\n";
+    }
+
+    if (!steps.empty()) {
+        out << "What you have looked at so far:\n";
+        for (std::size_t i = 0; i < steps.size(); ++i) {
+            out << "  " << (i + 1) << ". " << tool_name(steps[i].call.tool);
+            if (!steps[i].call.path.empty()) out << " " << steps[i].call.path;
+            out << "\n";
+            // Read CONTENTS are replayed, unlike a coder's writes: what it saw is
+            // the whole of what it has to reason from, and dropping it would make
+            // the report a summary of the last file only.
+            out << "     -> " << steps[i].result.output.substr(0, 2000) << "\n";
+        }
+        out << "\n";
+    }
+
+    out << "Your next tool call, as JSON:\n";
+    return out.str();
+}
+
+std::string run_researcher(const Config& config, const std::string& task,
+                           const std::filesystem::path& project,
+                           const CoderLimits& limits, const std::string& model) {
+    if (!std::filesystem::is_directory(project) || trim(task).empty()) return {};
+
+    CoderLimits bounded = limits;
+    bounded.read_only = true;      // whatever the caller passed
+    bounded.allow_run = false;
+    if (bounded.max_steps > 8) bounded.max_steps = 8;   // looking, not building
+
+    OllamaClient ollama(config);
+    GenerateOptions options;
+    options.json = true;
+    options.disable_thinking = true;
+    options.temperature = 0.2;
+
+    std::vector<CoderStep> steps;
+    for (int step = 0; step < bounded.max_steps; ++step) {
+        const auto files = list_file_names(project);
+        const auto reply = ollama.generate(
+            model.empty() ? config.ollama_model : model,
+            researcher_prompt(task, files, steps, bounded), options);
+        if (!reply) break;
+
+        CoderStep current;
+        current.call = parse_tool_call(reply->response.empty() ? reply->thinking
+                                                               : reply->response);
+        current.result = run_tool(current.call, project, bounded);
+
+        if (current.call.tool == CoderTool::Finish) return current.call.note;
+        steps.push_back(std::move(current));
+    }
+
+    // Out of steps without a report. What it read is not nothing, but it is not a
+    // report either, and inventing one from the transcript would be putting words
+    // in its mouth for every downstream role to trust.
+    return {};
+}
+
 ToolCall parse_tool_call(const std::string& reply) {
     ToolCall call;
 
@@ -432,6 +529,15 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
     if (call.tool == CoderTool::Finish) {
         result.ok = true;
         result.output = "finished";
+        return result;
+    }
+
+    // Enforced here rather than by leaving the verbs out of the prompt: a model
+    // that asks for `write` anyway must get a refusal, not a written file.
+    if (limits.read_only &&
+        (call.tool == CoderTool::Write || call.tool == CoderTool::Delete ||
+         call.tool == CoderTool::Run)) {
+        result.output = "this is a read-only pass; you may only list, read and finish";
         return result;
     }
 

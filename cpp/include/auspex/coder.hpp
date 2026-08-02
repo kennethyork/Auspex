@@ -164,6 +164,14 @@ struct CoderLimits {
     // answered with the subtask pushed out of view.
     std::size_t max_read_bytes = 24'000;
 
+    // Read-only: write, delete and run are refused whatever the model asks for.
+    //
+    // This is what makes a Researcher safe to point at the real project rather
+    // than a copy. It is enforced in run_tool(), not by leaving the verbs out of
+    // the prompt -- a model that asks for `write` anyway gets a refusal, not a
+    // written file.
+    bool read_only = false;
+
     // Whether `run` exists at all.
     //
     // OFF BY DEFAULT. Turning it on lets a coder execute a test suite it just
@@ -243,6 +251,24 @@ bool is_runnable(const std::string& program);
 // injected once rather than repeated into every prompt for the rest of the run.
 std::string take_steer(const std::filesystem::path& mailbox);
 bool        leave_steer(const std::filesystem::path& mailbox, const std::string& message);
+
+// The Researcher: read the project, report what a team needs to know.
+//
+// Runs BEFORE the Director and hands its findings to everyone downstream -- where
+// things live, the conventions in use, the files the work will touch. A filename
+// list and a semantic index say what EXISTS; this says what it means.
+//
+// Read-only by construction: the limits it runs under refuse every writing verb,
+// so it can be pointed at the real project rather than a sandbox.
+std::string run_researcher(const Config& config, const std::string& task,
+                           const std::filesystem::path& project,
+                           const CoderLimits& limits = {},
+                           const std::string& model = {});
+
+std::string researcher_prompt(const std::string& task,
+                              const std::vector<std::string>& files,
+                              const std::vector<CoderStep>& steps,
+                              const CoderLimits& limits);
 
 CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,

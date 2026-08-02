@@ -5705,6 +5705,76 @@ void test_crew_run() {
         check(!nowhere.error.empty(), "with a reason");
     }
 
+    // ---- the Researcher is read-only, and that is enforced ----
+    //
+    // It is pointed at the REAL project rather than a sandbox, so "read-only" has
+    // to be a refusal in the dispatcher and not merely a verb left out of the
+    // prompt. A model that asks for `write` anyway must get a refusal, not a file.
+    {
+        const auto root = std::filesystem::temp_directory_path() /
+                          "auspex-selftest-research";
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+        std::ofstream(root / "keep.py") << "x = 1\n";
+
+        CoderLimits looking;
+        looking.read_only = true;
+
+        const auto call = [](CoderTool t, std::string p, std::string c = {}) {
+            ToolCall k;
+            k.tool = t;
+            k.path = std::move(p);
+            k.contents = std::move(c);
+            return k;
+        };
+
+        check(run_tool(call(CoderTool::List, ""), root, looking).ok,
+              "a read-only pass may list");
+        check(run_tool(call(CoderTool::Read, "keep.py"), root, looking).ok, "and read");
+
+        const ToolResult wrote =
+            run_tool(call(CoderTool::Write, "new.py", "y = 2\n"), root, looking);
+        check(!wrote.ok, "but NOT write");
+        check(!std::filesystem::exists(root / "new.py"), "and nothing appears");
+
+        const ToolResult clobber =
+            run_tool(call(CoderTool::Write, "keep.py", "wiped\n"), root, looking);
+        check(!clobber.ok, "nor overwrite what is there");
+        {
+            std::ifstream in(root / "keep.py");
+            std::ostringstream got;
+            got << in.rdbuf();
+            check_eq(got.str(), std::string("x = 1\n"), "the file is untouched");
+        }
+
+        check(!run_tool(call(CoderTool::Delete, "keep.py"), root, looking).ok,
+              "nor delete");
+        check(std::filesystem::exists(root / "keep.py"), "and it survives");
+
+        // Even with running turned on, a read-only pass cannot run anything: the
+        // two flags are not a negotiation.
+        CoderLimits both;
+        both.read_only = true;
+        both.allow_run = true;
+        ToolCall runner;
+        runner.tool = CoderTool::Run;
+        runner.command = {"python3", "-c", "open('escaped.py','w').write('x')"};
+        check(!run_tool(runner, root, both).ok, "nor run a command");
+        check(!std::filesystem::exists(root / "escaped.py"), "which could have written");
+
+        // The prompt says what it is for.
+        const std::string prompt = researcher_prompt("add rate limiting", {"a.py"},
+                                                     {}, looking);
+        check(prompt.find("Researcher") != std::string::npos, "the role is named");
+        check(prompt.find("conventions") != std::string::npos,
+              "and asked for the conventions actually in use");
+        check(prompt.find("\"tool\":\"write\"") == std::string::npos,
+              "and no writing verb is offered");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
     // ---- one backend per coder ----
     //
     // The difference between "several coders" and several DIFFERENT coders: two
@@ -5925,10 +5995,13 @@ void test_crew_run() {
         // Not switches. Overlapping work is held whatever you do, and a leaked
         // credential is never landed -- drawing either as optional would offer a
         // choice that does not exist.
-        check(find("overlap") && find("overlap")->state == FacultyState::Always,
-              "the overlap guard is not optional");
-        check(find("secret") && find("secret")->state == FacultyState::Always,
-              "and neither is the secret gate");
+        // Guards, not stages. Neither can be turned off and neither is a step the
+        // run passes through -- they are refusals sitting across the landing pass,
+        // and the map draws them apart for that reason.
+        check(find("overlap") && find("overlap")->state == FacultyState::Guard,
+              "the overlap guard is a guard, not a stage");
+        check(find("secret") && find("secret")->state == FacultyState::Guard,
+              "and so is the secret gate");
 
         // Debate and the security scan are real now, and the map must say so --
         // it was drawing them as missing, which was true when it was written.
@@ -5938,8 +6011,8 @@ void test_crew_run() {
               "and so does the security scan");
         check(find("amplify") && find("amplify")->state == FacultyState::Optional,
               "and amplify");
-        check(find("learn") && find("learn")->state == FacultyState::Optional,
-              "and learning");
+        check(find("memory") && find("memory")->state == FacultyState::Optional,
+              "and memory");
 
         // Nothing claims to be missing any more. If something is added back to
         // this list as Missing, that is a deliberate statement, not an oversight.

@@ -50,6 +50,7 @@ struct Config {
     // src/calc.py instead of editing calc.py. Reviewing is the hardest of the three
     // roles and the one where being wrong is most expensive -- a bad Auditor either
     // holds everything, which makes the crew pointless, or lands something broken.
+    std::string crew_researcher_model;
     std::string crew_director_model;
     std::string crew_coder_model;
     std::string crew_auditor_model;
@@ -60,6 +61,7 @@ struct Config {
     // This is a bigger lever than the model names above it: a role on claude or
     // codex is running whatever frontier model its owner configured, while a role
     // on ollama is capped at what Ollama serves.
+    std::string crew_researcher_backend;
     std::string crew_director_backend;
     std::string crew_coder_backend;
     std::string crew_auditor_backend;

@@ -933,6 +933,9 @@ void CrewWindow::start() {
     options.security = security_.get_active();
     if (amplify_.get_value_as_int() > 0) options.amplify = amplify_.get_value_as_int();
 
+    options.researcher_backend = config.crew_researcher_backend.empty()
+                                     ? "ollama" : config.crew_researcher_backend;
+    options.researcher_model   = config.crew_researcher_model;
     options.director_backend = config.crew_director_backend.empty()
                                    ? "ollama" : config.crew_director_backend;
     options.coder_backend    = config.crew_coder_backend.empty()
@@ -1550,6 +1553,9 @@ BrainWindow::BrainWindow() {
     roles_.set_column_spacing(12);
 
     static const std::vector<std::pair<const char*, const char*>> kRoles{
+        // The Researcher runs FIRST, so it is listed first: the order on screen is
+        // the order of the run.
+        {"researcher", "Researcher — reads"},
         {"director", "Director — plans"},
         {"coder",    "Coders — build"},
         {"auditor",  "Auditor — reviews"},
@@ -1656,9 +1662,10 @@ void BrainWindow::reload() {
         }
 
         const std::string chosen_backend =
-            entry->key == "director" ? config.crew_director_backend
-            : entry->key == "coder"  ? config.crew_coder_backend
-                                     : config.crew_auditor_backend;
+            entry->key == "researcher" ? config.crew_researcher_backend
+            : entry->key == "director" ? config.crew_director_backend
+            : entry->key == "coder"    ? config.crew_coder_backend
+                                       : config.crew_auditor_backend;
         guint backend_index = 0;
         for (std::size_t i = 0; i < backends_.size(); ++i) {
             if (backends_[i] == chosen_backend) {
@@ -1677,9 +1684,10 @@ void BrainWindow::reload() {
         entry->models.set_model(Gtk::StringList::create(labels));
 
         const std::string current =
-            entry->key == "director" ? config.crew_director_model
-            : entry->key == "coder"  ? config.crew_coder_model
-                                     : config.crew_auditor_model;
+            entry->key == "researcher" ? config.crew_researcher_model
+            : entry->key == "director" ? config.crew_director_model
+            : entry->key == "coder"    ? config.crew_coder_model
+                                       : config.crew_auditor_model;
 
         guint selected = 0;
         for (std::size_t i = 0; i < models_.size(); ++i) {
@@ -1768,48 +1776,49 @@ void BrainWindow::refresh_map() {
 
     for (const auto& part : crew_faculties()) {
         auto card = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 1);
-        card->add_css_class("code-block");
+        card->add_css_class("faculty");
 
-        std::string title = part.label;
-        std::string note  = part.role;
-
+        // The category decides the colour of the stripe down the left, so the
+        // shape of the pipeline reads before any of the words do: what always
+        // runs, what you asked for, and what simply refuses.
         switch (part.state) {
-            case FacultyState::Missing:
-                title += "   (not in Auspex yet)";
-                break;
-            case FacultyState::Optional:
-                // Say whether the optional thing is actually on, rather than
-                // leaving "optional" to mean either.
-                if (part.key == "mcp") {
-                    title += have_mcp ? "   (configured)" : "   (none configured)";
-                } else if (part.key == "run") {
-                    title += "   (off by default)";
-                }
-                break;
-            case FacultyState::Always:
-                break;
+            case FacultyState::Guard:    card->add_css_class("faculty-guard"); break;
+            case FacultyState::Optional: card->add_css_class("faculty-optin"); break;
+            case FacultyState::Missing:  card->add_css_class("faculty-missing"); break;
+            case FacultyState::Always:   card->add_css_class("faculty-always"); break;
         }
 
-        auto* name = Gtk::make_managed<Gtk::Label>(title);
+        std::string note = part.role;
+        if (part.state == FacultyState::Optional) {
+            // Whether the optional thing is actually ON, rather than leaving
+            // "opt-in" to mean either.
+            if (part.key == "mcp") {
+                note += have_mcp ? "  ·  configured" : "  ·  none configured";
+            } else if (part.key == "run") {
+                note += "  ·  off by default";
+            } else {
+                note += "  ·  opt-in";
+            }
+        } else if (part.state == FacultyState::Missing) {
+            note += "  ·  not in Auspex yet";
+        }
+
+        auto* name = Gtk::make_managed<Gtk::Label>(part.label);
         name->set_xalign(0.0f);
+        name->add_css_class("faculty-name");
+
         auto* what = Gtk::make_managed<Gtk::Label>(note);
         what->set_xalign(0.0f);
         what->set_wrap(true);
-        what->add_css_class("subtitle");
+        what->add_css_class("faculty-role");
 
         card->append(*name);
         card->append(*what);
 
-        if (part.key == active) {
-            card->add_css_class("recording");   // the stage the run is in, now
-        }
+        if (part.key == active) card->add_css_class("faculty-active");
         if (part.state == FacultyState::Missing) {
-            // DIMMED, not red. Red is for something that went wrong; this went
-            // nowhere -- it is a part of ollamadev's crew that Auspex has not
-            // built. It also has to stay readable: the error colour on this
-            // background is dark red on dark grey.
-            name->set_opacity(0.45);
-            what->set_opacity(0.45);
+            name->set_opacity(0.4);
+            what->set_opacity(0.4);
         }
 
         map_.append(*card);

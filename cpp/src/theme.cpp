@@ -552,6 +552,60 @@ window.auspex-panel togglebutton:active {
     background-image: none;
 }
 
+/* The Brain's pipeline.
+ *
+ * A stripe down the left rather than a filled box, so the shape of the pipeline
+ * reads before any of the words do: what always runs, what you asked for, and
+ * what simply refuses. Filling them would make thirteen rows of solid colour and
+ * tell you nothing.
+ *
+ * The stripe is border-left, not a nested widget, because a border cannot be
+ * clipped away by a scroller the way a 4px box can. */
+.faculty {
+    padding: 6px 10px;
+    margin: 1px 0;
+    border-left: 3px solid $subtitle_fg;
+    background-color: $button_bg;
+    border-radius: 4px;
+}
+
+.faculty-name {
+    font-weight: bold;
+    color: $panel_fg;
+}
+
+.faculty-role {
+    color: $subtitle_fg;
+    font-size: 90%;
+}
+
+/* Part of every run. */
+.faculty-always {
+    border-left-color: $link;
+}
+
+/* Exists, and is off unless asked for. */
+.faculty-optin {
+    border-left-color: $accent;
+}
+
+/* A refusal rather than a stage: these cannot be turned off, so they are marked
+ * apart from the things that merely always happen. */
+.faculty-guard {
+    border-left-color: $error;
+}
+
+/* Not built. Dimmed in code as well, so it reads as absent rather than broken. */
+.faculty-missing {
+    border-left-color: $subtitle_fg;
+}
+
+/* Where a live run is right now. */
+.faculty-active {
+    background-color: $button_active;
+    border-left-color: $entry_focus;
+}
+
 /* Monitor and Clock labels */
 .monitor-label {
     color: $panel_fg;

@@ -187,6 +187,7 @@ std::string RunOptions::backend_for_coder(int n) const {
 
 std::string RunOptions::model_for(const std::string& role) const {
     // Role first, then the run-wide model, then (by returning empty) the config's.
+    if (role == "researcher" && !researcher_model.empty()) return researcher_model;
     if (role == "director" && !director_model.empty()) return director_model;
     if (role == "auditor"  && !auditor_model.empty())  return auditor_model;
     if (role == "coder"    && !coder_model.empty())    return coder_model;
@@ -559,7 +560,8 @@ const std::vector<Faculty>& crew_faculties() {
     // overlapping work is held whatever you do, and a leaked credential is never
     // landed. Neither is a switch, so neither is drawn as one.
     static const std::vector<Faculty> kParts{
-        {"researcher", "Researcher", "reads the project and indexes it by meaning",
+        {"researcher", "Researcher",
+         "reads the project read-only and reports what a team needs to know",
          FacultyState::Always},
         {"director", "Director", "decomposes the task into independent pieces",
          FacultyState::Always},
@@ -573,17 +575,20 @@ const std::vector<Faculty>& crew_faculties() {
          FacultyState::Optional},
         {"auditor", "Auditor", "reviews every changeset before it lands",
          FacultyState::Always},
+        // Guards, not stages. Neither can be turned off and neither is a step the
+        // run passes through -- they are refusals that sit across the landing
+        // pass, which is why they are drawn apart from the rest.
         {"secret", "Secret gate", "never lands a leaked credential",
-         FacultyState::Always},
-        {"overlap", "Overlap guard", "holds work that would overwrite another's",
-         FacultyState::Always},
+         FacultyState::Guard},
+        {"overlap", "Overlap guard", "first writer wins on a shared file",
+         FacultyState::Guard},
         {"landing", "Landing", "applies what passed, holds the rest",
          FacultyState::Always},
         {"debate", "Debate", "advocate vs skeptic vs judge, on every changeset",
          FacultyState::Optional},
         {"amplify", "Amplify", "N plans kept by agreement, N reviewers voting",
          FacultyState::Optional},
-        {"learn", "Learn", "remembers why work was held, for the next run",
+        {"memory", "Memory", "remembers why work was held, for the next run",
          FacultyState::Optional},
         {"security", "Security scan", "read-only vulnerability hunt; builds nothing",
          FacultyState::Optional},
@@ -999,9 +1004,45 @@ RunResult run_crew(const Config& config, const RunOptions& options,
         note("research: " + std::to_string(skills.skills.size()) + " skill(s) available");
     }
 
-    const std::string hint =
-        relevant_files_note(config, options.project, options.task);
+    std::string hint = relevant_files_note(config, options.project, options.task);
     if (!hint.empty()) note("research: the index suggests where to look");
+
+    // The Researcher. A read-only pass that reports what the index cannot: the
+    // index says which files are RELATED, this says what they mean and how this
+    // project does things.
+    if (options.research) {
+        note("research: investigating the codebase");
+        std::string findings;
+        if (is_cli_backend(options.researcher_backend)) {
+            // An agent CLI in a SANDBOX, and the sandbox thrown away afterwards.
+            // Its own read-only mode differs per tool and some have none; a
+            // throwaway copy makes the question moot -- whatever it writes, only
+            // its text comes back.
+            const auto scratch = auspex_crew_dir() / result.run_id / "research";
+            std::string error;
+            if (create_sandbox(options.project, scratch, &error)) {
+                findings = ask_cli(options.researcher_backend,
+                                   options.model_for("researcher"),
+                                   researcher_prompt(options.task,
+                                                     list_file_names(scratch), {},
+                                                     options.coder),
+                                   scratch);
+                destroy_sandbox(scratch);
+            }
+        } else {
+            findings = run_researcher(config, options.task, options.project,
+                                      options.coder, options.model_for("researcher"));
+        }
+
+        if (!findings.empty()) {
+            // Shared with the Director AND every coder, through the channel each
+            // already reads. One set of findings, not one per role.
+            hint += "What the Researcher found:\n" + findings + "\n\n";
+            note("research: reported " + std::to_string(findings.size()) + " chars");
+        } else {
+            note("research: nothing reported");
+        }
+    }
 
     if (options.amplify > 1) {
         note("plan: " + std::to_string(options.amplify) +
@@ -1036,9 +1077,11 @@ RunResult run_crew(const Config& config, const RunOptions& options,
         // Carried in the detail rather than as another prompt argument. The coder
         // prompt already renders detail prominently, and threading a fifth string
         // through every signature to say the same thing would be worse.
-        if (!lessons.empty()) {
-            piece.detail = piece.detail.empty() ? lessons
-                                                : piece.detail + "\n\n" + lessons;
+        std::string extra = lessons;
+        if (!hint.empty()) extra = hint + extra;
+        if (!extra.empty()) {
+            piece.detail = piece.detail.empty() ? extra
+                                                : piece.detail + "\n\n" + extra;
         }
         attempts.push_back({piece, {}, {}, {}, "todo"});
     }
