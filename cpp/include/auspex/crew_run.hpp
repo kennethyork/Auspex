@@ -133,6 +133,15 @@ struct RunOptions {
     // that should be asked for.
     bool        route = false;
 
+    // Run the project's tests in the sandbox after a coder finishes, and hand
+    // the failures back if they are red. 0 is off.
+    //
+    // OFF BY DEFAULT, and it also needs coder.allow_run -- running a suite
+    // executes code the coder just wrote, which is the same decision allow_run
+    // exists to gate rather than a second, weaker one. The `tested` pack turns
+    // both on together.
+    int verify_attempts = 0;
+
     // Write the shipped starter skills that match this task into the project.
     //
     // ON by default, unlike most things here, because the failure mode is mild

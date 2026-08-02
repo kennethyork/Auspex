@@ -252,6 +252,7 @@ add_library(auspex-core STATIC
     src/roles.cpp
     src/usage.cpp
     src/linters.cpp
+    src/verify.cpp
     src/hooks.cpp
     src/eval.cpp
     src/vad.cpp

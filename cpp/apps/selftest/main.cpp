@@ -44,6 +44,7 @@
 #include "auspex/linters.hpp"
 #include "auspex/roles.hpp"
 #include "auspex/usage.hpp"
+#include "auspex/verify.hpp"
 #include "auspex/panel_dock.hpp"
 #include "auspex/process.hpp"
 #include "auspex/projects.hpp"
@@ -7108,6 +7109,241 @@ void test_starter_skills() {
 }
 
 // ---------------------------------------------------------------------------
+// Verify
+//
+// Detection is pure -- a list of filenames in, a command out -- so the rules can
+// be tested without creating a project for each language.
+// ---------------------------------------------------------------------------
+void test_verify() {
+    using namespace auspex;
+    std::cout << "\nverify\n";
+
+    // ---- guessing is refused ----
+    //
+    // The most important case. Running the wrong suite fails in a way that looks
+    // like the coder's fault, and a crew that reports "your tests fail" because it
+    // ran the wrong command is worse than one that stays quiet.
+    {
+        check(!detect_tests_from({}).has_value(), "an empty project yields no command");
+        check(!detect_tests_from({"README.md", "LICENSE", "notes.txt"}).has_value(),
+              "and so does one with nothing recognisable");
+        check(!detect_tests_from({"main.c", "util.c"}).has_value(),
+              "source files alone are not a test setup");
+    }
+
+    // ---- the layouts ----
+    {
+        if (in_path("cargo")) {
+            const auto rust = detect_tests_from({"Cargo.toml", "src/main.rs"});
+            check(rust.has_value(), "a Cargo project is recognised");
+            if (rust) check_eq(rust->argv[0], std::string("cargo"), "as cargo");
+        }
+        if (in_path("go")) {
+            const auto go = detect_tests_from({"go.mod", "main.go"});
+            check(go.has_value(), "a Go module is recognised");
+        }
+        if (in_path("npm")) {
+            const auto node = detect_tests_from({"package.json", "index.js"});
+            check(node.has_value(), "a Node project is recognised");
+            if (node) check_eq(node->argv[0], std::string("npm"), "as npm");
+        }
+        if (in_path("pytest") || in_path("python3")) {
+            const auto py = detect_tests_from({"pyproject.toml", "test_calc.py"});
+            check(py.has_value(), "a Python project with tests is recognised");
+        }
+    }
+
+    // ---- order is the design ----
+    //
+    // Nearly every project has a Makefile, so make must lose to anything more
+    // specific or it would answer for all of them.
+    {
+        if (in_path("cargo") && in_path("make")) {
+            const auto both = detect_tests_from({"Cargo.toml", "Makefile", "src/x.rs"});
+            check(both.has_value(), "a Rust project with a Makefile is recognised");
+            if (both) {
+                check_eq(both->argv[0], std::string("cargo"),
+                         "as cargo, not make -- the specific runner wins");
+            }
+        }
+        if (in_path("make")) {
+            const auto only_make = detect_tests_from({"Makefile", "main.c"});
+            check(only_make.has_value(), "but a Makefile alone is used");
+            if (only_make) check_eq(only_make->argv[0], std::string("make"), "as make");
+        }
+    }
+
+    // ---- ctest needs a configured tree ----
+    {
+        if (in_path("ctest")) {
+            check(!detect_tests_from({"CMakeLists.txt", "src/main.cpp"}).has_value() ||
+                      detect_tests_from({"CMakeLists.txt", "src/main.cpp"})->argv[0] !=
+                          "ctest",
+                  "an unconfigured CMake tree is not handed to ctest -- it would "
+                  "fail for a reason that has nothing to do with the code");
+        }
+    }
+
+    // ---- everything detected is something we are willing to run ----
+    {
+        for (const auto& names :
+             std::vector<std::vector<std::string>>{{"Cargo.toml"},
+                                                   {"go.mod"},
+                                                   {"package.json"},
+                                                   {"Makefile"},
+                                                   {"pyproject.toml", "test_a.py"}}) {
+            if (const auto found = detect_tests_from(names)) {
+                check(is_runnable(found->argv[0]),
+                      "a detected runner is on the allowlist: " + found->argv[0]);
+            }
+        }
+    }
+
+    // ---- the digest ----
+    {
+        const std::string small = "one line of output";
+        check_eq(failure_digest(small), small, "short output is passed through whole");
+
+        std::string huge;
+        for (int i = 0; i < 2000; ++i) huge += "line " + std::to_string(i) + "\n";
+        const std::string digest = failure_digest(huge, 400);
+        check(digest.size() < huge.size(), "long output is cut down");
+        check(digest.find("line 0") != std::string::npos,
+              "keeping the head, where a failure is announced");
+        check(digest.find("line 1999") != std::string::npos,
+              "and the tail, where it is counted");
+        check(digest.find("not shown") != std::string::npos,
+              "and saying what was dropped rather than trimming silently");
+    }
+
+    // ---- what the coder is told ----
+    {
+        TestRun red;
+        red.command = {{"pytest", "-q"}, "pytest"};
+        red.exit_code = 1;
+        red.output = "E   assert 4 == 5";
+
+        const std::string note = retry_note(red, 1, 2);
+        check(note.find("FAILED") != std::string::npos, "the coder is told it failed");
+        check(note.find("assert 4 == 5") != std::string::npos, "and shown the failure");
+        check(note.find("attempt 1 of 2") != std::string::npos,
+              "and how many tries are left");
+        check(note.find("Do NOT change or delete the tests") != std::string::npos,
+              "and warned off the shortcut that makes a suite green and the "
+              "project worse");
+
+        TestRun hung;
+        hung.command = {{"pytest", "-q"}, "pytest"};
+        hung.timed_out = true;
+        check(retry_note(hung, 1, 2).find("hanging") != std::string::npos,
+              "a suite that never finished is described as hanging, not as failing");
+    }
+
+    // ---- running one for real ----
+    {
+        std::error_code ec;
+        const std::filesystem::path root = "/tmp/auspex-verify-run";
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+
+        if (in_path("python3")) {
+            {
+                std::ofstream out(root / "Makefile");
+                out << "test:\n\t@python3 -c \"import sys; sys.exit(1)\"\n";
+            }
+            if (in_path("make")) {
+                const TestCommand cmd{{"make", "test"}, "make test"};
+                const TestRun run = run_tests(cmd, root, 30);
+                check(!run.green(), "a failing suite is reported as not green");
+                check(run.exit_code != 0, "with a non-zero exit");
+
+                std::ofstream out(root / "Makefile", std::ios::trunc);
+                out << "test:\n\t@python3 -c \"import sys; sys.exit(0)\"\n";
+                out.close();
+                check(run_tests(cmd, root, 30).green(), "and a passing one as green");
+            }
+        }
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- a suite edited to pass is not a suite that passed ----
+    //
+    // Watched happening on the first live run that could: given two tests that
+    // contradicted each other, the coder edited one and verify reported green,
+    // because it was. A check that can be satisfied by deleting the check is not
+    // a check.
+    {
+        check(looks_like_tests("test_calc.py"), "test_ prefix");
+        check(looks_like_tests("calc_test.go"), "_test suffix");
+        check(looks_like_tests("tests/unit/thing.py"), "a tests directory");
+        check(looks_like_tests("src/__tests__/x.js"), "a __tests__ directory");
+        check(looks_like_tests("cart.spec.ts"), "a spec file");
+        check(!looks_like_tests("src/calc.py"), "and ordinary source is not");
+        check(!looks_like_tests("latest.py"),
+              "nor a file that merely contains the letters");
+
+        // Adding tests removes nothing, so it trips nothing.
+        Changeset added;
+        added.diff = unified_diff("test_calc.py",
+                                  "def test_a():\n    assert f(1) == 1\n",
+                                  "def test_a():\n    assert f(1) == 1\n\n\n"
+                                  "def test_b():\n    assert f(2) == 2\n");
+        check(weakened_tests(added).empty(),
+              "adding a test is not weakening the suite -- a coder asked for more "
+              "tests must not be punished for writing them");
+
+        // Changing an assertion removes a line, and that is the tell.
+        Changeset edited;
+        edited.diff = unified_diff("test_calc.py",
+                                   "def test_a():\n    assert f(4) == 9\n",
+                                   "def test_a():\n    assert f(4) == 8\n");
+        const auto caught = weakened_tests(edited);
+        check_eq(caught.size(), std::size_t{1}, "changing an assertion is caught");
+        if (!caught.empty()) {
+            check_eq(caught[0], std::string("test_calc.py"), "and the file is named");
+        }
+
+        // Deleting a test file entirely.
+        Changeset deleted;
+        deleted.diff = unified_diff("test_calc.py",
+                                    "def test_a():\n    assert f(1) == 1\n", "");
+        check(!weakened_tests(deleted).empty(), "deleting the tests is caught too");
+
+        // Production code losing lines is ordinary work, not cheating.
+        Changeset production;
+        production.diff = unified_diff("calc.py", "def f(n):\n    return n - 1\n",
+                                       "def f(n):\n    return n + 1\n");
+        check(weakened_tests(production).empty(),
+              "editing the code under test is the job, not the shortcut");
+    }
+
+    // ---- the coder is warned before it writes, not after ----
+    {
+        const std::string note = no_cheating_note();
+        check(!note.empty(), "there is an up-front warning");
+        check(note.find("Do NOT edit or delete an existing test") != std::string::npos,
+              "naming the shortcut");
+        check(note.find("Adding new tests is fine") != std::string::npos,
+              "while leaving the legitimate case open -- a warning that forbids "
+              "adding tests would break the tester role");
+        check(note.find("held for a person") != std::string::npos,
+              "and saying it is checked, not merely asked");
+    }
+
+    // ---- the tested pack turns on both halves ----
+    {
+        const auto pack = find_pack("tested");
+        check(pack.has_value(), "there is a tested pack");
+        if (pack) {
+            check(pack->options.verify_attempts > 0, "which verifies");
+            check(pack->options.coder.allow_run,
+                  "and lets coders run -- verifying without that would be a "
+                  "setting that silently does nothing");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
 void test_usage() {
@@ -8907,6 +9143,7 @@ int main(int argc, char** argv) {
     test_mcp();
     test_roles();
     test_starter_skills();
+    test_verify();
     test_usage();
     test_linters();
     test_hooks();

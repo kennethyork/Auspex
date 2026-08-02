@@ -20,6 +20,7 @@
 #include "auspex/projects.hpp"
 #include "auspex/roles.hpp"
 #include "auspex/router.hpp"
+#include "auspex/verify.hpp"
 #include "auspex/json_util.hpp"
 
 using json = nlohmann::json;
@@ -637,6 +638,7 @@ std::vector<CrewPack> builtin_packs() {
     CrewPack tested;
     tested.name = "tested";
     tested.options.coder.allow_run = true;
+    tested.options.verify_attempts = 2;
     tested.options.focus =
         "build with test-first discipline -- every change covered by a test that "
         "runs green; do not finish with failing or missing tests";
@@ -1345,20 +1347,25 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
             // the work to a stronger agent does not hand it the project.
             const std::string backend =
                 options.backend_for_coder(attempt.subtask.n);
+
+            // The coder's model, refined by how hard THIS piece looks. A plan with
+            // a rename and a redesign in it should not run both on the same model,
+            // and no per-role setting can say that.
+            //
+            // Declared out here because the verify loop below re-runs the same
+            // coder on the same model when the tests come back red.
+            std::string coder_model = options.model_for("coder");
+            if (options.route) {
+                const Difficulty how = classify_difficulty(
+                    attempt.subtask.title + " " + attempt.subtask.detail);
+                coder_model = route_model(config, coder_model, how.tier);
+            }
+
             if (is_cli_backend(backend)) {
                 attempt.outcome = run_cli_coder(config, attempt.subtask, sandbox,
                                                 backend, options.model_for("coder"),
                                                 /*timeout_seconds=*/900, lessons);
             } else {
-                // The coder's model, refined by how hard THIS piece looks. A plan
-                // with a rename and a redesign in it should not run both on the
-                // same model, and no per-role setting can say that.
-                std::string coder_model = options.model_for("coder");
-                if (options.route) {
-                    const Difficulty how = classify_difficulty(
-                        attempt.subtask.title + " " + attempt.subtask.detail);
-                    coder_model = route_model(config, coder_model, how.tier);
-                }
                 // A read-only role is REFUSED, not asked. run_tool() turns down
                 // every writing verb, so a reviewer that decides to edit something
                 // is told no rather than trusted -- which is what ollamadev cannot
@@ -1367,13 +1374,93 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
                 CoderLimits limits = options.coder;
                 if (role_is_read_only(attempt.subtask.role)) limits.read_only = true;
 
-                attempt.outcome = run_coder(config, attempt.subtask, sandbox,
+                // Told BEFORE it writes anything, not only when a retry happens.
+                // The warning used to live in retry_note() alone, which meant a
+                // coder that took the shortcut on its first attempt was never
+                // warned -- and on the first run that could, it did exactly that.
+                PlannedSubtask piece = attempt.subtask;
+                if (options.verify_attempts > 0 && options.coder.allow_run) {
+                    piece.detail = piece.detail + "\n\n" + no_cheating_note();
+                }
+
+                attempt.outcome = run_coder(config, piece, sandbox,
                                             limits, coder_model,
                                             steer_mailbox(result.run_id,
                                                           attempt.subtask.n),
                                             skills, mcp);
             }
+
+            // Do the tests still pass?
+            //
+            // In the SANDBOX, before anything is captured, so a coder that broke
+            // the suite gets told while it can still act -- and so a suite it
+            // cannot fix never reaches the project. Needs allow_run as well as
+            // verify_attempts: running a suite executes code this coder just
+            // wrote, and that is one decision, not two.
+            if (options.verify_attempts > 0 && options.coder.allow_run &&
+                !is_cli_backend(backend)) {
+                if (const auto tests = detect_tests(sandbox)) {
+                    for (int attempt_n = 1; attempt_n <= options.verify_attempts;
+                         ++attempt_n) {
+                        if (stopped()) break;
+                        const TestRun tested = run_tests(*tests, sandbox,
+                                                         /*timeout_seconds=*/300,
+                                                         cancel);
+                        if (tested.green()) {
+                            note("verify: #" + std::to_string(attempt.subtask.n) +
+                                 " " + tests->label + " green");
+                            break;
+                        }
+                        note("verify: #" + std::to_string(attempt.subtask.n) + " " +
+                             tests->label + " failed, attempt " +
+                             std::to_string(attempt_n) + " of " +
+                             std::to_string(options.verify_attempts));
+
+                        if (attempt_n == options.verify_attempts) {
+                            // Out of attempts. The changeset is still captured and
+                            // still audited -- what the coder wrote may be right
+                            // and the suite wrong -- but the board will say so.
+                            attempt.outcome.error =
+                                "the tests were still failing after " +
+                                std::to_string(options.verify_attempts) +
+                                " attempts (" + tests->label + ")";
+                            break;
+                        }
+
+                        // Handed back as a steer, which is the mechanism that
+                        // already exists for "a person said something mid-run".
+                        // The coder reads it on its next turn.
+                        PlannedSubtask again = attempt.subtask;
+                        again.detail = attempt.subtask.detail + "\n\n" +
+                                       retry_note(tested, attempt_n,
+                                                  options.verify_attempts);
+                        attempt.outcome = run_coder(config, again, sandbox,
+                                                    options.coder, coder_model,
+                                                    steer_mailbox(result.run_id,
+                                                                  attempt.subtask.n),
+                                                    skills, mcp);
+                    }
+                } else {
+                    note("verify: #" + std::to_string(attempt.subtask.n) +
+                         " no test command found, so nothing was run");
+                }
+            }
+
             attempt.changeset = capture_changeset(options.project, sandbox);
+
+            // A green suite proves nothing if the suite was edited to be green.
+            // Checked on the diff rather than on intent: adding tests only adds
+            // lines, so a coder asked for more tests trips nothing, while one that
+            // rewrote an assertion is visible. Held for a person either way -- a
+            // real test refactor looks the same and is also worth a glance.
+            const auto weakened = weakened_tests(attempt.changeset);
+            if (!weakened.empty()) {
+                note("verify: #" + std::to_string(attempt.subtask.n) +
+                     " removed lines from " + weakened.front() +
+                     (weakened.size() > 1
+                          ? " and " + std::to_string(weakened.size() - 1) + " more"
+                          : ""));
+            }
 
             // Audited on the worker thread. It is another model call, and doing it
             // here means a slow audit of one piece does not hold up the coder on
@@ -1420,6 +1507,22 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
                 attempt.audit = audit_changeset(config, attempt.subtask,
                                                 attempt.changeset, options.audit,
                                                 options.model_for("auditor"));
+            }
+
+            // A weakened test suite holds, whatever the Auditor said. This is a
+            // fact about the diff rather than an opinion about it, so it is not
+            // the Auditor's to overrule -- the same standing the secret gate and
+            // the parser have.
+            if (!weakened.empty()) {
+                Audit gate;
+                gate.certain = true;
+                gate.reason = "lines were removed from " + weakened.front() +
+                              " -- a suite edited to pass is not a suite that passed";
+                for (const auto& path : weakened) gate.notes.push_back(path);
+                if (!attempt.audit.reason.empty()) {
+                    gate.notes.push_back("the Auditor also said: " + attempt.audit.reason);
+                }
+                attempt.audit = gate;
             }
 
             {
