@@ -325,6 +325,11 @@ std::vector<EvalTask> load_evals(const std::filesystem::path& directory) {
 std::vector<EvalTask> eval_suite(const std::filesystem::path& project,
                                  const std::string& only) {
     std::vector<EvalTask> tasks = builtin_evals();
+    // The held-out pair is reachable by name, so it can be run deliberately, but
+    // is never part of the default suite -- see holdout_evals().
+    if (!only.empty()) {
+        for (const auto& task : holdout_evals()) tasks.push_back(task);
+    }
     if (!project.empty()) {
         const auto user = load_evals(project / ".auspex" / "evals");
         tasks.insert(tasks.end(), user.begin(), user.end());
@@ -500,6 +505,73 @@ std::vector<EvalResult> run_evals(const Config& config,
         results.push_back(std::move(result));
     }
     return results;
+}
+
+std::vector<EvalTrend> eval_trends(const std::vector<std::vector<EvalResult>>& runs) {
+    std::vector<EvalTrend> trends;
+    std::map<std::string, std::size_t> at;
+    std::map<std::string, long long> total_ms;
+
+    for (const auto& run : runs) {
+        for (const auto& result : run) {
+            if (at.find(result.task) == at.end()) {
+                at[result.task] = trends.size();
+                trends.push_back(EvalTrend{result.task, 0, 0, 0, 0});
+            }
+            EvalTrend& trend = trends[at[result.task]];
+            ++trend.runs;
+            if (result.skipped) {
+                ++trend.skipped;
+            } else {
+                if (result.passed) ++trend.passed;
+                total_ms[result.task] += result.milliseconds;
+            }
+        }
+    }
+
+    for (auto& trend : trends) {
+        const int scored = trend.runs - trend.skipped;
+        trend.mean_ms = scored > 0
+                            ? static_cast<int>(total_ms[trend.task] / scored)
+                            : 0;
+    }
+    return trends;
+}
+
+std::string render_eval_trends(const std::vector<std::vector<EvalResult>>& runs) {
+    std::ostringstream out;
+    const auto trends = eval_trends(runs);
+    if (trends.empty()) {
+        out << "  nothing was run\n";
+        return out.str();
+    }
+
+    int always = 0, never = 0, flaky = 0;
+    for (const auto& trend : trends) {
+        out << "  " << (trend.always() ? " ok " : (trend.never() ? "FAIL" : "~~~~"))
+            << "  " << trend.task << "  " << trend.passed << "/" << trend.runs;
+        if (trend.skipped > 0) out << " (" << trend.skipped << " skipped)";
+        if (trend.mean_ms > 0) out << "  ~" << (trend.mean_ms / 1000) << "s";
+        out << "\n";
+
+        if (trend.always()) {
+            ++always;
+        } else if (trend.never()) {
+            ++never;
+        } else if (trend.skipped < trend.runs) {
+            ++flaky;
+        }
+    }
+
+    out << "\n  " << always << " always pass, " << never << " never, " << flaky
+        << " sometimes\n";
+    if (flaky > 0) {
+        // The number that matters when reading a before/after. A task that passes
+        // half the time will move on its own between two identical builds.
+        out << "  -- a task in the middle column will move between runs on its own;\n"
+               "     do not read a change in one as a change in the code\n";
+    }
+    return out.str();
 }
 
 // --- measuring the Auditor ----------------------------------------------------
@@ -685,6 +757,60 @@ const std::vector<AuditCase>& builtin_audit_cases() {
         return cases;
     }();
     return kCases;
+}
+
+// The held-out pair for the caller-update rule.
+//
+// `two-files` failed because a coder changed a signature and left the caller
+// alone, and the fix was a general rule in the coder prompt. A rule added until
+// one task goes green is indistinguishable from memorising that task -- so this
+// tests the same behaviour in a different shape, with a different verb (rename
+// rather than add an argument) and a different number of callers.
+//
+// If this passes and `two-files` does not, or the reverse, the rule did not
+// generalise and the prompt was fitted to the test.
+const std::vector<EvalTask>& holdout_evals() {
+    static const std::vector<EvalTask> kTasks = [] {
+        std::vector<EvalTask> tasks;
+
+        tasks.push_back(EvalTask{
+            "rename-and-callers",
+            "Rename the function fetch() in store.py to load(). Update everything "
+            "that calls it so the project still works.",
+            {{"store.py", "def fetch(key):\n    return key.upper()\n"},
+             {"app.py",
+              "from store import fetch\n\n\ndef one():\n    return fetch(\"a\")\n\n\n"
+              "def two():\n    return fetch(\"b\")\n"}},
+            {
+                EvalCheck{{}, {}, {},
+                          {"python3", "-c",
+                           "import app,store,sys; sys.exit(0 if store.load('a')=='A' and "
+                           "app.one()=='A' and app.two()=='B' else 1)"},
+                          {}},
+                EvalCheck{"store.py", {}, "def fetch", {}, {}},
+            }});
+
+        tasks.push_back(EvalTask{
+            "return-shape-change",
+            "size() in box.py returns a number. Change it to return a tuple of "
+            "(width, height), both 3. Update anything that uses it so the project "
+            "still works.",
+            {{"box.py", "def size():\n    return 3\n"},
+             {"report.py",
+              "from box import size\n\n\ndef describe():\n"
+              "    return \"area \" + str(size() * size())\n"}},
+            {
+                EvalCheck{{}, {}, {},
+                          {"python3", "-c",
+                           "import box,report,sys; w,h=box.size(); "
+                           "sys.exit(0 if (w,h)==(3,3) and report.describe()=='area 9' "
+                           "else 1)"},
+                          {}},
+            }});
+
+        return tasks;
+    }();
+    return kTasks;
 }
 
 AuditEvalResult run_audit_case(const Config& config, const AuditCase& item,

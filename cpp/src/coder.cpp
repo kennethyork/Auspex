@@ -261,6 +261,10 @@ std::string coder_prompt(const PlannedSubtask& subtask,
            "  here. Do NOT invent a directory: writing src/thing.py when the \n"
            "  project has no src/ is the single most common way this goes \n"
            "  wrong, and the file is then in the wrong place.\n"
+           "- If you change HOW something is called -- its name, its \n"
+           "  arguments, what it returns -- find every place that calls it and \n"
+           "  update those too. A change that is right in one file and breaks \n"
+           "  another is not finished.\n"
            "- Only these tools. There is no shell.\n"
            "- Do the piece you were given and nothing else.\n"
            "- Finish as soon as it is done. You have "
@@ -289,17 +293,22 @@ std::string coder_prompt(const PlannedSubtask& subtask,
             // re-sending them would double the context every time the coder wrote
             // anything -- which is exactly when the context is most needed.
             if (step.call.tool == CoderTool::Write) {
-                // Nudged to stop. A model that has just written the file it was
-                // asked to change will otherwise write it again, slightly
-                // differently, until the budget runs out -- an observed run spent
-                // six of nine steps that way. One sentence in the transcript is a
-                // far cheaper fix than a larger step budget.
+                // Nudged to stop rewriting the same file. A model that has just
+                // written the file it was asked to change will otherwise write it
+                // again, slightly differently, until the budget runs out -- an
+                // observed run spent six of nine steps that way.
+                //
+                // EVERY part, not "your piece". The old wording said "if your piece
+                // is done, finish now" after every single write, which on a piece
+                // that spans two files is the prompt telling the coder to stop
+                // halfway. Watched on the two-files eval: signature changed, caller
+                // never opened.
                 out << "     -> "
                     << (step.result.ok
                             ? (step.result.no_op
                                    ? step.result.output + " -- stop rewriting it"
-                                   : std::string("written. If your piece is done, "
-                                                 "finish now."))
+                                   : std::string("written. If EVERY part of your "
+                                                 "piece is done, finish now."))
                             : step.result.output)
                     << "\n";
             } else {
@@ -307,6 +316,32 @@ std::string coder_prompt(const PlannedSubtask& subtask,
             }
         }
         out << "\n";
+
+        // What has actually changed, gathered in one place.
+        //
+        // The numbered list above is a history and reads as one; a coder four
+        // writes deep has to reconstruct "which files have I dealt with" from it
+        // every turn, and a mid-sized model does not reliably manage that. This is
+        // the same information as state rather than as narrative, which is what a
+        // model needs to answer "what is left".
+        std::vector<std::string> changed;
+        for (const CoderStep& step : steps) {
+            if (!step.result.ok || step.result.no_op) continue;
+            if (step.call.tool != CoderTool::Write &&
+                step.call.tool != CoderTool::Delete) {
+                continue;
+            }
+            if (std::find(changed.begin(), changed.end(), step.call.path) ==
+                changed.end()) {
+                changed.push_back(step.call.path);
+            }
+        }
+        if (!changed.empty()) {
+            out << "Files you have already changed:\n";
+            for (const auto& path : changed) out << "  " << path << "\n";
+            out << "Do not write these again unless something is actually wrong with "
+                   "them. If your piece needs another file changed, do that now.\n\n";
+        }
     }
 
     out << "Your next tool call, as JSON:\n";
@@ -387,6 +422,16 @@ std::string run_researcher(const Config& config, const std::string& task,
     options.temperature = 0.2;
 
     std::vector<CoderStep> steps;
+    bool asked_again = false;
+    // What it has already opened.
+    //
+    // The Researcher had its own loop and never got run_coder's repeat guard, so
+    // nothing stopped it re-reading one file until the budget was gone. Traced on
+    // a real repository: reads of router.cpp at steps 0, 1, 3 and 4, then a report
+    // at step 5 -- and on the runs where it read once more than that, no report at
+    // all. That was the "nothing reported" seen in about a third of runs.
+    std::vector<std::string> already_read;
+
     for (int step = 0; step < bounded.max_steps; ++step) {
         const auto files = list_file_names(project);
         const auto reply = ollama.generate(
@@ -399,7 +444,55 @@ std::string run_researcher(const Config& config, const std::string& task,
                                                                : reply->response);
         current.result = run_tool(current.call, project, bounded);
 
-        if (current.call.tool == CoderTool::Finish) return current.call.note;
+        // Re-reading a file it has already seen. The contents are still in the
+        // transcript, so sending them again buys nothing and costs a step out of
+        // eight -- the scarcest thing this pass has.
+        if (current.call.tool == CoderTool::Read && current.result.ok) {
+            if (std::find(already_read.begin(), already_read.end(), current.call.path) !=
+                already_read.end()) {
+                current.result.output =
+                    "You have already read " + current.call.path +
+                    " -- its contents are above. Read something else, or call "
+                    "finish now with what you have found.";
+            } else {
+                already_read.push_back(current.call.path);
+            }
+        }
+
+        if (current.call.tool == CoderTool::Finish) {
+            if (!trim(current.call.note).empty()) return current.call.note;
+
+            // FINISHED WITHOUT SAYING ANYTHING.
+            //
+            // Measured at roughly one run in three against a real repository, and
+            // it silently cost the whole research pass -- the Director and every
+            // coder then worked with no findings at all, and the run log said only
+            // "nothing reported". For a role whose entire product is its closing
+            // note, an empty note is not an answer, it is a dropped turn.
+            //
+            // So: say so, once, and let it try again. Returning empty here was
+            // giving up without telling anybody, which is the same mistake the
+            // repeat guard used to make.
+            if (asked_again) break;
+            asked_again = true;
+            current.result.ok = false;
+            current.result.output =
+                "You finished without reporting anything. The note IS the product "
+                "of this pass -- nothing else you did here is kept. Call finish "
+                "again and put what you found in the note: where the relevant code "
+                "lives, the conventions in use, and which files this work will "
+                "touch.";
+        }
+
+        // The last step is spent asking for the report rather than on another
+        // read, because a report that never arrives is worth less than one built
+        // on slightly less reading.
+        if (step == bounded.max_steps - 2 && !asked_again) {
+            current.result.output +=
+                "\n\nThis is your last look. Next turn, call finish and put "
+                "everything you have found in the note.";
+        }
+
         steps.push_back(std::move(current));
     }
 
@@ -824,7 +917,28 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                                  current.call.tool == CoderTool::Write;
 
         if (same_target && no_progress) {
-            if (++repeats >= limits.max_repeats) {
+            ++repeats;
+            // SAY SO FIRST, END SECOND.
+            //
+            // This used to end the run outright the moment the counter tripped, and
+            // that threw away everything the coder had not got to yet. Watched on
+            // the two-files eval: asked to change a signature AND update its caller,
+            // the coder rewrote the signature file four times, tripped this, and the
+            // loop returned before it ever opened the caller. The task was then
+            // scored as a model failure. It was not one -- the model was never given
+            // the chance, and the guard meant to stop waste was throwing away work.
+            //
+            // A coder that is told it is repeating itself usually moves on, which is
+            // the whole point of a transcript it can read. So the first trip is a
+            // message, and only a coder that keeps going after being told is stopped.
+            if (repeats == limits.max_repeats) {
+                current.result.output +=
+                    "\n\nYou have now made this same call " + std::to_string(repeats) +
+                    " times without getting anywhere. Stop repeating it. If this "
+                    "piece has another part you have not done yet -- another file to "
+                    "change, a caller to update -- do that next. If it is genuinely "
+                    "done, finish.";
+            } else if (repeats > limits.max_repeats) {
                 outcome.steps.push_back(std::move(current));
                 outcome.error = "the coder stopped making progress";
                 return outcome;

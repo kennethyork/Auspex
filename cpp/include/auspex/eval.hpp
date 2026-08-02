@@ -95,6 +95,12 @@ struct EvalResult {
 // named, and ignoring an instruction about style.
 const std::vector<EvalTask>& builtin_evals();
 
+// The held-out pair. Same behaviour as a task in the suite above, in a different
+// shape -- see the note in eval.cpp. These exist to tell a general fix apart from
+// a prompt fitted to one test, so they are NOT part of the default suite: adding
+// them to it would make them the thing being fitted to next.
+const std::vector<EvalTask>& holdout_evals();
+
 // User-authored tasks from `<project>/.auspex/evals/*.json`. Absent directory
 // yields none.
 //
@@ -162,6 +168,32 @@ struct EvalSummary {
 
 EvalSummary summarize_evals(const std::vector<EvalResult>& results);
 std::string render_evals(const std::vector<EvalResult>& results);
+
+// Per-task pass rates across repeated runs of the same suite.
+//
+// A SINGLE RUN IS AN ANECDOTE. A local model at a non-zero temperature does not
+// give the same answer twice, so one 8/8 and one 6/8 can be the same build --
+// and a change that looks like a regression may be noise, while a real regression
+// can hide inside it. That distinction is the whole reason this exists: without
+// it there is no honest way to say a change made the crew better.
+//
+// Reports each task's pass count out of N, so a task that is right half the time
+// is visibly different from one that is always right. An average over everything
+// would hide exactly that.
+struct EvalTrend {
+    std::string task;
+    int runs = 0;
+    int passed = 0;
+    int skipped = 0;
+    // Milliseconds, averaged over the runs that were scored.
+    int mean_ms = 0;
+
+    bool always() const { return runs > 0 && passed == runs; }
+    bool never() const { return runs > 0 && passed == 0 && skipped < runs; }
+};
+
+std::vector<EvalTrend> eval_trends(const std::vector<std::vector<EvalResult>>& runs);
+std::string render_eval_trends(const std::vector<std::vector<EvalResult>>& runs);
 
 // --- measuring the Auditor ----------------------------------------------------
 //

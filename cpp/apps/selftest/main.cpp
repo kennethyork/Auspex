@@ -7393,6 +7393,50 @@ void test_eval() {
               "but a seed file that escapes the task directory is not written");
     }
 
+    // ---- the transcript tells the coder what it has already changed ----
+    //
+    // Both of these were found by watching a real run rather than by reading the
+    // code. The old wording said "if your piece is done, finish now" after EVERY
+    // write, which on a two-file piece is the prompt telling the coder to stop
+    // halfway -- and it did exactly that, deterministically, three times out of
+    // three.
+    {
+        PlannedSubtask subtask;
+        subtask.title = "change a signature and its caller";
+        subtask.role = "coder";
+
+        std::vector<CoderStep> steps;
+        CoderStep wrote;
+        wrote.call.tool = CoderTool::Write;
+        wrote.call.path = "greeter.py";
+        wrote.result.ok = true;
+        wrote.result.output = "written (69 bytes)";
+        steps.push_back(wrote);
+
+        const std::string prompt = coder_prompt(subtask, {"greeter.py", "main.py"},
+                                                steps, {});
+        check(prompt.find("EVERY part") != std::string::npos,
+              "a write is followed by 'if EVERY part is done', not 'if your piece is'");
+        check(prompt.find("Files you have already changed") != std::string::npos,
+              "and what has been changed is stated as state, not only as history");
+        check(prompt.find("another file changed, do that now") != std::string::npos,
+              "with the remaining work named");
+
+        // A no-op write must not be listed as a file that was changed: it was not.
+        std::vector<CoderStep> nothing;
+        CoderStep noop;
+        noop.call.tool = CoderTool::Write;
+        noop.call.path = "greeter.py";
+        noop.result.ok = true;
+        noop.result.no_op = true;
+        noop.result.output = "no change";
+        nothing.push_back(noop);
+        const std::string after_noop =
+            coder_prompt(subtask, {"greeter.py"}, nothing, {});
+        check(after_noop.find("Files you have already changed") == std::string::npos,
+              "a write that changed nothing is not reported as a change");
+    }
+
     // ---- the Auditor corpus ----
     //
     // The cases need no model to check; whether the Auditor gets them right needs
@@ -7888,9 +7932,12 @@ int main(int argc, char** argv) {
     if (!args.empty() && args[0] == "--eval") {
         auspex::EvalOptions options;
         std::string only;
+        int repeat = 1;
         for (std::size_t i = 1; i < args.size(); ++i) {
             if (args[i] == "--keep") {
                 options.keep_failures = true;
+            } else if (args[i] == "--repeat" && i + 1 < args.size()) {
+                repeat = std::max(1, std::atoi(args[++i].c_str()));
             } else if (args[i] == "--only" && i + 1 < args.size()) {
                 only = args[++i];
             } else if (auspex::is_cli_backend(args[i])) {
@@ -7915,23 +7962,40 @@ int main(int argc, char** argv) {
                   << "\n\n";
 
         const auto before = auspex::usage_snapshot();
-        const auto results = auspex::run_evals(
-            config, tasks, options, [](const auspex::EvalResult& result) {
-                // Streamed as they finish. A suite takes minutes and watching it
-                // sit silent tells you nothing about whether it is stuck.
-                std::cout << "  [" << (result.skipped ? "skip"
-                                                      : (result.passed ? " ok " : "FAIL"))
-                          << "] " << result.task;
-                if (!result.skipped) {
-                    std::cout << "  (" << (result.milliseconds / 1000) << "s)";
-                }
-                std::cout << "\n" << std::flush;
-            });
+        std::vector<std::vector<auspex::EvalResult>> runs;
+        for (int pass = 0; pass < repeat; ++pass) {
+            if (repeat > 1) {
+                std::cout << "-- run " << (pass + 1) << " of " << repeat << "\n";
+            }
+            runs.push_back(auspex::run_evals(
+                config, tasks, options, [](const auspex::EvalResult& result) {
+                    // Streamed as they finish. A suite takes minutes and watching
+                    // it sit silent tells you nothing about whether it is stuck.
+                    std::cout << "  ["
+                              << (result.skipped ? "skip"
+                                                 : (result.passed ? " ok " : "FAIL"))
+                              << "] " << result.task;
+                    if (!result.skipped) {
+                        std::cout << "  (" << (result.milliseconds / 1000) << "s)";
+                    }
+                    std::cout << "\n" << std::flush;
+                }));
+        }
 
-        std::cout << "\n" << auspex::render_evals(results);
+        std::cout << "\n";
+        if (repeat > 1) {
+            // Per task, across runs. One run is an anecdote; this is the shape a
+            // before/after can actually be read from.
+            std::cout << auspex::render_eval_trends(runs);
+        } else {
+            std::cout << auspex::render_evals(runs.front());
+        }
         std::cout << "\n"
                   << auspex::usage_report(auspex::usage_since(before), "what it cost");
-        return auspex::summarize_evals(results).failed == 0 ? 0 : 1;
+
+        int failed = 0;
+        for (const auto& run : runs) failed += auspex::summarize_evals(run).failed;
+        return failed == 0 ? 0 : 1;
     }
 
     // Is the AUDITOR right? The corpus, against a real model.
