@@ -43,6 +43,7 @@ std::string_view tool_name(CoderTool tool) {
         case CoderTool::Read:   return "read";
         case CoderTool::Write:  return "write";
         case CoderTool::Delete: return "delete";
+        case CoderTool::Run:    return "run";
         case CoderTool::Finish: return "finish";
         case CoderTool::Unknown: break;
     }
@@ -59,6 +60,7 @@ CoderTool tool_from_name(const std::string& name) {
     if (lower == "write")  return CoderTool::Write;
     if (lower == "delete") return CoderTool::Delete;
     if (lower == "finish") return CoderTool::Finish;
+    if (lower == "run")    return CoderTool::Run;
 
     // Synonyms models reach for unprompted. Accepted because the alternative is a
     // wasted turn spent telling it the word it wanted is spelled differently --
@@ -73,8 +75,45 @@ CoderTool tool_from_name(const std::string& name) {
         return CoderTool::Delete;
     }
     if (lower == "done" || lower == "complete" || lower == "stop") return CoderTool::Finish;
+    if (lower == "test" || lower == "exec" || lower == "shell" || lower == "bash" ||
+        lower == "sh"   || lower == "command") {
+        // Mapped to Run, NOT refused: the model wanting to run something is a
+        // legitimate intent spelled badly. It still hits the allowlist, so asking
+        // for "bash" gets it a refusal that names bash rather than a refusal that
+        // says "bash is not a tool" and invites it to try "sh" next.
+        return CoderTool::Run;
+    }
 
     return CoderTool::Unknown;
+}
+
+const std::vector<std::string>& runnable_programs() {
+    // Build and test drivers only. What is ABSENT is the important half: every
+    // shell, env, xargs, find, sudo, ssh, curl, wget, nc, git -- anything whose
+    // job is to run something else, reach the network, or change the machine
+    // outside the sandbox.
+    static const std::vector<std::string> kAllowed{
+        "pytest", "python", "python3", "tox", "nox", "ruff", "mypy", "black",
+        "node", "npm", "npx", "yarn", "pnpm", "jest", "vitest", "tsc", "eslint",
+        "cargo", "rustc", "rustfmt", "clippy-driver",
+        "go", "gofmt",
+        "make", "cmake", "ctest", "ninja",
+        "mvn", "gradle", "javac", "java",
+        "dotnet", "phpunit", "composer", "rspec", "rake", "bundle",
+        "swift", "dart", "flutter", "zig", "gcc", "g++", "clang", "clang++",
+        "shellcheck", "luacheck", "busted",
+    };
+    return kAllowed;
+}
+
+bool is_runnable(const std::string& program) {
+    // Matched on the WHOLE name, not a prefix or a path. "/usr/bin/pytest" and
+    // "pytest-evil" are both refused: allowing a path would let a coder run
+    // something it had just written into the sandbox and named convincingly.
+    if (program.empty()) return false;
+    if (program.find('/') != std::string::npos) return false;
+    const auto& allowed = runnable_programs();
+    return std::find(allowed.begin(), allowed.end(), program) != allowed.end();
 }
 
 int CoderOutcome::writes() const {
@@ -89,10 +128,42 @@ int CoderOutcome::writes() const {
 }
 
 // ---------------------------------------------------------------------------
+std::string take_steer(const std::filesystem::path& mailbox) {
+    if (mailbox.empty()) return {};
+    std::ifstream in(mailbox);
+    if (!in) return {};
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    in.close();
+
+    // Consumed, not merely read. A message left in place would be re-injected on
+    // every remaining turn, and the coder would take it as being said again.
+    std::error_code ec;
+    std::filesystem::remove(mailbox, ec);
+    return trim(contents.str());
+}
+
+bool leave_steer(const std::filesystem::path& mailbox, const std::string& message) {
+    if (mailbox.empty()) return false;
+    const std::string text = trim(message);
+    if (text.empty()) return false;
+
+    std::error_code ec;
+    std::filesystem::create_directories(mailbox.parent_path(), ec);
+
+    // Appended, so a second message sent before the coder has looked does not
+    // silently replace the first.
+    std::ofstream out(mailbox, std::ios::app);
+    if (!out) return false;
+    out << text << "\n";
+    return static_cast<bool>(out);
+}
+
 std::string coder_prompt(const PlannedSubtask& subtask,
                          const std::vector<std::string>& files,
                          const std::vector<CoderStep>& steps,
-                         const CoderLimits& limits) {
+                         const CoderLimits& limits,
+                         const std::string& steered) {
     std::ostringstream out;
 
     out << "You are a " << (subtask.role.empty() ? "coder" : subtask.role)
@@ -104,6 +175,14 @@ std::string coder_prompt(const PlannedSubtask& subtask,
     if (!subtask.detail.empty()) out << subtask.detail << "\n";
     out << "\n";
 
+    // A person has said something. Placed high and marked, because the whole point
+    // of steering is that it outranks the plan the coder is working to.
+    if (!steered.empty()) {
+        out << "IMPORTANT -- a person watching you has just said:\n"
+            << steered << "\n"
+               "Take that into account before your next step.\n\n";
+    }
+
     // The tools, spelled exactly as they must be answered.
     out << "Answer with ONE JSON object per turn, naming one tool:\n"
            "  {\"tool\":\"list\"}                                   what files exist\n"
@@ -112,13 +191,27 @@ std::string coder_prompt(const PlannedSubtask& subtask,
            "entirely, or create it\n"
            "  {\"tool\":\"delete\",\"path\":\"src/x.py\"}               remove a file\n"
            "  {\"tool\":\"finish\",\"note\":\"what you did\"}          when the piece is "
-           "done\n\n";
+           "done\n";
+    if (limits.allow_run) {
+        out << "  {\"tool\":\"run\",\"command\":[\"pytest\",\"-q\"]}        run tests or a "
+               "build\n";
+    }
+    out << "\n";
+
+    if (limits.allow_run) {
+        out << "You may run: ";
+        for (std::size_t i = 0; i < runnable_programs().size(); ++i) {
+            if (i) out << ", ";
+            out << runnable_programs()[i];
+        }
+        out << ".\nNothing else, and no shell.\n\n";
+    }
 
     out << "Rules:\n"
            "- write replaces the WHOLE file. Read it first unless you are creating "
            "it.\n"
            "- Paths are relative to the project root. No leading slash, no \"..\".\n"
-           "- You cannot run commands, tests, or anything else. Only these tools.\n"
+           "- Only these tools. There is no shell.\n"
            "- Do the piece you were given and nothing else.\n"
            "- Finish as soon as it is done. You have "
         << limits.max_steps << " steps in total.\n\n";
@@ -211,6 +304,34 @@ ToolCall parse_tool_call(const std::string& reply) {
     if (call.contents.empty()) call.contents = string_field(document, "content");
     if (call.contents.empty()) call.contents = string_field(document, "text");
 
+    // The command, as an ARRAY. A string would have to be word-split, and the
+    // splitter is where a shell creeps back in -- so a string is refused with a
+    // note saying what shape is wanted.
+    if (call.tool == CoderTool::Run) {
+        for (const char* key : {"command", "argv", "cmd"}) {
+            if (!document.contains(key)) continue;
+            const auto& value = document[key];
+            if (value.is_array()) {
+                for (const auto& part : value) {
+                    if (part.is_string()) call.command.push_back(part.get<std::string>());
+                    else if (part.is_number()) call.command.push_back(part.dump());
+                }
+                break;
+            }
+            if (value.is_string() && call.command.empty()) {
+                call.error = "give \"command\" as an array of words, e.g. "
+                             "[\"pytest\", \"-q\"], not as one string";
+                call.tool  = CoderTool::Unknown;
+                return call;
+            }
+        }
+        if (call.command.empty() && call.error.empty()) {
+            call.error = "run needs a \"command\" array, e.g. [\"pytest\", \"-q\"]";
+            call.tool  = CoderTool::Unknown;
+            return call;
+        }
+    }
+
     call.note = trim(string_field(document, "note"));
     if (call.note.empty()) call.note = trim(string_field(document, "summary"));
     if (call.note.empty()) call.note = trim(string_field(document, "message"));
@@ -240,6 +361,47 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
     if (call.tool == CoderTool::Finish) {
         result.ok = true;
         result.output = "finished";
+        return result;
+    }
+
+    if (call.tool == CoderTool::Run) {
+        if (!limits.allow_run) {
+            result.output = "running commands is turned off for this crew";
+            return result;
+        }
+        if (call.command.empty()) {
+            result.output = "run needs a command";
+            return result;
+        }
+        if (!is_runnable(call.command.front())) {
+            // Named, so the model can pick something else rather than guessing at
+            // what is allowed. Listing the whole allowlist here would be a wall of
+            // text on every mistake; the prompt already carries it.
+            result.output = "refused: \"" + call.command.front() +
+                            "\" is not a program this crew may run";
+            return result;
+        }
+
+        const LimitedResult ran = run_limited(call.command, sandbox.string(),
+                                              limits.run_timeout_seconds,
+                                              limits.max_run_output);
+
+        std::string report;
+        if (ran.timed_out) {
+            report = "timed out after " + std::to_string(limits.run_timeout_seconds) +
+                     "s and was killed\n";
+        } else {
+            report = "exit " + std::to_string(ran.exit_code) + "\n";
+        }
+        report += ran.output;
+        if (ran.truncated) report += "\n... (output truncated)";
+
+        // A non-zero exit is NOT a failed tool call. The command ran; it reported
+        // failing tests, which is exactly the information the coder asked for and
+        // needs to act on. Marking it failed would trip the no-progress guard on
+        // the most useful turn in the loop.
+        result.ok = !ran.timed_out;
+        result.output = report;
         return result;
     }
 
@@ -348,7 +510,8 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
 // ---------------------------------------------------------------------------
 CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,
-                       const CoderLimits& limits, const std::string& model) {
+                       const CoderLimits& limits, const std::string& model,
+                       const std::filesystem::path& mailbox) {
     CoderOutcome outcome;
 
     if (!std::filesystem::is_directory(sandbox)) {
@@ -375,8 +538,10 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
         std::vector<std::string> files;
         for (const auto& [path, _] : list_files(sandbox)) files.push_back(path);
 
+        // Checked between turns, so a message lands at the next decision rather
+        // than needing the coder to be interrupted mid-call.
         const std::string prompt =
-            coder_prompt(subtask, files, outcome.steps, limits);
+            coder_prompt(subtask, files, outcome.steps, limits, take_steer(mailbox));
 
         const auto reply = ollama.generate(
             model.empty() ? config.ollama_model : model, prompt, options);

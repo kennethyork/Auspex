@@ -124,6 +124,35 @@ RunResult run_crew(const Config& config, const RunOptions& options,
                    const RunEvents& events = {},
                    const std::atomic<bool>* cancel = nullptr);
 
+// Where a message to coder `n` of `run_id` is left.
+std::filesystem::path steer_mailbox(const std::string& run_id, int n);
+
+// The run that is going, or the most recent one. Empty when none.
+//
+// Read from the state file rather than held in memory: the window that steers may
+// not be the one that started the run, and after a restart it certainly is not.
+std::string current_run_id();
+
+// Say something to a running coder. False when there is no run, or no such coder.
+bool steer_coder(int n, const std::string& message, std::string* error = nullptr);
+
+// --- resuming -----------------------------------------------------------------
+
+// Finish an interrupted run WITHOUT calling a model.
+//
+// A cancelled run leaves its sandboxes behind on purpose -- the work already done
+// is the thing you most want after stopping early. This walks them, captures what
+// each coder wrote, audits it, and lands or holds it exactly as a finished run
+// would. No coder is restarted and no plan is remade, so it is cheap and cannot
+// produce anything the interrupted run had not already produced.
+//
+// `run_id` empty resumes the most recent run.
+RunResult resume_crew(const Config& config, const std::filesystem::path& project,
+                      const std::string& run_id = {}, const RunEvents& events = {});
+
+// Runs with sandboxes still on disk, newest first. What resume could act on.
+std::vector<std::string> resumable_runs();
+
 // --- the board ----------------------------------------------------------------
 
 // What the run left for a person, in the same JSON shape parse_board() reads.

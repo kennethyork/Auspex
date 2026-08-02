@@ -12,6 +12,7 @@
 #include <iostream>
 #include <filesystem>
 #include <fstream>
+#include <chrono>
 #include <locale>
 #include <memory>
 #include <ostream>
@@ -5005,13 +5006,18 @@ void test_coder() {
         check(tool_from_name("edit")      == CoderTool::Write, "edit");
         check(tool_from_name("done")      == CoderTool::Finish, "done");
 
-        // Anything else is refused, not guessed at. Guessing means acting on a
-        // verb the model did not ask for.
-        check(tool_from_name("run")     == CoderTool::Unknown, "there is no run verb");
-        check(tool_from_name("shell")   == CoderTool::Unknown, "nor a shell one");
-        check(tool_from_name("bash")    == CoderTool::Unknown, "nor bash");
-        check(tool_from_name("fetch")   == CoderTool::Unknown, "nor anything networked");
-        check(tool_from_name("")        == CoderTool::Unknown, "and nothing is not a verb");
+        check(tool_from_name("run") == CoderTool::Run, "run is a verb now");
+
+        // "shell" and "bash" map to Run rather than being refused as unknown. That
+        // is deliberate: wanting to run something is a legitimate intent spelled
+        // badly, and routing it to Run means it meets the ALLOWLIST, which refuses
+        // it by name. Refusing it as "not a tool" would invite the model to try
+        // "sh" next, and the one after that.
+        check(tool_from_name("shell") == CoderTool::Run, "shell is a badly spelled run");
+        check(tool_from_name("bash")  == CoderTool::Run, "and so is bash");
+
+        check(tool_from_name("fetch") == CoderTool::Unknown, "nothing networked is a verb");
+        check(tool_from_name("")      == CoderTool::Unknown, "and nothing is not a verb");
     }
 
     // ---- reading a reply ----
@@ -5050,10 +5056,23 @@ void test_coder() {
         check(junk.tool == CoderTool::Unknown, "prose is not a call");
         check(!junk.error.empty(), "and the model is told so");
 
-        const ToolCall invented = parse_tool_call(R"({"tool":"run","command":"pytest"})");
+        const ToolCall invented = parse_tool_call(R"({"tool":"teleport"})");
         check(invented.tool == CoderTool::Unknown, "an invented verb is refused");
-        check(invented.error.find("run") != std::string::npos,
+        check(invented.error.find("teleport") != std::string::npos,
               "by name, so the model can correct itself");
+
+        // A command given as a STRING is refused rather than word-split. The
+        // splitter is exactly where a shell would creep back in.
+        const ToolCall stringy = parse_tool_call(R"({"tool":"run","command":"pytest -q"})");
+        check(stringy.tool == CoderTool::Unknown, "a string command is refused");
+        check(stringy.error.find("array") != std::string::npos, "and the shape is named");
+
+        const ToolCall ran = parse_tool_call(R"({"tool":"run","command":["pytest","-q"]})");
+        check(ran.tool == CoderTool::Run, "an array command parses");
+        check_eq(ran.command.size(), std::size_t{2}, "with both words");
+
+        check(parse_tool_call(R"({"tool":"run"})").tool == CoderTool::Unknown,
+              "run with no command is refused");
     }
 
     // ---- running a call ----
@@ -5125,6 +5144,111 @@ void test_coder() {
         check(!dir.ok, "deleting a directory is refused");
         check(std::filesystem::exists(sandbox / "src"), "and it survives");
 
+        // ---- running ----
+        //
+        // The one place a model's output becomes a process. Off by default, bounded
+        // by an allowlist, no shell, inside the sandbox, on a deadline.
+        {
+            CoderTool run_tool_kind = CoderTool::Run;
+            ToolCall runner;
+            runner.tool = run_tool_kind;
+            runner.command = {"python3", "-c", "print('hi')"};
+
+            // Off by default. A coder cannot run anything unless the person whose
+            // machine it is turned it on.
+            CoderLimits off;
+            check(!off.allow_run, "running is off by default");
+            const ToolResult refused = run_tool(runner, sandbox, off);
+            check(!refused.ok, "and a run is refused while it is off");
+
+            CoderLimits on;
+            on.allow_run = true;
+            on.run_timeout_seconds = 20;
+
+            const ToolResult ok = run_tool(runner, sandbox, on);
+            check(ok.ok, "an allowed program runs");
+            check(ok.output.find("hi") != std::string::npos, "and its output comes back");
+            check(ok.output.find("exit 0") != std::string::npos, "with its exit code");
+
+            // A FAILING command is not a failed tool call. The command ran and
+            // reported failing tests, which is the information the coder asked for
+            // -- marking it failed would trip the no-progress guard on the most
+            // useful turn in the loop.
+            ToolCall failing;
+            failing.tool = run_tool_kind;
+            failing.command = {"python3", "-c", "import sys; sys.exit(3)"};
+            const ToolResult failed = run_tool(failing, sandbox, on);
+            check(failed.ok, "a non-zero exit is still a successful tool call");
+            check(failed.output.find("exit 3") != std::string::npos, "reporting the code");
+
+            // stderr comes back too, or a stack trace would vanish.
+            ToolCall noisy;
+            noisy.tool = run_tool_kind;
+            noisy.command = {"python3", "-c", "import sys; print('boom', file=sys.stderr)"};
+            check(run_tool(noisy, sandbox, on).output.find("boom") != std::string::npos,
+                  "stderr is captured, not discarded");
+
+            // It runs IN THE SANDBOX, not wherever the panel happens to be.
+            ToolCall where;
+            where.tool = run_tool_kind;
+            where.command = {"python3", "-c", "import os; print(os.getcwd())"};
+            check(run_tool(where, sandbox, on).output.find(sandbox.filename().string()) !=
+                      std::string::npos,
+                  "and it runs inside the sandbox");
+
+            // ---- the allowlist ----
+            const auto refuse = [&](std::vector<std::string> cmd) {
+                ToolCall c;
+                c.tool = run_tool_kind;
+                c.command = std::move(cmd);
+                return !run_tool(c, sandbox, on).ok;
+            };
+            check(refuse({"sh", "-c", "echo hi"}),      "sh is refused");
+            check(refuse({"bash", "-c", "echo hi"}),    "bash is refused");
+            check(refuse({"env", "echo", "hi"}),        "env is refused -- it runs things");
+            check(refuse({"sudo", "ls"}),               "sudo is refused");
+            check(refuse({"curl", "http://x"}),         "curl is refused -- it reaches out");
+            check(refuse({"ssh", "host"}),              "ssh is refused");
+            check(refuse({"git", "push"}),              "git is refused");
+            check(refuse({"rm", "-rf", "/"}),           "rm is refused");
+            // A path, even to something allowed. Otherwise a coder could write a
+            // program into the sandbox and name it convincingly.
+            check(refuse({"/usr/bin/python3", "-c", "print(1)"}),
+                  "an absolute path is refused even for an allowed name");
+            check(refuse({"./pytest"}),                 "and so is a relative one");
+            check(refuse({"pytest-evil"}),              "matching is on the whole name");
+
+            check(is_runnable("pytest"), "pytest is allowed");
+            check(is_runnable("cargo"),  "and cargo");
+            check(!is_runnable("sh"),    "sh is not");
+            check(!is_runnable(""),      "and nothing is not");
+
+            // There is no shell, so metacharacters are just characters in an
+            // argument. This prints them rather than doing anything with them.
+            ToolCall meta;
+            meta.tool = run_tool_kind;
+            meta.command = {"python3", "-c", "print('a; rm -rf /')"};
+            const ToolResult inert = run_tool(meta, sandbox, on);
+            check(inert.ok, "shell metacharacters are inert");
+            check(inert.output.find("a; rm -rf /") != std::string::npos,
+                  "they are data, not syntax");
+
+            // A hang is killed on the deadline rather than waiting forever.
+            CoderLimits brief;
+            brief.allow_run = true;
+            brief.run_timeout_seconds = 2;
+            ToolCall hang;
+            hang.tool = run_tool_kind;
+            hang.command = {"python3", "-c", "import time; time.sleep(60)"};
+            const auto began = std::chrono::steady_clock::now();
+            const ToolResult killed = run_tool(hang, sandbox, brief);
+            const auto took = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::steady_clock::now() - began).count();
+            check(!killed.ok, "a hung command fails");
+            check(killed.output.find("timed out") != std::string::npos, "saying it timed out");
+            check(took < 15, "and it is killed near the deadline, not left running");
+        }
+
         // ---- a truncated read says so ----
         {
             std::string big(60'000, 'x');
@@ -5157,14 +5281,27 @@ void test_coder() {
         // the budget by hitting it.
         check(first.find(std::to_string(limits.max_steps)) != std::string::npos,
               "and the step budget is stated");
-        check(first.find("cannot run commands") != std::string::npos,
-              "and that it cannot run anything");
+        check(first.find("no shell") != std::string::npos, "and that there is no shell");
+        // The allowlist is not advertised when running is off, or the model spends
+        // turns asking for a verb that will always be refused.
+        check(first.find("pytest") == std::string::npos,
+              "and running is not offered when it is off");
+
+        CoderLimits runnable;
+        runnable.allow_run = true;
+        const std::string offered = coder_prompt(subtask, {"greet.py"}, {}, runnable);
+        check(offered.find("\"tool\":\"run\"") != std::string::npos,
+              "run is offered when it is on");
+        check(offered.find("You may run: ") != std::string::npos,
+              "with the list of what may be run");
 
         // A write's contents are NOT replayed into the transcript: they are already
         // on disk, and re-sending them doubles the context exactly when it is most
         // needed.
         CoderStep wrote;
-        wrote.call = {CoderTool::Write, "test_greet.py", std::string(5000, 'q'), "", ""};
+        wrote.call.tool     = CoderTool::Write;
+        wrote.call.path     = "test_greet.py";
+        wrote.call.contents = std::string(5000, 'q');
         wrote.result = {true, false, "written (5000 bytes)"};
         const std::string second = coder_prompt(subtask, {"greet.py"}, {wrote}, limits);
         check(second.find(std::string(200, 'q')) == std::string::npos,
@@ -5475,6 +5612,54 @@ void test_crew_run() {
         check(parse_board(encode_board({})).empty(), "an empty board round-trips too");
     }
 
+    // ---- steering ----
+    //
+    // A file rather than a queue, because the two ends are not in one place: the
+    // window that steers may be a different process from the run, and a run
+    // outlives the window that started it.
+    {
+        const auto box = std::filesystem::temp_directory_path() /
+                         "auspex-selftest-steer" / "steer-1";
+        std::error_code ec;
+        std::filesystem::remove_all(box.parent_path(), ec);
+
+        check(take_steer(box).empty(), "an empty mailbox says nothing");
+        check(!leave_steer(box, ""), "and nothing cannot be left in it");
+        check(!leave_steer(box, "   "), "nor whitespace");
+        check(!leave_steer({}, "hi"), "and there is nowhere to leave it without a path");
+
+        check(leave_steer(box, "use pytest, not unittest"), "a message is left");
+        check_eq(take_steer(box), std::string("use pytest, not unittest"),
+                 "and read back");
+        // CONSUMED. Left in place it would be re-injected every remaining turn and
+        // the coder would take it as being said again and again.
+        check(take_steer(box).empty(), "and it is consumed, not repeated");
+
+        // Two messages before the coder looks: both survive. Replacing the first
+        // would silently lose something a person said.
+        check(leave_steer(box, "first"), "a first message");
+        check(leave_steer(box, "second"), "and a second");
+        const std::string both = take_steer(box);
+        check(both.find("first") != std::string::npos, "both are kept");
+        check(both.find("second") != std::string::npos, "in order");
+
+        // It reaches the prompt, and prominently.
+        PlannedSubtask subtask{1, "coder", "x", ""};
+        const std::string plain = coder_prompt(subtask, {}, {}, {}, "");
+        const std::string steered = coder_prompt(subtask, {}, {}, {}, "stop and use pytest");
+        check(steered.find("stop and use pytest") != std::string::npos,
+              "a steer reaches the prompt");
+        check(steered.find("IMPORTANT") != std::string::npos, "marked as outranking the plan");
+        check(steered.size() > plain.size(), "and adds to it rather than replacing");
+
+        check(steer_mailbox("crew_1", 2).string().find("steer-2") != std::string::npos,
+              "each coder has its own mailbox");
+        check(steer_mailbox("", 1).empty(), "which needs a run");
+        check(steer_mailbox("crew_1", 0).empty(), "and a coder");
+
+        std::filesystem::remove_all(box.parent_path(), ec);
+    }
+
     // ---- state the panel can read ----
     //
     // Auspex writes its own state file now, but in ollamadev's SHAPE, so the
@@ -5580,11 +5765,13 @@ int main(int argc, char** argv) {
         }
 
         auspex::PlannedSubtask subtask{1, "coder", task, {}};
+        auspex::CoderLimits limits;
+        limits.allow_run = args.size() >= 4 && args[3] == "run";
         std::cout << "sandbox " << sandbox.string() << "\n"
                   << "asking " << auspex::Config::load().ollama_model << "…\n\n";
 
         const auspex::CoderOutcome outcome =
-            auspex::run_coder(auspex::Config::load(), subtask, sandbox);
+            auspex::run_coder(auspex::Config::load(), subtask, sandbox, limits);
 
         for (std::size_t i = 0; i < outcome.steps.size(); ++i) {
             const auto& step = outcome.steps[i];
@@ -5689,6 +5876,10 @@ int main(int argc, char** argv) {
         options.project = args[2];
         if (args.size() >= 4) options.max_subtasks = std::atoi(args[3].c_str());
         if (args.size() >= 5) options.auditor_model = args[4];
+        // "run" as a 6th argument turns on command execution for the coders.
+        // Opt-in on the command line as well as in the struct, because this is the
+        // switch that lets a model start a process.
+        if (args.size() >= 6 && args[5] == "run") options.coder.allow_run = true;
 
         auspex::RunEvents events;
         events.log = [](const std::string& line) { std::cout << "  " << line << "\n"; };
@@ -5711,6 +5902,26 @@ int main(int argc, char** argv) {
                       << item.repo_root << "\n";
         }
         return 0;
+    }
+
+    // Recover an interrupted run's work. No model call for the coding half.
+    if (args.size() >= 2 && args[0] == "--resume") {
+        const std::filesystem::path project = args[1];
+        const auto runs = auspex::resumable_runs();
+        std::cout << runs.size() << " resumable run(s)\n";
+        for (const auto& r : runs) std::cout << "  " << r << "\n";
+        if (runs.empty()) return 1;
+
+        auspex::RunEvents events;
+        events.log = [](const std::string& l) { std::cout << "  " << l << "\n"; };
+        const auto result =
+            auspex::resume_crew(auspex::Config::load(), project, {}, events);
+        std::cout << (result.error.empty()
+                          ? std::to_string(result.applied) + " applied, " +
+                                std::to_string(result.held) + " held"
+                          : result.error)
+                  << "\n";
+        return result.error.empty() ? 0 : 1;
     }
 
     if (args.size() >= 2 && args[0] == "--css") {

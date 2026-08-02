@@ -12,11 +12,27 @@
 // when it stops making progress.
 //
 // WHY A FIXED VERB TABLE, AGAIN. Same reason as agents.hpp: the model names a
-// VERB, not a command. There is no verb here that runs a program, opens a shell,
-// or reaches the network -- a coder reads and writes files inside its own sandbox
-// and does nothing else. That is a real limit on what this crew can do (it cannot
-// run the tests it writes) and it is the honest trade for a loop that cannot be
-// talked into anything.
+// VERB, not a command line.
+//
+// `run` is the exception that proves it, and the one place a model's output turns
+// into a process. A tester that cannot run tests is doing proofreading, so it had
+// to exist -- but it is bounded on every side:
+//
+//   * THE PROGRAM COMES FROM A FIXED ALLOWLIST. `pytest`, `cargo`, `make` and the
+//     like. Not `sh`, not `bash`, not `env`, not `sudo`, not `ssh`, not `curl` --
+//     anything that would run something else, or reach the network, or leave the
+//     machine. A program that is not on the list is refused by name.
+//   * THERE IS NO SHELL. execvp with an argv vector, so `;`, `|`, backticks and
+//     `$(...)` are ordinary characters in an argument, not syntax.
+//   * IT RUNS IN THE SANDBOX. A throwaway copy, never the real project.
+//   * IT IS KILLED ON A DEADLINE, with its whole process group, and its output is
+//     capped.
+//
+// What this does NOT do is contain a program that is on the list. `make` runs a
+// Makefile the coder may have just written; `pytest` imports code it wrote. That
+// is the actual risk, it is the same risk as running an unfamiliar repository's
+// tests on your own machine, and no allowlist can remove it. It is off by default
+// for exactly that reason -- see CoderLimits::allow_run.
 //
 // WHY PATHS ARE STILL CHECKED. Every path goes through safe_join() against the
 // sandbox even though the sandbox is a throwaway copy. A copy is not a jail: a
@@ -39,6 +55,7 @@ enum class CoderTool {
     Read,      // the contents of one
     Write,     // replace one, or create it
     Delete,    // remove one
+    Run,       // run one of a fixed set of build/test programs, in the sandbox
     Finish,    // done, with a note
     Unknown,   // the model asked for something that is not a verb
 };
@@ -52,6 +69,9 @@ struct ToolCall {
     std::string path;
     std::string contents;
     std::string note;
+    // For Run: the program and its arguments, already split. Never a string to be
+    // word-split later -- that is where a shell would sneak back in.
+    std::vector<std::string> command;
     // Why the reply could not be turned into a call. Fed back to the model, which
     // is usually enough for it to correct itself on the next turn.
     std::string error;
@@ -106,6 +126,18 @@ struct CoderLimits {
     // answered with the subtask pushed out of view.
     std::size_t max_read_bytes = 24'000;
 
+    // Whether `run` exists at all.
+    //
+    // OFF BY DEFAULT. Turning it on lets a coder execute a test suite it just
+    // wrote, inside its sandbox -- which is the point, and is also the same risk
+    // as running an unfamiliar repository's tests on your own machine. That is a
+    // decision for the person whose machine it is, not a default.
+    bool allow_run = false;
+
+    // How long one command may take, and how much of its output is kept.
+    int         run_timeout_seconds = 60;
+    std::size_t max_run_output      = 12'000;
+
     // Consecutive calls at the same target before the coder is called stuck.
     //
     // Covers three things that all look like working and are not: repeating a
@@ -121,6 +153,8 @@ struct CoderLimits {
 
 // The prompt for one turn.
 //
+// `steered` is a message from a person, shown once and prominently. Empty usually.
+//
 // `files` is the sandbox listing. `steps` is everything done so far, oldest first;
 // it is summarised rather than replayed verbatim, because the contents the coder
 // WROTE are already on disk and re-sending them would double the context for no
@@ -128,7 +162,8 @@ struct CoderLimits {
 std::string coder_prompt(const PlannedSubtask& subtask,
                          const std::vector<std::string>& files,
                          const std::vector<CoderStep>& steps,
-                         const CoderLimits& limits);
+                         const CoderLimits& limits,
+                         const std::string& steered = {});
 
 // Reads one reply into a call.
 //
@@ -148,8 +183,30 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
 // Never throws and always returns: a coder that cannot reach the model, cannot
 // parse a reply, or will not stop is a coder that produced nothing, which is a
 // result the crew can carry on from.
+// Programs a coder may run, when running is allowed at all.
+//
+// Build and test drivers only. Deliberately absent: every shell, `env`, `xargs`,
+// `find`, `sudo`, `ssh`, `curl`, `wget`, `nc`, `git` -- anything whose job is to
+// run something else, reach the network, or change the machine outside the
+// sandbox.
+const std::vector<std::string>& runnable_programs();
+bool is_runnable(const std::string& program);
+
+// A file a running coder reads between turns, so a person can say something to it.
+//
+// A FILE rather than a queue or a socket, because the two ends are not in the same
+// place: the window may be in one process and the run in another, and a run
+// outlives the window that started it. A path both ends can name is the whole
+// mechanism.
+//
+// Read-and-truncate: the message is consumed on the turn it is seen, so it is
+// injected once rather than repeated into every prompt for the rest of the run.
+std::string take_steer(const std::filesystem::path& mailbox);
+bool        leave_steer(const std::filesystem::path& mailbox, const std::string& message);
+
 CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,
-                       const CoderLimits& limits = {}, const std::string& model = {});
+                       const CoderLimits& limits = {}, const std::string& model = {},
+                       const std::filesystem::path& mailbox = {});
 
 }  // namespace auspex

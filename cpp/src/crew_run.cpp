@@ -192,6 +192,68 @@ std::vector<std::string> overlapping_files(const Changeset& a, const Changeset& 
 }
 
 // ---------------------------------------------------------------------------
+std::filesystem::path steer_mailbox(const std::string& run_id, int n) {
+    const auto dir = auspex_crew_dir();
+    if (dir.empty() || run_id.empty() || n <= 0) return {};
+    return dir / run_id / ("steer-" + std::to_string(n));
+}
+
+std::string current_run_id() {
+    return current_crew_run(auspex_run_state_path()).run_id;
+}
+
+bool steer_coder(int n, const std::string& message, std::string* error) {
+    const auto fail = [error](const std::string& what) {
+        if (error) *error = what;
+        return false;
+    };
+
+    const CrewRun run = current_crew_run(auspex_run_state_path());
+    if (run.run_id.empty()) return fail("no crew has run here yet");
+    if (!run.active)        return fail("the crew is not running");
+
+    const bool exists = std::any_of(
+        run.subtasks.begin(), run.subtasks.end(),
+        [n](const CrewSubtask& s) { return s.n == n; });
+    if (!exists) return fail("there is no coder #" + std::to_string(n));
+
+    if (!leave_steer(steer_mailbox(run.run_id, n), message)) {
+        return fail("could not leave the message");
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+std::vector<std::string> resumable_runs() {
+    std::vector<std::string> runs;
+    const auto dir = auspex_crew_dir();
+    if (dir.empty()) return runs;
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return runs;
+
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        // A run is resumable only if a sandbox survived. One that finished cleanly
+        // destroyed its own, so there is nothing left to recover and offering it
+        // would be offering to redo work that already landed.
+        bool has_sandbox = false;
+        for (const auto& child : std::filesystem::directory_iterator(entry.path(), ec)) {
+            if (child.is_directory(ec) &&
+                child.path().filename().string().rfind("sandbox-", 0) == 0) {
+                has_sandbox = true;
+                break;
+            }
+        }
+        if (has_sandbox) runs.push_back(entry.path().filename().string());
+    }
+
+    // Newest first. Run ids carry a unix timestamp, so they sort correctly as text
+    // for any run made this millennium.
+    std::sort(runs.begin(), runs.end(), std::greater<>());
+    return runs;
+}
+
 std::string encode_board(const std::vector<BoardItem>& items) {
     json array = json::array();
     for (const auto& item : items) {
@@ -313,6 +375,164 @@ std::string encode_state(const std::string& run_id, const std::string& task,
 
 }  // namespace
 
+namespace {
+
+// Land or hold one attempt. Shared by run and resume, because "what happens to a
+// changeset" is the one decision that must not differ between them.
+void land_or_hold(const std::string& run_id, const std::filesystem::path& project,
+                  Attempt& attempt, Changeset& landed, std::vector<BoardItem>& board,
+                  int& next_number, RunResult& result,
+                  const std::function<void(const std::string&)>& note) {
+    if (attempt.changeset.empty()) return;
+
+    std::string reason = attempt.audit.reason;
+    bool        hold   = attempt.audit.held();
+
+    if (!hold) {
+        if (const auto shared = overlapping_files(landed, attempt.changeset);
+            !shared.empty()) {
+            hold   = true;
+            reason = "overlaps another coder on " + shared.front();
+            if (shared.size() > 1) {
+                reason += " (and " + std::to_string(shared.size() - 1) + " more)";
+            }
+            attempt.state = "held";
+        }
+    }
+
+    if (!hold) {
+        std::string error;
+        if (apply_changeset(attempt.changeset, project, nullptr, &error)) {
+            landed.files.insert(landed.files.end(), attempt.changeset.files.begin(),
+                                attempt.changeset.files.end());
+            ++result.applied;
+            if (note) note("applied #" + std::to_string(attempt.subtask.n));
+            return;
+        }
+        hold   = true;
+        reason = error.empty() ? "could not be applied" : error;
+        attempt.state = "held";
+    }
+
+    const auto store = changeset_store(run_id, attempt.subtask.n);
+    save_changeset(store, attempt.changeset);
+
+    BoardItem item;
+    item.n         = ++next_number;
+    item.id        = run_id + "_" + std::to_string(attempt.subtask.n);
+    item.kind      = "crew_branch";
+    item.summary   = "coder #" + std::to_string(attempt.subtask.n) + " — " +
+                     attempt.subtask.title;
+    item.reason    = reason;
+    item.diff      = attempt.changeset.diff;
+    item.repo_root = project.string();
+    item.store     = store.string();
+    item.files     = static_cast<int>(attempt.changeset.files.size());
+    for (const auto& file : attempt.changeset.files) {
+        item.file_names.push_back(file.path);
+    }
+    board.push_back(std::move(item));
+    ++result.held;
+}
+
+}  // namespace
+
+RunResult resume_crew(const Config& config, const std::filesystem::path& project,
+                      const std::string& run_id, const RunEvents& events) {
+    RunResult result;
+
+    const auto note = [&events](const std::string& text) {
+        if (events.log) events.log(text);
+    };
+
+    if (!is_project_dir(project)) {
+        result.error = "no such project";
+        return result;
+    }
+
+    result.run_id = run_id;
+    if (result.run_id.empty()) {
+        const auto runs = resumable_runs();
+        if (runs.empty()) {
+            result.error = "there is no interrupted run to resume";
+            return result;
+        }
+        result.run_id = runs.front();
+    }
+
+    const auto run_dir = auspex_crew_dir() / result.run_id;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(run_dir, ec)) {
+        result.error = "no such run: " + result.run_id;
+        return result;
+    }
+
+    // The plan, from the state file, so the pieces keep their titles and roles --
+    // the Auditor is asked whether the work matches what was ASKED for, and
+    // without the original subtask it has nothing to compare against.
+    const CrewRun previous = current_crew_run(auspex_run_state_path());
+
+    std::vector<std::filesystem::path> sandboxes;
+    for (const auto& child : std::filesystem::directory_iterator(run_dir, ec)) {
+        if (child.is_directory(ec) &&
+            child.path().filename().string().rfind("sandbox-", 0) == 0) {
+            sandboxes.push_back(child.path());
+        }
+    }
+    std::sort(sandboxes.begin(), sandboxes.end());
+
+    if (sandboxes.empty()) {
+        result.error = "that run left nothing to recover";
+        return result;
+    }
+    note("resume: recovering " + std::to_string(sandboxes.size()) +
+         " interrupted coder(s)");
+
+    auto board = read_board();
+    int  next_number = 0;
+    for (const auto& item : board) next_number = std::max(next_number, item.n);
+
+    Changeset landed;
+
+    for (const auto& sandbox : sandboxes) {
+        const std::string name = sandbox.filename().string();
+        const int n = std::atoi(name.substr(std::string("sandbox-").size()).c_str());
+
+        Attempt attempt;
+        attempt.subtask.n     = n;
+        attempt.subtask.role  = "coder";
+        attempt.subtask.title = "recovered work";
+        for (const auto& s : previous.subtasks) {
+            if (s.n != n) continue;
+            attempt.subtask.role  = s.role;
+            attempt.subtask.title = s.title;
+            break;
+        }
+
+        attempt.changeset = capture_changeset(project, sandbox);
+        if (attempt.changeset.empty()) {
+            note("#" + std::to_string(n) + " had written nothing");
+            destroy_sandbox(sandbox);
+            continue;
+        }
+
+        // Still audited. Work interrupted mid-thought is MORE likely to be
+        // half-finished, not less, so skipping the review here would be exactly
+        // backwards.
+        attempt.audit = audit_changeset(config, attempt.subtask, attempt.changeset,
+                                        AuditLimits{}, config.crew_auditor_model);
+
+        land_or_hold(result.run_id, project, attempt, landed, board, next_number,
+                     result, note);
+        destroy_sandbox(sandbox);
+    }
+
+    write_board(board);
+    note("done: " + std::to_string(result.applied) + " applied · " +
+         std::to_string(result.held) + " held");
+    return result;
+}
+
 RunResult run_crew(const Config& config, const RunOptions& options,
                    const RunEvents& events, const std::atomic<bool>* cancel) {
     RunResult result;
@@ -406,7 +626,8 @@ RunResult run_crew(const Config& config, const RunOptions& options,
             }
 
             attempt.outcome = run_coder(config, attempt.subtask, sandbox,
-                                        options.coder, options.model_for("coder"));
+                                        options.coder, options.model_for("coder"),
+                                        steer_mailbox(result.run_id, attempt.subtask.n));
             attempt.changeset = capture_changeset(options.project, sandbox);
 
             // Audited on the worker thread. It is another model call, and doing it
@@ -452,60 +673,8 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     Changeset landed;   // everything applied so far, for overlap detection
 
     for (auto& attempt : attempts) {
-        if (attempt.changeset.empty()) continue;
-
-        std::string reason = attempt.audit.reason;
-        bool        hold   = attempt.audit.held();
-
-        if (!hold) {
-            if (const auto shared = overlapping_files(landed, attempt.changeset);
-                !shared.empty()) {
-                // Approved, but it would overwrite work already landed -- including
-                // the parts the Auditor passed. Held rather than dropped, so the
-                // decision is a person's.
-                hold   = true;
-                reason = "overlaps another coder on " + shared.front();
-                if (shared.size() > 1) {
-                    reason += " (and " + std::to_string(shared.size() - 1) + " more)";
-                }
-                attempt.state = "held";
-            }
-        }
-
-        if (!hold) {
-            std::string error;
-            if (apply_changeset(attempt.changeset, options.project, nullptr, &error)) {
-                landed.files.insert(landed.files.end(), attempt.changeset.files.begin(),
-                                    attempt.changeset.files.end());
-                ++result.applied;
-                note("applied #" + std::to_string(attempt.subtask.n));
-                continue;
-            }
-            hold   = true;
-            reason = error.empty() ? "could not be applied" : error;
-            attempt.state = "held";
-        }
-
-        // Held: save the work so a decision later can still act on it.
-        const auto store = changeset_store(result.run_id, attempt.subtask.n);
-        save_changeset(store, attempt.changeset);
-
-        BoardItem item;
-        item.n         = ++next_number;
-        item.id        = result.run_id + "_" + std::to_string(attempt.subtask.n);
-        item.kind      = "crew_branch";
-        item.summary   = "coder #" + std::to_string(attempt.subtask.n) + " — " +
-                         attempt.subtask.title;
-        item.reason    = reason;
-        item.diff      = attempt.changeset.diff;
-        item.repo_root = options.project.string();
-        item.store     = store.string();
-        item.files     = static_cast<int>(attempt.changeset.files.size());
-        for (const auto& file : attempt.changeset.files) {
-            item.file_names.push_back(file.path);
-        }
-        board.push_back(std::move(item));
-        ++result.held;
+        land_or_hold(result.run_id, options.project, attempt, landed, board,
+                     next_number, result, events.log);
     }
 
     write_board(board);

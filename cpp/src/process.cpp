@@ -8,7 +8,11 @@
 #include <filesystem>
 #include <sstream>
 
+#include <chrono>
+#include <csignal>
+
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -81,6 +85,114 @@ ProcessResult run(const std::vector<std::string>& argv, bool capture,
     }
 
     result.ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return result;
+}
+
+LimitedResult run_limited(const std::vector<std::string>& argv, const std::string& cwd,
+                          int timeout_seconds, std::size_t max_output) {
+    LimitedResult result;
+    if (argv.empty()) return result;
+
+    int fds[2] = {-1, -1};
+    if (::pipe(fds) != 0) return result;
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(fds[0]);
+        ::close(fds[1]);
+        return result;
+    }
+
+    if (pid == 0) {
+        if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) ::_exit(127);
+
+        // Its own process group, so a test runner that forks workers can be killed
+        // as a unit. Killing only the child would leave the workers holding the
+        // pipe open and the parent reading from a process that is already gone.
+        ::setpgid(0, 0);
+
+        ::close(fds[0]);
+        ::dup2(fds[1], STDOUT_FILENO);
+        ::dup2(fds[1], STDERR_FILENO);   // interleaved, as a terminal shows them
+        ::close(fds[1]);
+
+        // stdin from /dev/null: a command that stops to ask a question would
+        // otherwise wait out the whole timeout for an answer that cannot come.
+        if (const int devnull = ::open("/dev/null", O_RDONLY); devnull >= 0) {
+            ::dup2(devnull, STDIN_FILENO);
+            ::close(devnull);
+        }
+
+        std::vector<char*> args;
+        args.reserve(argv.size() + 1);
+        for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+        args.push_back(nullptr);
+
+        ::execvp(args[0], args.data());
+        ::_exit(127);
+    }
+
+    ::close(fds[1]);
+    ::setpgid(pid, pid);   // also in the parent; whichever wins, the race is benign
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+
+    // Non-blocking reads around a poll, so the deadline is enforced even when the
+    // child is silent -- a blocking read on a hung process never returns.
+    ::fcntl(fds[0], F_SETFL, O_NONBLOCK);
+
+    std::array<char, 4096> buffer{};
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            result.timed_out = true;
+            ::kill(-pid, SIGKILL);
+            break;
+        }
+
+        const auto left =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        pollfd waiting{fds[0], POLLIN, 0};
+        const int ready = ::poll(&waiting, 1, static_cast<int>(left.count()));
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ready == 0) continue;   // round again; the deadline check is at the top
+
+        const ssize_t n = ::read(fds[0], buffer.data(), buffer.size());
+        if (n > 0) {
+            if (result.output.size() < max_output) {
+                const std::size_t room = max_output - result.output.size();
+                result.output.append(buffer.data(),
+                                     std::min(room, static_cast<std::size_t>(n)));
+                if (static_cast<std::size_t>(n) > room) result.truncated = true;
+            } else {
+                // Discarded rather than buffered. The cap bounds memory, so growing
+                // to the full size before trimming would defeat it.
+                result.truncated = true;
+            }
+            continue;
+        }
+        if (n == 0) break;                              // child closed the pipe
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+
+    ::close(fds[0]);
+
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return result;
+    }
+
+    // Killed after the deadline, so anything it left behind goes too.
+    if (result.timed_out) ::kill(-pid, SIGKILL);
+
+    if (WIFEXITED(status)) result.exit_code = WEXITSTATUS(status);
+    result.ok = !result.timed_out && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     return result;
 }
 

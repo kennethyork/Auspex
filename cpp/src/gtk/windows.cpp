@@ -559,12 +559,52 @@ CrewWindow::CrewWindow() {
     start_.add_css_class("suggested-action");
     start_.signal_clicked().connect([this] { start(); });
 
-    // Not in Auspex's own engine yet. Left visible but insensitive with the reason
-    // on it: a control that looks live and silently does nothing is worse than one
-    // that plainly says it is not ready.
-    resume_.set_sensitive(false);
     resume_.set_tooltip_text(
-        "Not available yet: Auspex's own engine cannot resume an interrupted run");
+        "Recover an interrupted run: capture what its coders wrote, audit it, and "
+        "land or hold it. No coder is restarted and no plan is remade.");
+    resume_.signal_clicked().connect([this] {
+        if (running_.load()) {
+            status_.set_text("A run is going. Stop it first.");
+            return;
+        }
+        if (!is_project_dir(project_)) {
+            status_.set_text("Choose a folder first");
+            return;
+        }
+        if (resumable_runs().empty()) {
+            status_.set_text("There is no interrupted run to resume");
+            return;
+        }
+
+        if (runner_.joinable()) runner_.join();
+        running_.store(true);
+        start_.set_sensitive(false);
+        resume_.set_sensitive(false);
+        status_.set_text("Recovering the last interrupted run\u2026");
+
+        const Config config = Config::load();
+        const auto   project = project_;
+        runner_ = std::thread([this, config, project] {
+            RunEvents events;
+            events.log = [this](const std::string& line) {
+                {
+                    std::lock_guard lock(log_mutex_);
+                    last_log_ = line;
+                }
+                run_changed_.emit();
+            };
+            const RunResult result = resume_crew(config, project, {}, events);
+            {
+                std::lock_guard lock(log_mutex_);
+                last_log_ = result.error.empty()
+                                ? std::to_string(result.applied) + " applied \u00b7 " +
+                                      std::to_string(result.held) + " held"
+                                : result.error;
+            }
+            running_.store(false);
+            run_changed_.emit();
+        });
+    });
     resume_.signal_clicked().connect([this] {
         if (!is_project_dir(project_)) {
             status_.set_text("Choose a folder for the crew to work in first");
@@ -596,6 +636,7 @@ CrewWindow::CrewWindow() {
         if (!running_.load()) {
             start_.set_sensitive(true);
             stop_.set_sensitive(false);
+            resume_.set_sensitive(!resumable_runs().empty());
         }
         have_run_mtime_   = false;
         have_board_mtime_ = false;
@@ -705,37 +746,36 @@ CrewWindow::CrewWindow() {
 
     // Steering a coder while it works. The instruction is your words, sent as one
     // argument -- the model never composes what goes to a running coder.
-    // No engine equivalent: a coder here runs its loop to completion and has
-    // nowhere to receive a message. Disabled rather than silently dropped.
-    steer_.set_sensitive(false);
-    steer_send_.set_sensitive(false);
-    steer_.set_placeholder_text("Steering is not available in Auspex's own engine yet");
+    steer_.set_placeholder_text("Tell the coder that is running something\u2026");
     steer_.set_hexpand(true);
     steer_.signal_activate().connect([this] { steer_send_.activate(); });
     steer_send_.signal_clicked().connect([this] {
-        const std::string text = std::string(steer_.get_text());
+        const std::string text = trim(std::string(steer_.get_text()));
         if (text.empty()) {
             status_.set_text("Say what to tell the coder first");
             return;
         }
 
-        // The subtask being worked on. Steering is aimed at a coder, and picking
-        // the earliest outstanding one is the only choice the state file supports.
-        const CrewRun run = current_crew_run();
+        // Aimed at the coder that is actually running. A held one has stopped and
+        // has nowhere to receive a message.
+        const CrewRun run = current_crew_run(auspex_run_state_path());
         const auto target = crew_current_subtask(run);
         if (!target) {
             status_.set_text("\u26a0 nothing is running to steer");
             return;
         }
 
-        const auto argv = crew_steer_command(target->n, text);
-        if (argv.empty() || !spawn_detached(argv, project_.string())) {
-            status_.set_text("\u26a0 could not reach the crew");
+        std::string error;
+        if (!steer_coder(target->n, text, &error)) {
+            status_.set_text("\u26a0 " + (error.empty() ? std::string("could not steer")
+                                                         : error));
             return;
         }
-        status_.set_text("\u2713 steered coder " + std::to_string(target->n));
+        status_.set_text("\u2713 told coder " + std::to_string(target->n) +
+                         " \u2014 it will see this at its next step");
         steer_.set_text("");
     });
+
     steer_row_.append(steer_);
     steer_row_.append(steer_send_);
 
@@ -1090,15 +1130,30 @@ void CrewWindow::refresh_board() {
     board_rows_.clear();
 
     const auto items = read_board();
+
+    // ollamadev keeps its OWN board, and anything held there before Auspex grew an
+    // engine is still sitting in it. Auspex will not touch it -- accepting through
+    // this window would apply a changeset stored in a format it does not own -- but
+    // saying nothing would let that work quietly rot. So it is counted and named.
+    std::string elsewhere;
+    if (const auto theirs = board_items(project_); !theirs.empty()) {
+        elsewhere = "  (" + std::to_string(theirs.size()) +
+                    " more held by ollamadev itself \u2014 decide those with "
+                    "`ollamadev crew accept`)";
+    }
+
     if (items.empty()) {
-        board_heading_.set_text("Nothing is being held for review.");
+        board_heading_.set_text(elsewhere.empty()
+                                    ? "Nothing is being held for review."
+                                    : "Nothing held here." + elsewhere);
         board_scroller_.set_visible(false);
         return;
     }
 
     board_heading_.set_text(std::to_string(items.size()) +
                             (items.size() == 1 ? " change held for review"
-                                               : " changes held for review"));
+                                               : " changes held for review") +
+                            elsewhere);
     board_scroller_.set_visible(true);
 
     for (const auto& item : items) {

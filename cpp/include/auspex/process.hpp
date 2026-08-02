@@ -4,6 +4,7 @@
 // are arbitrary user-controlled text and must not be word-split or interpreted.
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,33 @@ struct ProcessResult {
 // crashing to avoid.
 ProcessResult run(const std::vector<std::string>& argv, bool capture = true,
                   const std::string& cwd = {});
+
+// Runs argv with a deadline and an output cap, capturing stdout AND stderr.
+//
+// The plain run() above is for helpers that answer in milliseconds; this is for
+// running somebody else's test suite, where all three of "it hangs", "it prints a
+// gigabyte" and "it fails" are ordinary outcomes rather than surprises.
+//
+// A child that outlives `timeout` is sent SIGKILL and its process GROUP with it --
+// a test runner that forks workers would otherwise leave them behind holding the
+// pipe open, and the read would block long after the child it was waiting for had
+// died.
+//
+// Output past `max_output` is discarded, not buffered: the cap exists to bound
+// memory, so growing to the full size first would defeat it.
+struct LimitedResult {
+    bool        ok = false;        // exited 0, within the deadline
+    int         exit_code = -1;
+    bool        timed_out = false;
+    bool        truncated = false;
+    std::string output;            // stdout and stderr interleaved, as a terminal
+                                   // would show them
+};
+
+LimitedResult run_limited(const std::vector<std::string>& argv,
+                          const std::string& cwd,
+                          int timeout_seconds = 60,
+                          std::size_t max_output = 16'000);
 
 // Splits on '\n', dropping empty lines.
 std::vector<std::string> split_lines(const std::string& text);
