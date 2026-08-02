@@ -24,6 +24,7 @@
 #include "auspex/auditor.hpp"
 #include "auspex/autostart.hpp"
 #include "auspex/calendar.hpp"
+#include "auspex/mcp.hpp"
 #include "auspex/notifications.hpp"
 #include "auspex/canvas.hpp"
 #include "auspex/commands.hpp"
@@ -5964,6 +5965,206 @@ void test_skills() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MCP
+// ---------------------------------------------------------------------------
+//
+// The framing gets the weight. A bug there does not throw -- it waits for bytes
+// that never come, and a deadlocked pipe is not a thing to debug against a live
+// server.
+void test_mcp() {
+    using namespace auspex;
+    std::cout << "\nmcp\n";
+
+    // ---- framing ----
+    {
+        const std::string framed = encode_frame("{\"a\":1}");
+        check(framed.find("Content-Length: 7\r\n\r\n") != std::string::npos,
+              "a frame carries its byte length");
+
+        std::string buffer = framed;
+        const auto one = decode_frame(buffer);
+        check(one.has_value(), "and decodes back");
+        if (one) check_eq(*one, std::string("{\"a\":1}"), "to exactly the payload");
+        check(buffer.empty(), "consuming it from the buffer");
+
+        // A PARTIAL frame is the normal case on a pipe and must not be an error.
+        std::string partial = "Content-Length: 20\r\n\r\n{\"a\":";
+        check(!decode_frame(partial).has_value(), "an incomplete body waits");
+        check(!partial.empty(), "and is left in the buffer for the rest");
+
+        std::string headerless = "Content-Len";
+        check(!decode_frame(headerless).has_value(), "so does half a header");
+
+        // Two frames in one read: both come out, in order.
+        std::string two = encode_frame("{\"n\":1}") + encode_frame("{\"n\":2}");
+        const auto first  = decode_frame(two);
+        const auto second = decode_frame(two);
+        check(first && second, "two frames in one buffer both decode");
+        if (first && second) {
+            check_eq(*first,  std::string("{\"n\":1}"), "the first");
+            check_eq(*second, std::string("{\"n\":2}"), "then the second");
+        }
+        check(two.empty(), "and the buffer empties");
+
+        // Some servers emit \n\n rather than the spec's \r\n\r\n. Getting this
+        // wrong hangs forever rather than failing.
+        std::string loose = "Content-Length: 7\n\n{\"a\":1}";
+        const auto lf = decode_frame(loose);
+        check(lf.has_value(), "bare \\n\\n framing is accepted");
+        if (lf) check_eq(*lf, std::string("{\"a\":1}"), "with the right body");
+
+        // \r\n\r\n CONTAINS \n\n. Searching for the short one first would cut the
+        // header in half and read the body from the wrong offset.
+        std::string strict = "Content-Length: 7\r\n\r\n{\"a\":1}";
+        const auto crlf = decode_frame(strict);
+        check(crlf.has_value(), "and \\r\\n\\r\\n is not mistaken for it");
+        if (crlf) check_eq(*crlf, std::string("{\"a\":1}"), "reading the body correctly");
+
+        // A header with no length can never become usable; dropped rather than
+        // left to wedge the stream forever.
+        std::string lengthless = "X-Thing: 1\r\n\r\n{}";
+        check(!decode_frame(lengthless).has_value(), "a frame with no length is refused");
+        check(lengthless.find("X-Thing") == std::string::npos,
+              "and discarded, not left to block everything behind it");
+
+        // Case-insensitive: the header name is not guaranteed in one spelling.
+        std::string shouty = "CONTENT-LENGTH: 2\r\n\r\n{}";
+        check(decode_frame(shouty).has_value(), "the header name is case-insensitive");
+
+        // A body containing the header delimiter must not be cut short: the length
+        // decides, not a search for the next blank line.
+        const std::string tricky = "{\"t\":\"a\\r\\n\\r\\nb\"}";
+        std::string wrapped = encode_frame(tricky);
+        const auto whole = decode_frame(wrapped);
+        check(whole.has_value(), "a body containing a delimiter still decodes");
+        if (whole) check_eq(*whole, tricky, "whole, because the length decides");
+
+        std::string nothing;
+        check(!decode_frame(nothing).has_value(), "an empty buffer yields nothing");
+    }
+
+    // ---- config ----
+    {
+        const auto servers = parse_mcp_config(R"({
+            "mcpServers": {
+                "files": {"command": "mcp-files", "args": ["--root", "/tmp"],
+                          "env": {"TOKEN": "x"}},
+                "tickets": {"command": "mcp-tickets"},
+                "broken": {"args": ["no command"]}
+            }})");
+        check_eq(servers.size(), std::size_t{2},
+                 "a server with no command is dropped -- it could never be called");
+
+        const auto* files = servers.empty() ? nullptr : &servers[0];
+        check(files && files->name == "files", "servers are sorted by name");
+        if (files) {
+            check_eq(files->command, std::string("mcp-files"), "the command");
+            check_eq(files->args.size(), std::size_t{2}, "its arguments, separate");
+            check_eq(files->env.at("TOKEN"), std::string("x"), "and its environment");
+        }
+
+        // The key every other client uses, so a config can be copied across.
+        check_eq(parse_mcp_config(R"({"servers":{"a":{"command":"x"}}})").size(),
+                 std::size_t{1}, "\"servers\" is accepted as well as \"mcpServers\"");
+
+        check(parse_mcp_config("").empty(), "no config, no servers");
+        check(parse_mcp_config("garbage").empty(), "and garbage is not a config");
+        check(parse_mcp_config("{}").empty(), "nor an empty object");
+
+        check(mcp_config_path().string().find("mcp.json") != std::string::npos,
+              "the config has a home");
+    }
+
+    // ---- naming ----
+    {
+        // Servers are configured by different people and two may both offer
+        // "search"; the coder names them apart.
+        const McpTool tool{"tickets", "search", "find tickets", "{}"};
+        check_eq(tool.qualified(), std::string("tickets.search"),
+                 "tools are named server.tool");
+        const McpTool orphan{"", "search", "", ""};
+        check_eq(orphan.qualified(), std::string("search"),
+                 "and fall back to the bare name");
+    }
+
+    // ---- the verb ----
+    {
+        McpAccess mcp;
+        mcp.tools = {{"tickets", "search", "find tickets", "{}"},
+                     {"files",   "read",   "read a file",  "{}"}};
+        std::string asked_for, asked_with;
+        mcp.call = [&](const std::string& name, const std::string& args)
+            -> std::pair<bool, std::string> {
+            asked_for  = name;
+            asked_with = args;
+            return {true, "two results"};
+        };
+
+        PlannedSubtask subtask{1, "coder", "find the bug", ""};
+        const std::string without = coder_prompt(subtask, {}, {}, {}, "", {}, {});
+        const std::string with    = coder_prompt(subtask, {}, {}, {}, "", {}, mcp);
+        check(with.find("tickets.search") != std::string::npos,
+              "tools are offered as server.tool");
+        check(with.find("find tickets") != std::string::npos, "with descriptions");
+        check(without.find("tickets.search") == std::string::npos,
+              "and not offered when there are none");
+
+        ToolCall call;
+        call.tool          = CoderTool::Mcp;
+        call.mcp_tool      = "tickets.search";
+        call.mcp_arguments = R"({"q":"crash"})";
+        const ToolResult out = run_tool(call, "/tmp", {}, {}, mcp);
+        check(out.ok, "a known tool is called");
+        check_eq(asked_for, std::string("tickets.search"), "by qualified name");
+        check(asked_with.find("crash") != std::string::npos, "with its arguments");
+        check_eq(out.output, std::string("two results"), "and its answer comes back");
+
+        // Checked against the DISCOVERED list before anything is sent. The server
+        // said what it has; a name that is not among them is refused here rather
+        // than forwarded for the server to reject.
+        asked_for.clear();
+        call.mcp_tool = "tickets.deleteEverything";
+        const ToolResult refused = run_tool(call, "/tmp", {}, {}, mcp);
+        check(!refused.ok, "a tool the server did not offer is refused");
+        check(asked_for.empty(), "and never reaches the server at all");
+
+        // With no MCP configured the verb exists but does nothing.
+        check(!run_tool(call, "/tmp", {}, {}, {}).ok, "no servers, no calls");
+
+        // Parsing.
+        const ToolCall parsed = parse_tool_call(
+            R"({"tool":"mcp","name":"a.b","arguments":{"x":1}})");
+        check(parsed.tool == CoderTool::Mcp, "an mcp call parses");
+        check_eq(parsed.mcp_tool, std::string("a.b"), "with its tool name");
+        check(parsed.mcp_arguments.find("\"x\"") != std::string::npos, "and arguments");
+        // Re-serialised rather than passed through, so what reaches the server is
+        // JSON we produced rather than a string the model called JSON.
+        check(parse_tool_call(R"({"tool":"mcp","name":"a.b"})").mcp_arguments == "{}",
+              "missing arguments become an empty object");
+        check(parse_tool_call(R"({"tool":"mcp"})").tool == CoderTool::Unknown,
+              "an mcp call with no tool name is refused");
+    }
+
+    // A server that does not exist fails to start, and says so rather than hanging.
+    {
+        McpClient client(McpServerConfig{"ghost", "definitely-not-a-real-mcp-server",
+                                         {}, {}});
+        std::string error;
+        const auto began = std::chrono::steady_clock::now();
+        check(!client.start(&error), "a missing server fails to start");
+        const auto took = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now() - began).count();
+        check(!error.empty(), "with a reason");
+        check(took < 30, "and fails rather than hanging");
+
+        check(client.tools().empty(), "an unstarted server offers nothing");
+        bool ok = true;
+        client.call("anything", "{}", &ok);
+        check(!ok, "and cannot be called");
+    }
+}
+
 int main(int argc, char** argv) {
     const std::vector<std::string> args(argv + 1, argv + argc);
 
@@ -6234,6 +6435,29 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (!args.empty() && args[0] == "--mcp") {
+        std::vector<std::string> problems;
+        const auto tools = auspex::discover_mcp_tools(&problems);
+        for (const auto& p : problems) std::cout << "  problem: " << p << "\n";
+        std::cout << tools.size() << " tool(s)\n";
+        for (const auto& t : tools) {
+            std::cout << "  " << t.qualified() << " — " << t.description << "\n";
+        }
+        if (args.size() >= 3) {
+            for (const auto& server : auspex::load_mcp_servers()) {
+                auspex::McpClient client(server);
+                std::string error;
+                if (!client.start(&error)) continue;
+                bool ok = false;
+                const std::string out = client.call(args[1], args[2], &ok);
+                std::cout << "\ncall " << args[1] << " -> " << (ok ? "ok" : "FAILED")
+                          << "\n" << out << "\n";
+                break;
+            }
+        }
+        return 0;
+    }
+
     if (args.size() >= 2 && args[0] == "--css") {
         std::cout << auspex::generate_css(auspex::theme_by_name(args[1]));
         return 0;
@@ -6276,6 +6500,7 @@ int main(int argc, char** argv) {
     test_crew_run();
     test_code_index();
     test_skills();
+    test_mcp();
     test_sysmon();
 
     std::cout << "\n" << (checks - failures) << "/" << checks << " checks passed\n";

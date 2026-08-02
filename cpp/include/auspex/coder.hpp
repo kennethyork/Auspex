@@ -47,6 +47,10 @@
 
 #include "auspex/config.hpp"
 #include "auspex/director.hpp"
+#include <functional>
+#include <utility>
+
+#include "auspex/mcp.hpp"
 #include "auspex/skills.hpp"
 
 namespace auspex {
@@ -58,6 +62,7 @@ enum class CoderTool {
     Delete,    // remove one
     Run,       // run one of a fixed set of build/test programs, in the sandbox
     Skill,     // open a skill listed in the catalogue
+    Mcp,       // call a tool offered by a configured MCP server
     Finish,    // done, with a note
     Unknown,   // the model asked for something that is not a verb
 };
@@ -74,6 +79,9 @@ struct ToolCall {
     // For Skill: which one. Reuses `path` would be confusing, so it is its own
     // field -- a skill name is a slug, not a filename.
     std::string skill;
+    // For Mcp: which tool ("server.tool") and its arguments as JSON text.
+    std::string mcp_tool;
+    std::string mcp_arguments;
     // For Run: the program and its arguments, already split. Never a string to be
     // word-split later -- that is where a shell would sneak back in.
     std::vector<std::string> command;
@@ -120,6 +128,20 @@ struct CoderOutcome {
 };
 
 // How hard a coder may try.
+// The MCP tools on offer, and how to call them.
+//
+// Passed in rather than discovered inside the loop: starting every configured
+// server on every turn would be absurd, and the set does not change while a crew
+// runs. `call` is a function so the loop needs no knowledge of transports.
+struct McpAccess {
+    std::vector<McpTool> tools;
+    // (qualified name, arguments JSON) -> (ok, text). Empty means MCP is off.
+    std::function<std::pair<bool, std::string>(const std::string&, const std::string&)>
+        call;
+
+    bool empty() const { return tools.empty() || !call; }
+};
+
 // The skill catalogue and the skills themselves.
 //
 // Passed in rather than looked up inside the loop, so run_coder() stays a function
@@ -180,7 +202,7 @@ std::string coder_prompt(const PlannedSubtask& subtask,
                          const std::vector<CoderStep>& steps,
                          const CoderLimits& limits,
                          const std::string& steered = {},
-                         const SkillSet& skills = {});
+                         const SkillSet& skills = {}, const McpAccess& mcp = {});
 
 // Reads one reply into a call.
 //
@@ -193,7 +215,8 @@ ToolCall parse_tool_call(const std::string& reply);
 // anything that escapes fails the call rather than the run, so the model is told
 // and can correct itself.
 ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
-                    const CoderLimits& limits, const SkillSet& skills = {});
+                    const CoderLimits& limits, const SkillSet& skills = {},
+                    const McpAccess& mcp = {});
 
 // The loop. Blocking -- run it off the GTK thread.
 //
@@ -225,6 +248,6 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,
                        const CoderLimits& limits = {}, const std::string& model = {},
                        const std::filesystem::path& mailbox = {},
-                       const SkillSet& skills = {});
+                       const SkillSet& skills = {}, const McpAccess& mcp = {});
 
 }  // namespace auspex

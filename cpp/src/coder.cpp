@@ -45,6 +45,7 @@ std::string_view tool_name(CoderTool tool) {
         case CoderTool::Delete: return "delete";
         case CoderTool::Run:    return "run";
         case CoderTool::Skill:  return "skill";
+        case CoderTool::Mcp:    return "mcp";
         case CoderTool::Finish: return "finish";
         case CoderTool::Unknown: break;
     }
@@ -63,6 +64,7 @@ CoderTool tool_from_name(const std::string& name) {
     if (lower == "finish") return CoderTool::Finish;
     if (lower == "run")    return CoderTool::Run;
     if (lower == "skill")  return CoderTool::Skill;
+    if (lower == "mcp")    return CoderTool::Mcp;
 
     // Synonyms models reach for unprompted. Accepted because the alternative is a
     // wasted turn spent telling it the word it wanted is spelled differently --
@@ -168,7 +170,8 @@ std::string coder_prompt(const PlannedSubtask& subtask,
                          const std::vector<std::string>& files,
                          const std::vector<CoderStep>& steps,
                          const CoderLimits& limits,
-                         const std::string& steered, const SkillSet& skills) {
+                         const std::string& steered, const SkillSet& skills,
+                         const McpAccess& mcp) {
     std::ostringstream out;
 
     out << "You are a " << (subtask.role.empty() ? "coder" : subtask.role)
@@ -205,6 +208,10 @@ std::string coder_prompt(const PlannedSubtask& subtask,
         out << "  {\"tool\":\"skill\",\"skill\":\"name\"}                 read one of the "
                "skills below\n";
     }
+    if (!mcp.empty()) {
+        out << "  {\"tool\":\"mcp\",\"name\":\"server.tool\",\"arguments\":{}}  call an "
+               "external tool\n";
+    }
     out << "\n";
 
     // The CATALOGUE only -- one line each. The bodies arrive when asked for, which
@@ -213,6 +220,19 @@ std::string coder_prompt(const PlannedSubtask& subtask,
     if (!skills.empty()) {
         out << "Skills available (read one before doing work it covers):\n"
             << skills.catalog << "\n";
+    }
+
+    // Name and one line each. The argument SCHEMAS are deliberately not here: a
+    // dozen JSON schemas would be most of the prompt, and a wrong call costs one
+    // turn and an error message that says what was wrong.
+    if (!mcp.empty()) {
+        out << "External tools available:\n";
+        for (const auto& tool : mcp.tools) {
+            out << "  " << tool.qualified();
+            if (!tool.description.empty()) out << " — " << tool.description;
+            out << "\n";
+        }
+        out << "\n";
     }
 
     if (limits.allow_run) {
@@ -332,6 +352,28 @@ ToolCall parse_tool_call(const std::string& reply) {
         }
     }
 
+    if (call.tool == CoderTool::Mcp) {
+        call.mcp_tool = trim(string_field(document, "mcp_tool"));
+        if (call.mcp_tool.empty()) call.mcp_tool = trim(string_field(document, "name"));
+        if (call.mcp_tool.empty()) call.mcp_tool = trim(string_field(document, "tool_name"));
+        if (call.mcp_tool.empty()) {
+            call.error = "mcp needs a \"name\" from the list above, like "
+                         "\"server.tool\"";
+            call.tool  = CoderTool::Unknown;
+            return call;
+        }
+        // Arguments as an OBJECT, kept as text. Re-serialised rather than passed
+        // through so what reaches the server is JSON we produced, not a string
+        // the model claimed was JSON.
+        if (document.contains("arguments") && document["arguments"].is_object()) {
+            call.mcp_arguments = document["arguments"].dump();
+        } else if (document.contains("args") && document["args"].is_object()) {
+            call.mcp_arguments = document["args"].dump();
+        } else {
+            call.mcp_arguments = "{}";
+        }
+    }
+
     // The command, as an ARRAY. A string would have to be word-split, and the
     // splitter is where a shell creeps back in -- so a string is refused with a
     // note saying what shape is wanted.
@@ -378,7 +420,8 @@ ToolCall parse_tool_call(const std::string& reply) {
 }
 
 ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
-                    const CoderLimits& limits, const SkillSet& skills) {
+                    const CoderLimits& limits, const SkillSet& skills,
+                    const McpAccess& mcp) {
     ToolResult result;
 
     if (call.tool == CoderTool::Unknown) {
@@ -444,6 +487,28 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
             return result;
         }
         result.output = "there is no skill called \"" + call.skill + "\"";
+        return result;
+    }
+
+    if (call.tool == CoderTool::Mcp) {
+        if (mcp.empty()) {
+            result.output = "no MCP servers are configured";
+            return result;
+        }
+        // Checked against the DISCOVERED list before anything is sent. The server
+        // said which tools it has; a name that is not among them is refused here
+        // rather than forwarded for the server to reject.
+        const bool known = std::any_of(
+            mcp.tools.begin(), mcp.tools.end(),
+            [&call](const McpTool& t) { return t.qualified() == call.mcp_tool; });
+        if (!known) {
+            result.output = "there is no MCP tool called \"" + call.mcp_tool + "\"";
+            return result;
+        }
+
+        const auto [ok, text] = mcp.call(call.mcp_tool, call.mcp_arguments);
+        result.ok     = ok;
+        result.output = text;
         return result;
     }
 
@@ -553,7 +618,8 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
 CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,
                        const CoderLimits& limits, const std::string& model,
-                       const std::filesystem::path& mailbox, const SkillSet& skills) {
+                       const std::filesystem::path& mailbox, const SkillSet& skills,
+                       const McpAccess& mcp) {
     CoderOutcome outcome;
 
     if (!std::filesystem::is_directory(sandbox)) {
@@ -583,7 +649,7 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
         // than needing the coder to be interrupted mid-call.
         const std::string prompt =
             coder_prompt(subtask, files, outcome.steps, limits, take_steer(mailbox),
-                         skills);
+                         skills, mcp);
 
         const auto reply = ollama.generate(
             model.empty() ? config.ollama_model : model, prompt, options);
@@ -597,7 +663,7 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
 
         CoderStep current;
         current.call   = parse_tool_call(text);
-        current.result = run_tool(current.call, sandbox, limits, skills);
+        current.result = run_tool(current.call, sandbox, limits, skills, mcp);
 
         if (current.call.tool == CoderTool::Finish) {
             outcome.finished = true;

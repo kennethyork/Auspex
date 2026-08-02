@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -12,6 +13,7 @@
 
 #include "auspex/process.hpp"
 #include "auspex/code_index.hpp"
+#include "auspex/mcp.hpp"
 #include "auspex/skills.hpp"
 #include "auspex/projects.hpp"
 
@@ -575,6 +577,53 @@ RunResult run_crew(const Config& config, const RunOptions& options,
 
     // What the index thinks is relevant, when there is one. Silent when there is
     // not: an unindexed project must still be plannable.
+    // MCP servers are started ONCE for the run and shared. Starting every
+    // configured server per coder, or per turn, would be absurd -- and the tools
+    // do not change while a crew works.
+    //
+    // Serialised on a mutex: coders run on several threads and each client owns
+    // one pipe, which is not safe to interleave. MCP calls are rare next to model
+    // calls, so the contention is nothing.
+    std::vector<std::unique_ptr<McpClient>> mcp_clients;
+    std::vector<std::string> mcp_problems;
+    McpAccess mcp;
+    {
+        for (const auto& server : load_mcp_servers()) {
+            auto client = std::make_unique<McpClient>(server);
+            std::string error;
+            if (!client->start(&error)) {
+                mcp_problems.push_back(server.name + ": " + error);
+                continue;
+            }
+            for (auto& tool : client->tools()) mcp.tools.push_back(std::move(tool));
+            mcp_clients.push_back(std::move(client));
+        }
+        for (const auto& problem : mcp_problems) note("mcp: " + problem);
+
+        if (!mcp.tools.empty()) {
+            auto* clients = &mcp_clients;
+            auto  guard   = std::make_shared<std::mutex>();
+            mcp.call = [clients, guard](const std::string& qualified,
+                                        const std::string& arguments)
+                -> std::pair<bool, std::string> {
+                const auto dot = qualified.find('.');
+                if (dot == std::string::npos) return {false, "not a server.tool name"};
+                const std::string server = qualified.substr(0, dot);
+                const std::string tool   = qualified.substr(dot + 1);
+
+                std::lock_guard lock(*guard);
+                for (auto& client : *clients) {
+                    if (client->config().name != server) continue;
+                    bool ok = false;
+                    const std::string text = client->call(tool, arguments, &ok);
+                    return {ok, text};
+                }
+                return {false, "no such server: " + server};
+            };
+            note("mcp: " + std::to_string(mcp.tools.size()) + " tool(s) available");
+        }
+    }
+
     // Discovered once for the run, not per coder: the set does not change while a
     // crew works, and re-walking two directories on every turn would be waste.
     SkillSet skills;
@@ -644,7 +693,7 @@ RunResult run_crew(const Config& config, const RunOptions& options,
             attempt.outcome = run_coder(config, attempt.subtask, sandbox,
                                         options.coder, options.model_for("coder"),
                                         steer_mailbox(result.run_id, attempt.subtask.n),
-                                        skills);
+                                        skills, mcp);
             attempt.changeset = capture_changeset(options.project, sandbox);
 
             // Audited on the worker thread. It is another model call, and doing it
