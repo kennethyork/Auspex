@@ -5615,6 +5615,81 @@ void test_crew_run() {
         check(parse_board(encode_board({})).empty(), "an empty board round-trips too");
     }
 
+    // ---- the faculty map ----
+    //
+    // The Brain window draws this. It must describe THIS engine: a faculty
+    // Auspex does not have, drawn as though it worked, is the same lie the window
+    // used to tell by editing ollamadev's router settings that nothing read.
+    {
+        const auto& parts = crew_faculties();
+        check(!parts.empty(), "the crew has faculties to show");
+
+        const auto find = [&parts](const std::string& key) -> const Faculty* {
+            for (const auto& p : parts) if (p.key == key) return &p;
+            return nullptr;
+        };
+
+        check(find("director") && find("director")->state == FacultyState::Always,
+              "the Director is always part of a run");
+        check(find("auditor") && find("auditor")->state == FacultyState::Always,
+              "and so is the Auditor");
+
+        // Not switches. Overlapping work is held whatever you do, and a leaked
+        // credential is never landed -- drawing either as optional would offer a
+        // choice that does not exist.
+        check(find("overlap") && find("overlap")->state == FacultyState::Always,
+              "the overlap guard is not optional");
+        check(find("secret") && find("secret")->state == FacultyState::Always,
+              "and neither is the secret gate");
+
+        // Honest about what is absent.
+        check(find("debate") && find("debate")->state == FacultyState::Missing,
+              "debate is marked missing, not drawn as working");
+        check(find("security") && find("security")->state == FacultyState::Missing,
+              "and so is the security scan");
+
+        check(find("run") && find("run")->state == FacultyState::Optional,
+              "test running is optional, because it is off by default");
+
+        for (const auto& part : parts) {
+            check(!part.label.empty(), part.key + " has a label");
+            check(!part.role.empty(), part.key + " says what it does");
+        }
+    }
+
+    // ---- which stage a run is in ----
+    {
+        const auto stage = [](bool active, std::vector<std::string> states) {
+            CrewRun run;
+            run.known  = true;
+            run.active = active;
+            int n = 1;
+            for (auto& st : states) {
+                CrewSubtask s;
+                s.n = n++;
+                s.state = st;
+                run.subtasks.push_back(s);
+            }
+            return active_faculty(run);
+        };
+
+        check(stage(false, {"doing"}).empty(), "an idle crew is in no stage");
+        check_eq(stage(true, {}), std::string("director"),
+                 "no plan yet means the Director is still deciding");
+        check_eq(stage(true, {"doing", "todo"}), std::string("coders"),
+                 "anything doing means the coders are working");
+        check_eq(stage(true, {"todo", "todo"}), std::string("director"),
+                 "nothing started yet is still planning");
+        check_eq(stage(true, {"done", "done"}), std::string("landing"),
+                 "all done means landing");
+        // Nothing running, nothing waiting, not all finished: what is left is held.
+        check_eq(stage(true, {"done", "held"}), std::string("auditor"),
+                 "held work means the Auditor has it");
+
+        CrewRun unknown;
+        check(active_faculty(unknown).empty(), "an unread state file names no stage");
+    }
+
     // ---- steering ----
     //
     // A file rather than a queue, because the two ends are not in one place: the

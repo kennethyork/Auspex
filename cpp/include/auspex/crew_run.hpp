@@ -153,6 +153,37 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
 // Runs with sandboxes still on disk, newest first. What resume could act on.
 std::vector<std::string> resumable_runs();
 
+// --- what the crew is made of -------------------------------------------------
+//
+// ollamadev-qt's Brain pane draws the crew as a stack of faculties with the
+// active one lit. This is the same list for Auspex's engine -- and it is a LIST
+// OF WHAT IS TRUE, not a copy of theirs: a faculty this engine does not have says
+// so rather than being drawn as though it worked.
+
+enum class FacultyState {
+    Always,      // part of every run; nothing to turn on
+    Optional,    // exists, and is off unless asked for
+    Missing,     // ollamadev has it, Auspex does not (yet)
+};
+
+struct Faculty {
+    std::string  key;
+    std::string  label;
+    std::string  role;    // one line: what it does
+    FacultyState state = FacultyState::Always;
+};
+
+// In pipeline order, so the list reads as the run does.
+const std::vector<Faculty>& crew_faculties();
+
+// Which faculty a run is in right now, from the state file. Empty when idle.
+//
+// Derived from the subtasks rather than written by the runner: any coder doing
+// means "coders", none started means "director", all done means "landing", and
+// anything else means the Auditor has them. One source of truth, and it is the
+// same file the panel already watches.
+std::string active_faculty(const CrewRun& run);
+
 // --- the board ----------------------------------------------------------------
 
 // What the run left for a person, in the same JSON shape parse_board() reads.

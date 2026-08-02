@@ -258,6 +258,62 @@ std::vector<std::string> resumable_runs() {
     return runs;
 }
 
+const std::vector<Faculty>& crew_faculties() {
+    // Honest about what this engine has. Debate and the security scan exist in
+    // ollamadev and not here; drawing them as faculties would be describing a
+    // pipeline that does not run.
+    //
+    // Dedupe and the secret gate are Always rather than Optional on purpose:
+    // overlapping work is held whatever you do, and a leaked credential is never
+    // landed. Neither is a switch, so neither is drawn as one.
+    static const std::vector<Faculty> kParts{
+        {"researcher", "Researcher", "reads the project and indexes it by meaning",
+         FacultyState::Always},
+        {"director", "Director", "decomposes the task into independent pieces",
+         FacultyState::Always},
+        {"roles", "Roles", "assigns a persona to each piece", FacultyState::Always},
+        {"skills", "Skills", "offers know-how a coder can open on demand",
+         FacultyState::Always},
+        {"mcp", "External tools", "servers you configured, if any",
+         FacultyState::Optional},
+        {"coders", "Coders", "build in parallel sandboxes", FacultyState::Always},
+        {"run", "Test running", "coders may run tests; off unless allowed",
+         FacultyState::Optional},
+        {"auditor", "Auditor", "reviews every changeset before it lands",
+         FacultyState::Always},
+        {"secret", "Secret gate", "never lands a leaked credential",
+         FacultyState::Always},
+        {"overlap", "Overlap guard", "holds work that would overwrite another's",
+         FacultyState::Always},
+        {"landing", "Landing", "applies what passed, holds the rest",
+         FacultyState::Always},
+        {"debate", "Debate", "advocate vs skeptic vs judge", FacultyState::Missing},
+        {"security", "Security scan", "read-only vulnerability hunt",
+         FacultyState::Missing},
+    };
+    return kParts;
+}
+
+std::string active_faculty(const CrewRun& run) {
+    if (!run.known || !run.active) return {};
+    // No plan yet: the Director is still deciding what the pieces are.
+    if (run.subtasks.empty()) return "director";
+
+    bool any_doing = false, any_todo = false, all_done = true;
+    for (const auto& subtask : run.subtasks) {
+        if (subtask.state == "doing") any_doing = true;
+        if (subtask.state == "todo")  any_todo  = true;
+        if (subtask.state != "done")  all_done  = false;
+    }
+
+    if (any_doing) return "coders";
+    if (all_done)  return "landing";
+    if (any_todo)  return "director";
+    // Nothing running, nothing waiting to start, not all finished: what is left is
+    // held or being reviewed.
+    return "auditor";
+}
+
 std::string encode_board(const std::vector<BoardItem>& items) {
     json array = json::array();
     for (const auto& item : items) {

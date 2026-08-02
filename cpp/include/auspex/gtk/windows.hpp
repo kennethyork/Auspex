@@ -401,54 +401,52 @@ private:
     Gtk::Label  status_;
 };
 
-// The crew's brain: which model each difficulty routes to, and where a given
-// request would go.
+// The crew's brain: what it is made of, and which model does each part.
 //
-// Ports ollamadev-qt's BrainPane. Before this, --route was a switch you could turn
-// on and neither see the effect of nor influence -- the tiers live in ollamadev's
-// own prefs and there was no way to read or write them from Auspex at all.
+// This window used to edit ollamadev's `router.*` preferences, which Auspex's own
+// engine never reads -- so it was a settings panel that changed nothing about the
+// crew it claimed to configure. It now writes Auspex's own per-role models, which
+// are what actually run.
+//
+// It also draws the pipeline, as ollamadev-qt's Brain pane does, with the stage a
+// live run is in lit up. The faculty list is Auspex's OWN (see crew_faculties()):
+// a part this engine does not have is drawn as missing rather than as working.
 class BrainWindow : public Gtk::Window {
 public:
     BrainWindow();
 
 private:
     void reload();
-    void probe();
+    void save_models();
+    void refresh_map();
     void show_usage();
 
     Gtk::Box   root_{Gtk::Orientation::VERTICAL, 10};
     Gtk::Label heading_;
 
-    // One row per tier: its name, and the model it resolves to.
-    Gtk::Grid  tiers_;
-    struct TierRow {
-        Gtk::Label     label;
-        Gtk::DropDown  models;
-        std::string    tier;
+    // One picker per ROLE, not per difficulty tier. Auspex's engine chooses by
+    // role -- planning, coding and reviewing are different jobs -- and offering
+    // difficulty tiers it does not use would be the same lie as before.
+    Gtk::Grid  roles_;
+    struct RoleRow {
+        Gtk::Label    label;
+        Gtk::DropDown models;
+        std::string   key;     // "director" | "coder" | "auditor"
     };
-    std::vector<std::unique_ptr<TierRow>> rows_;
+    std::vector<std::unique_ptr<RoleRow>> rows_;
     std::vector<std::string> models_;
-    // Set while the pickers are being filled in from the engine, so their own
-    // change handlers do not fire and write back what was just read.
     bool loading_ = false;
 
-    // "Where would this go?" -- the probe. Answers without running anything, which
-    // is why route_command() deliberately omits --run.
-    Gtk::Label  probe_label_;
-    Gtk::Box    probe_row_{Gtk::Orientation::HORIZONTAL, 6};
-    Gtk::Entry  probe_entry_;
-    Gtk::Button probe_go_{"Route it"};
-    Gtk::Label  probe_result_;
+    // The pipeline, with the live stage marked.
+    Gtk::Label          map_heading_;
+    Gtk::ScrolledWindow map_scroller_;
+    Gtk::Box            map_{Gtk::Orientation::VERTICAL, 2};
+    std::vector<std::unique_ptr<Gtk::Widget>> map_rows_;
+    std::string         last_active_;
+    bool                have_map_ = false;
 
-    // What has been spent, and how much of it stayed on this machine.
-    //
-    // Per PROJECT, unlike the tiers above -- usage.json lives in the project's own
-    // .ollamadev -- so the folder it refers to is named rather than assumed. Qt's
-    // BrainPane shows the same line for whatever project the app has open; this
-    // window has no project of its own, so it takes the current one.
     Gtk::Label  tokens_;
-
-    Gtk::Label status_;
+    Gtk::Label  status_;
 };
 
 // Conversation window. Replaces llm_menu.py, including its per-message actions:

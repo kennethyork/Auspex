@@ -1519,66 +1519,62 @@ void TeamWindow::launch() {
 BrainWindow::BrainWindow() {
     set_title("Auspex Brain");
     add_css_class("auspex-window");
-    set_default_size(600, 420);
+    set_default_size(640, 720);
     set_hide_on_close(true);
 
-    heading_.set_markup("<b>The crew's brain</b> — which model each difficulty routes to");
+    heading_.set_markup("<b>The crew's brain</b> — what it is made of, and which "
+                        "model does each part");
     heading_.set_xalign(0.0f);
     heading_.set_wrap(true);
 
-    tiers_.set_row_spacing(8);
-    tiers_.set_column_spacing(12);
+    // ---- per-role models ----
+    roles_.set_row_spacing(8);
+    roles_.set_column_spacing(12);
 
-    static const std::vector<std::pair<const char*, const char*>> kTierLabels{
-        {"simple", "Simple (trivia)"},
-        {"moderate", "Moderate (general)"},
-        {"hard", "Hard (design/debug)"},
+    static const std::vector<std::pair<const char*, const char*>> kRoles{
+        {"director", "Director — plans"},
+        {"coder",    "Coders — build"},
+        {"auditor",  "Auditor — reviews"},
     };
 
     int row = 0;
-    for (const auto& [tier, caption] : kTierLabels) {
-        auto entry = std::make_unique<TierRow>();
-        entry->tier = tier;
+    for (const auto& [key, caption] : kRoles) {
+        auto entry = std::make_unique<RoleRow>();
+        entry->key = key;
         entry->label.set_text(caption);
         entry->label.set_xalign(0.0f);
         entry->models.set_hexpand(true);
 
-        TierRow* raw = entry.get();
-        entry->models.property_selected().signal_changed().connect([this, raw] {
-            if (loading_) return;
-            const auto index = raw->models.get_selected();
-            if (index == GTK_INVALID_LIST_POSITION || index >= models_.size()) return;
+        // The Auditor is the one worth setting, and the tooltip says why rather
+        // than leaving it to be discovered the hard way.
+        if (std::string(key) == "auditor") {
+            entry->models.set_tooltip_text(
+                "The one worth changing. A small model here holds correct work with "
+                "confident wrong reasons, which makes the whole crew pointless.");
+        }
 
-            // Written through the engine's own `config set`, so the value lands in
-            // ade-prefs.json exactly where ollamadev looks for it -- and so the Qt
-            // front end sees the same change without either of them knowing about
-            // the other.
-            const auto argv = router_set_command(raw->tier, models_[index]);
-            if (argv.empty() || !run(argv).ok) {
-                status_.set_text("⚠ could not set " + raw->tier);
-                return;
-            }
-            status_.set_text("✓ " + raw->tier + " → " + models_[index]);
+        entry->models.property_selected().signal_changed().connect([this] {
+            if (loading_) return;
+            save_models();
         });
 
-        tiers_.attach(entry->label, 0, row);
-        tiers_.attach(entry->models, 1, row);
+        roles_.attach(entry->label, 0, row);
+        roles_.attach(entry->models, 1, row);
         rows_.push_back(std::move(entry));
         ++row;
     }
 
-    probe_label_.set_text("Try the router — where would this go?");
-    probe_label_.set_xalign(0.0f);
-    probe_label_.add_css_class("subtitle");
-    probe_entry_.set_placeholder_text("e.g. \"rename a variable\" or \"design a cache\"…");
-    probe_entry_.set_hexpand(true);
-    probe_entry_.signal_activate().connect([this] { probe(); });
-    probe_go_.signal_clicked().connect([this] { probe(); });
-    probe_row_.append(probe_entry_);
-    probe_row_.append(probe_go_);
+    // ---- the pipeline ----
+    map_heading_.set_text("The pipeline");
+    map_heading_.set_xalign(0.0f);
+    map_heading_.add_css_class("subtitle");
+    map_scroller_.set_child(map_);
+    map_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    map_scroller_.set_vexpand(true);
 
-    probe_result_.set_xalign(0.0f);
-    probe_result_.set_wrap(true);
+    tokens_.set_xalign(0.0f);
+    tokens_.set_wrap(true);
+    tokens_.set_margin_top(6);
 
     status_.set_xalign(0.0f);
     status_.add_css_class("subtitle");
@@ -1586,46 +1582,49 @@ BrainWindow::BrainWindow() {
 
     root_.set_margin(14);
     root_.append(heading_);
-    root_.append(tiers_);
-    root_.append(probe_label_);
-    root_.append(probe_row_);
-    root_.append(probe_result_);
+    root_.append(roles_);
+    root_.append(map_heading_);
+    root_.append(map_scroller_);
     root_.append(tokens_);
     root_.append(status_);
     set_child(root_);
 
-    tokens_.set_xalign(0.0f);
-    tokens_.set_wrap(true);
-    tokens_.set_margin_top(6);
-
     reload();
+    refresh_map();
+
+    // The stage a run is in changes as it works. Two seconds, and a rebuild only
+    // when the stage actually changed -- redrawing thirteen rows every tick would
+    // flicker for nothing.
+    Glib::signal_timeout().connect(
+        [this] {
+            refresh_map();
+            return true;
+        },
+        2000);
 }
 
 void BrainWindow::reload() {
     models_ = available_models();
-    if (models_.empty()) {
-        status_.set_text("No models listed — is Ollama running?");
-        return;
-    }
+    const Config config = Config::load();
 
     loading_ = true;
     for (auto& entry : rows_) {
+        // "Default" first, so a role can be put back to following ollama_model
+        // without having to know what that is.
         std::vector<Glib::ustring> labels;
+        labels.emplace_back("Default (" + config.ollama_model + ")");
         for (const auto& model : models_) labels.emplace_back(model);
         entry->models.set_model(Gtk::StringList::create(labels));
 
-        // What the tier resolves to right now, including a default the engine
-        // derived rather than one anybody set.
-        const auto argv = router_get_command(entry->tier);
-        std::string current;
-        if (!argv.empty()) {
-            if (const auto result = run(argv); result.ok) current = trim(result.out);
-        }
+        const std::string current =
+            entry->key == "director" ? config.crew_director_model
+            : entry->key == "coder"  ? config.crew_coder_model
+                                     : config.crew_auditor_model;
 
         guint selected = 0;
         for (std::size_t i = 0; i < models_.size(); ++i) {
             if (models_[i] == current) {
-                selected = static_cast<guint>(i);
+                selected = static_cast<guint>(i) + 1;   // +1 for "Default"
                 break;
             }
         }
@@ -1633,6 +1632,120 @@ void BrainWindow::reload() {
     }
     loading_ = false;
 
+    if (models_.empty()) status_.set_text("No models listed — is Ollama running?");
+    show_usage();
+}
+
+void BrainWindow::save_models() {
+    const auto path = Config::default_path();
+
+    // Read-modify-write, so keys this window does not expose are preserved rather
+    // than dropped -- the same rule SettingsWindow follows.
+    json document = json::object();
+    if (std::ifstream in(path); in) {
+        document = json::parse(in, nullptr, /*allow_exceptions=*/false);
+        if (document.is_discarded() || !document.is_object()) document = json::object();
+    }
+
+    for (const auto& entry : rows_) {
+        const auto index = entry->models.get_selected();
+        // Index 0 is "Default": an empty string, which is what the engine reads as
+        // "fall back to ollama_model".
+        const std::string value =
+            (index == GTK_INVALID_LIST_POSITION || index == 0 ||
+             index > models_.size())
+                ? std::string{}
+                : models_[index - 1];
+        document["crew_" + entry->key + "_model"] = value;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    const auto temp = path.string() + ".tmp";
+    {
+        std::ofstream out(temp, std::ios::trunc);
+        if (!out) {
+            status_.set_text("⚠ could not write the config");
+            return;
+        }
+        out << document.dump(2) << "\n";
+    }
+    std::filesystem::rename(temp, path, ec);
+    if (ec) {
+        std::filesystem::remove(temp, ec);
+        status_.set_text("⚠ could not replace the config");
+        return;
+    }
+    status_.set_text("✓ saved — the next run uses these");
+}
+
+void BrainWindow::refresh_map() {
+    const CrewRun run = current_crew_run(auspex_run_state_path());
+    const std::string active = active_faculty(run);
+
+    // Only when it changed. Redrawing thirteen rows every two seconds would
+    // flicker for nothing.
+    if (have_map_ && active == last_active_) return;
+    last_active_ = active;
+    have_map_    = true;
+
+    while (Gtk::Widget* child = map_.get_first_child()) map_.remove(*child);
+    map_rows_.clear();
+
+    const Config config = Config::load();
+    const bool have_mcp = !load_mcp_servers().empty();
+
+    for (const auto& part : crew_faculties()) {
+        auto card = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 1);
+        card->add_css_class("code-block");
+
+        std::string title = part.label;
+        std::string note  = part.role;
+
+        switch (part.state) {
+            case FacultyState::Missing:
+                title += "   (not in Auspex yet)";
+                break;
+            case FacultyState::Optional:
+                // Say whether the optional thing is actually on, rather than
+                // leaving "optional" to mean either.
+                if (part.key == "mcp") {
+                    title += have_mcp ? "   (configured)" : "   (none configured)";
+                } else if (part.key == "run") {
+                    title += "   (off by default)";
+                }
+                break;
+            case FacultyState::Always:
+                break;
+        }
+
+        auto* name = Gtk::make_managed<Gtk::Label>(title);
+        name->set_xalign(0.0f);
+        auto* what = Gtk::make_managed<Gtk::Label>(note);
+        what->set_xalign(0.0f);
+        what->set_wrap(true);
+        what->add_css_class("subtitle");
+
+        card->append(*name);
+        card->append(*what);
+
+        if (part.key == active) {
+            card->add_css_class("recording");   // the stage the run is in, now
+        }
+        if (part.state == FacultyState::Missing) {
+            // DIMMED, not red. Red is for something that went wrong; this went
+            // nowhere -- it is a part of ollamadev's crew that Auspex has not
+            // built. It also has to stay readable: the error colour on this
+            // background is dark red on dark grey.
+            name->set_opacity(0.45);
+            what->set_opacity(0.45);
+        }
+
+        map_.append(*card);
+        map_rows_.push_back(std::move(card));
+    }
+
+    (void)config;
     show_usage();
 }
 
@@ -1650,43 +1763,9 @@ void BrainWindow::show_usage() {
                            Glib::Markup::escape_text(project->name) + " yet</span>");
         return;
     }
-
     tokens_.set_markup("<b>" + Glib::Markup::escape_text(project->name) + ":</b> " +
                        Glib::Markup::escape_text(summary));
     tokens_.set_tooltip_text(usage_path(project->path).string());
-}
-
-void BrainWindow::probe() {
-    const std::string text = trim(std::string(probe_entry_.get_text()));
-    if (text.empty()) {
-        probe_result_.set_text({});
-        return;
-    }
-
-    const auto argv = route_command(text);
-    if (argv.empty()) return;
-
-    const auto result = run(argv);
-    if (!result.ok) {
-        probe_result_.set_text("⚠ the router did not answer");
-        return;
-    }
-
-    const RouteDecision decision = parse_route(result.out);
-    if (decision.tier.empty()) {
-        probe_result_.set_text("⚠ could not read the router's answer");
-        return;
-    }
-
-    std::string text_out = decision.tier + "  →  " + decision.model;
-    if (!decision.reason.empty()) text_out += "\n" + decision.reason;
-    probe_result_.set_markup("<b>" + Glib::Markup::escape_text(decision.tier) +
-                             "</b>  →  " + Glib::Markup::escape_text(decision.model) +
-                             (decision.reason.empty()
-                                  ? ""
-                                  : "\n<span alpha='70%'>" +
-                                        Glib::Markup::escape_text(decision.reason) +
-                                        "</span>"));
 }
 
 // ---------------------------------------------------------------------------
