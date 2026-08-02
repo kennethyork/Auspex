@@ -47,6 +47,7 @@
 
 #include "auspex/config.hpp"
 #include "auspex/director.hpp"
+#include "auspex/skills.hpp"
 
 namespace auspex {
 
@@ -56,6 +57,7 @@ enum class CoderTool {
     Write,     // replace one, or create it
     Delete,    // remove one
     Run,       // run one of a fixed set of build/test programs, in the sandbox
+    Skill,     // open a skill listed in the catalogue
     Finish,    // done, with a note
     Unknown,   // the model asked for something that is not a verb
 };
@@ -69,6 +71,9 @@ struct ToolCall {
     std::string path;
     std::string contents;
     std::string note;
+    // For Skill: which one. Reuses `path` would be confusing, so it is its own
+    // field -- a skill name is a slug, not a filename.
+    std::string skill;
     // For Run: the program and its arguments, already split. Never a string to be
     // word-split later -- that is where a shell would sneak back in.
     std::vector<std::string> command;
@@ -115,6 +120,17 @@ struct CoderOutcome {
 };
 
 // How hard a coder may try.
+// The skill catalogue and the skills themselves.
+//
+// Passed in rather than looked up inside the loop, so run_coder() stays a function
+// of its arguments and the prompt builder can be tested without a filesystem.
+struct SkillSet {
+    std::string              catalog;   // one line each, for the prompt
+    std::vector<::auspex::Skill> skills;
+
+    bool empty() const { return skills.empty(); }
+};
+
 struct CoderLimits {
     // Steps, not turns of conversation: a read is a step. Twenty-four is enough to
     // look at half a dozen files and write three, and small enough that a model
@@ -163,7 +179,8 @@ std::string coder_prompt(const PlannedSubtask& subtask,
                          const std::vector<std::string>& files,
                          const std::vector<CoderStep>& steps,
                          const CoderLimits& limits,
-                         const std::string& steered = {});
+                         const std::string& steered = {},
+                         const SkillSet& skills = {});
 
 // Reads one reply into a call.
 //
@@ -176,7 +193,7 @@ ToolCall parse_tool_call(const std::string& reply);
 // anything that escapes fails the call rather than the run, so the model is told
 // and can correct itself.
 ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
-                    const CoderLimits& limits);
+                    const CoderLimits& limits, const SkillSet& skills = {});
 
 // The loop. Blocking -- run it off the GTK thread.
 //
@@ -207,6 +224,7 @@ bool        leave_steer(const std::filesystem::path& mailbox, const std::string&
 CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,
                        const CoderLimits& limits = {}, const std::string& model = {},
-                       const std::filesystem::path& mailbox = {});
+                       const std::filesystem::path& mailbox = {},
+                       const SkillSet& skills = {});
 
 }  // namespace auspex

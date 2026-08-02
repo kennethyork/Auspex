@@ -65,9 +65,12 @@ struct Plan {
 //
 // `max_subtasks` bounds the plan. It is in the prompt AND enforced on the reply,
 // because a model asked for at most four will sometimes return six.
+// `hint` is anything already known about WHERE the work is -- in practice the
+// semantic index's answer, which turns a filename list into a filename list plus
+// "these ones matter". Empty when there is no index; planning must work without.
 std::string director_prompt(const std::string& task,
                             const std::vector<std::string>& files,
-                            int max_subtasks);
+                            int max_subtasks, const std::string& hint = {});
 
 // Reads the Director's reply.
 //
@@ -94,6 +97,6 @@ std::string extract_json(const std::string& text);
 // --route will pick a different one per role later.
 Plan plan_task(const Config& config, const std::string& task,
                const std::vector<std::string>& files, int max_subtasks,
-               const std::string& model = {});
+               const std::string& model = {}, const std::string& hint = {});
 
 }  // namespace auspex

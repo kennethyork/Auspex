@@ -44,6 +44,7 @@ std::string_view tool_name(CoderTool tool) {
         case CoderTool::Write:  return "write";
         case CoderTool::Delete: return "delete";
         case CoderTool::Run:    return "run";
+        case CoderTool::Skill:  return "skill";
         case CoderTool::Finish: return "finish";
         case CoderTool::Unknown: break;
     }
@@ -61,6 +62,7 @@ CoderTool tool_from_name(const std::string& name) {
     if (lower == "delete") return CoderTool::Delete;
     if (lower == "finish") return CoderTool::Finish;
     if (lower == "run")    return CoderTool::Run;
+    if (lower == "skill")  return CoderTool::Skill;
 
     // Synonyms models reach for unprompted. Accepted because the alternative is a
     // wasted turn spent telling it the word it wanted is spelled differently --
@@ -70,6 +72,9 @@ CoderTool tool_from_name(const std::string& name) {
     if (lower == "read_file" || lower == "open" || lower == "cat") return CoderTool::Read;
     if (lower == "write_file" || lower == "edit" || lower == "create") {
         return CoderTool::Write;
+    }
+    if (lower == "open_skill" || lower == "use_skill" || lower == "load_skill") {
+        return CoderTool::Skill;
     }
     if (lower == "remove" || lower == "rm" || lower == "delete_file") {
         return CoderTool::Delete;
@@ -163,7 +168,7 @@ std::string coder_prompt(const PlannedSubtask& subtask,
                          const std::vector<std::string>& files,
                          const std::vector<CoderStep>& steps,
                          const CoderLimits& limits,
-                         const std::string& steered) {
+                         const std::string& steered, const SkillSet& skills) {
     std::ostringstream out;
 
     out << "You are a " << (subtask.role.empty() ? "coder" : subtask.role)
@@ -196,7 +201,19 @@ std::string coder_prompt(const PlannedSubtask& subtask,
         out << "  {\"tool\":\"run\",\"command\":[\"pytest\",\"-q\"]}        run tests or a "
                "build\n";
     }
+    if (!skills.empty()) {
+        out << "  {\"tool\":\"skill\",\"skill\":\"name\"}                 read one of the "
+               "skills below\n";
+    }
     out << "\n";
+
+    // The CATALOGUE only -- one line each. The bodies arrive when asked for, which
+    // is the whole idea: putting every skill's full text in every prompt would
+    // spend the context window on instructions that do not apply.
+    if (!skills.empty()) {
+        out << "Skills available (read one before doing work it covers):\n"
+            << skills.catalog << "\n";
+    }
 
     if (limits.allow_run) {
         out << "You may run: ";
@@ -304,6 +321,17 @@ ToolCall parse_tool_call(const std::string& reply) {
     if (call.contents.empty()) call.contents = string_field(document, "content");
     if (call.contents.empty()) call.contents = string_field(document, "text");
 
+    if (call.tool == CoderTool::Skill) {
+        call.skill = trim(string_field(document, "skill"));
+        if (call.skill.empty()) call.skill = trim(string_field(document, "name"));
+        if (call.skill.empty()) call.skill = trim(string_field(document, "path"));
+        if (call.skill.empty()) {
+            call.error = "skill needs a \"skill\" name from the list above";
+            call.tool  = CoderTool::Unknown;
+            return call;
+        }
+    }
+
     // The command, as an ARRAY. A string would have to be word-split, and the
     // splitter is where a shell creeps back in -- so a string is refused with a
     // note saying what shape is wanted.
@@ -350,7 +378,7 @@ ToolCall parse_tool_call(const std::string& reply) {
 }
 
 ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
-                    const CoderLimits& limits) {
+                    const CoderLimits& limits, const SkillSet& skills) {
     ToolResult result;
 
     if (call.tool == CoderTool::Unknown) {
@@ -402,6 +430,20 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
         // the most useful turn in the loop.
         result.ok = !ran.timed_out;
         result.output = report;
+        return result;
+    }
+
+    if (call.tool == CoderTool::Skill) {
+        for (const auto& skill : skills.skills) {
+            if (skill.name != call.skill) continue;
+            result.ok = true;
+            // The BODY, which is the whole point: the catalogue said one line, and
+            // this is the pages behind it, delivered only now that it is wanted.
+            result.output = skill.body.empty() ? "(that skill has no instructions)"
+                                               : skill.body;
+            return result;
+        }
+        result.output = "there is no skill called \"" + call.skill + "\"";
         return result;
     }
 
@@ -511,7 +553,7 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
 CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,
                        const CoderLimits& limits, const std::string& model,
-                       const std::filesystem::path& mailbox) {
+                       const std::filesystem::path& mailbox, const SkillSet& skills) {
     CoderOutcome outcome;
 
     if (!std::filesystem::is_directory(sandbox)) {
@@ -540,7 +582,8 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
         // Checked between turns, so a message lands at the next decision rather
         // than needing the coder to be interrupted mid-call.
         const std::string prompt =
-            coder_prompt(subtask, files, outcome.steps, limits, take_steer(mailbox));
+            coder_prompt(subtask, files, outcome.steps, limits, take_steer(mailbox),
+                         skills);
 
         const auto reply = ollama.generate(
             model.empty() ? config.ollama_model : model, prompt, options);
@@ -554,7 +597,7 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
 
         CoderStep current;
         current.call   = parse_tool_call(text);
-        current.result = run_tool(current.call, sandbox, limits);
+        current.result = run_tool(current.call, sandbox, limits, skills);
 
         if (current.call.tool == CoderTool::Finish) {
             outcome.finished = true;

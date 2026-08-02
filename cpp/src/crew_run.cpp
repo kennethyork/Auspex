@@ -11,6 +11,8 @@
 #include <nlohmann/json.hpp>
 
 #include "auspex/process.hpp"
+#include "auspex/code_index.hpp"
+#include "auspex/skills.hpp"
 #include "auspex/projects.hpp"
 
 using json = nlohmann::json;
@@ -571,9 +573,24 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     publish(/*active=*/true);
     note("plan: the Director is deciding what the pieces are");
 
+    // What the index thinks is relevant, when there is one. Silent when there is
+    // not: an unindexed project must still be plannable.
+    // Discovered once for the run, not per coder: the set does not change while a
+    // crew works, and re-walking two directories on every turn would be waste.
+    SkillSet skills;
+    skills.skills  = all_skills(options.project);
+    skills.catalog = skills_catalog(skills.skills);
+    if (!skills.empty()) {
+        note("research: " + std::to_string(skills.skills.size()) + " skill(s) available");
+    }
+
+    const std::string hint =
+        relevant_files_note(config, options.project, options.task);
+    if (!hint.empty()) note("research: the index suggests where to look");
+
     const Plan plan =
         plan_task(config, options.task, files, options.max_subtasks,
-                  options.model_for("director"));
+                  options.model_for("director"), hint);
     if (!plan.ok()) {
         result.error = plan.error;
         publish(/*active=*/false);
@@ -626,7 +643,8 @@ RunResult run_crew(const Config& config, const RunOptions& options,
 
             attempt.outcome = run_coder(config, attempt.subtask, sandbox,
                                         options.coder, options.model_for("coder"),
-                                        steer_mailbox(result.run_id, attempt.subtask.n));
+                                        steer_mailbox(result.run_id, attempt.subtask.n),
+                                        skills);
             attempt.changeset = capture_changeset(options.project, sandbox);
 
             // Audited on the worker thread. It is another model call, and doing it

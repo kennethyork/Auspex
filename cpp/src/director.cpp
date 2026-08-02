@@ -49,7 +49,7 @@ bool is_known_role(const std::string& role) {
 // ---------------------------------------------------------------------------
 std::string director_prompt(const std::string& task,
                             const std::vector<std::string>& files,
-                            int max_subtasks) {
+                            int max_subtasks, const std::string& hint) {
     if (max_subtasks < 1) max_subtasks = 1;
 
     std::ostringstream out;
@@ -87,6 +87,10 @@ std::string director_prompt(const std::string& task,
         }
         out << "\n";
     }
+
+    // Before the task, so it is read as context for it rather than as an
+    // afterthought. A filename list says what exists; this says what is relevant.
+    if (!hint.empty()) out << hint;
 
     out << "The task:\n" << task << "\n\n";
 
@@ -210,7 +214,7 @@ Plan parse_plan(const std::string& reply, int max_subtasks) {
 
 Plan plan_task(const Config& config, const std::string& task,
                const std::vector<std::string>& files, int max_subtasks,
-               const std::string& model) {
+               const std::string& model, const std::string& hint) {
     Plan plan;
 
     const std::string trimmed = trim(task);
@@ -228,7 +232,7 @@ Plan plan_task(const Config& config, const std::string& task,
     options.temperature = 0.2;        // planning is not where variety helps
 
     const auto reply = ollama.generate(model.empty() ? config.ollama_model : model,
-                                       director_prompt(trimmed, files, max_subtasks),
+                                       director_prompt(trimmed, files, max_subtasks, hint),
                                        options);
     if (!reply) {
         plan.error = "could not reach the model";

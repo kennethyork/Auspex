@@ -186,6 +186,30 @@ OracleStatus OllamaClient::verify_model(const StatusCallback& on_update) {
     return s;
 }
 
+std::vector<float> OllamaClient::embed(const std::string& model,
+                                       const std::string& text,
+                                       std::chrono::seconds timeout) {
+    if (model.empty() || text.empty()) return {};
+
+    json body;
+    body["model"]  = model;
+    body["prompt"] = text;
+
+    const auto reply = post_json("/api/embeddings", body.dump(), timeout);
+    if (!reply.ok) return {};
+
+    const auto document = json::parse(reply.body, nullptr, /*allow_exceptions=*/false);
+    if (document.is_discarded() || !document.is_object()) return {};
+    if (!document.contains("embedding") || !document["embedding"].is_array()) return {};
+
+    std::vector<float> vector;
+    vector.reserve(document["embedding"].size());
+    for (const auto& value : document["embedding"]) {
+        if (value.is_number()) vector.push_back(static_cast<float>(value.get<double>()));
+    }
+    return vector;
+}
+
 OracleStatus OllamaClient::check_status(const StatusCallback& on_update) {
     if (!version()) {
         // The Python original distinguished ConnectionError from Timeout to pick

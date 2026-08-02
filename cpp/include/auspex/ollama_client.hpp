@@ -93,6 +93,15 @@ public:
                                            const std::string& prompt,
                                            GenerateOptions opts = {});
 
+    // POST /api/embeddings. Empty on any failure.
+    //
+    // A separate call rather than a flag on generate(), because it is a different
+    // endpoint with a different response shape and a different model -- the
+    // embedding model is small, local and unrelated to whatever is answering
+    // questions.
+    std::vector<float> embed(const std::string& model, const std::string& text,
+                             std::chrono::seconds timeout = std::chrono::seconds(60));
+
     // Single-shot equivalent of the Python check_status(): probes the daemon,
     // then confirms the configured model actually answers.
     OracleStatus check_status(const StatusCallback& on_update = {});

@@ -32,12 +32,14 @@
 #include "auspex/desktop.hpp"
 #include "auspex/display.hpp"
 #include "auspex/desktop_entries.hpp"
+#include "auspex/code_index.hpp"
 #include "auspex/coder.hpp"
 #include "auspex/director.hpp"
 #include "auspex/panel_dock.hpp"
 #include "auspex/process.hpp"
 #include "auspex/projects.hpp"
 #include "auspex/sandbox.hpp"
+#include "auspex/skills.hpp"
 #include "auspex/session.hpp"
 #include "auspex/sysmon.hpp"
 #include "auspex/timekeeping.hpp"
@@ -5686,6 +5688,282 @@ void test_crew_run() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Semantic code index
+// ---------------------------------------------------------------------------
+void test_code_index() {
+    using namespace auspex;
+    std::cout << "\ncode index\n";
+
+    // ---- chunking ----
+    {
+        std::string text;
+        for (int i = 1; i <= 100; ++i) text += "line " + std::to_string(i) + "\n";
+
+        IndexOptions options;
+        options.lines_per_chunk = 20;
+        options.overlap_lines   = 5;
+
+        const auto chunks = chunk_text("a.py", text, options);
+        check(!chunks.empty(), "a file chunks");
+        check_eq(chunks.front().start, 1, "line numbers are 1-based, as an editor counts");
+        check_eq(chunks.front().end, 20, "and inclusive");
+        check(chunks.back().end <= 100, "and never run past the file");
+
+        // The overlap is not waste: a function whose signature ends one chunk and
+        // whose body starts the next matches neither well without it.
+        if (chunks.size() >= 2) {
+            check(chunks[1].start < chunks[0].end,
+                  "consecutive chunks overlap");
+            check(chunks[1].start > chunks[0].start, "but still move forward");
+        }
+        check(chunks.front().text.find("line 1\n") != std::string::npos,
+              "the text is carried");
+
+        // An overlap as large as the window would never advance. Clamped rather
+        // than trusted, because a config that hangs the indexer is worse than one
+        // that indexes slightly differently.
+        IndexOptions silly;
+        silly.lines_per_chunk = 10;
+        silly.overlap_lines   = 10;
+        const auto safe = chunk_text("a.py", text, silly);
+        check(!safe.empty(), "an overlap equal to the window still terminates");
+        check(safe.size() < 200u, "without looping forever");
+
+        // Whitespace-only windows are dropped: they embed to something, and that
+        // something competes with real answers.
+        check(chunk_text("b.py", "\n\n\n\n\n", options).empty(),
+              "a blank file yields no chunks");
+        check(chunk_text("", "x", options).empty(), "and a nameless one none");
+        check(chunk_text("a.py", "", options).empty(), "and an empty one none");
+    }
+
+    // ---- cosine ----
+    {
+        check(std::abs(cosine({1, 0, 0}, {1, 0, 0}) - 1.0) < 1e-9, "identical is 1");
+        check(std::abs(cosine({1, 0, 0}, {0, 1, 0})) < 1e-9, "orthogonal is 0");
+        check(cosine({1, 0}, {-1, 0}) < -0.9, "opposite is negative");
+        // Magnitude must not matter, or a long chunk beats a relevant one.
+        check(std::abs(cosine({2, 0}, {8, 0}) - 1.0) < 1e-9, "length does not matter");
+        // Zero rather than NaN, so an unembedded chunk sinks instead of tying with
+        // everything at once.
+        check_eq(cosine({0, 0}, {1, 1}), 0.0, "an all-zero vector scores zero");
+        check_eq(cosine({}, {1.0f}), 0.0, "and an empty one too");
+    }
+
+    // ---- ranking ----
+    {
+        std::vector<CodeChunk> chunks{
+            {"far.py",  1, 10, "far",  {0, 1}},
+            {"near.py", 1, 10, "near", {1, 0}},
+            {"mid.py",  1, 10, "mid",  {1, 1}},
+        };
+        const auto hits = rank(chunks, {1, 0}, 3);
+        check_eq(hits.size(), std::size_t{3}, "everything is ranked");
+        if (hits.size() == 3) {
+            check_eq(hits[0].file, std::string("near.py"), "closest first");
+            check_eq(hits[2].file, std::string("far.py"),  "furthest last");
+        }
+        check_eq(rank(chunks, {1, 0}, 1).size(), std::size_t{1}, "the limit holds");
+        check(rank(chunks, {}, 3).empty(), "an unembedded query ranks nothing");
+        check(rank(chunks, {1, 0}, 0).empty(), "and a limit of zero returns nothing");
+
+        // Ties keep their order. A search that reorders its own ties between runs
+        // looks broken even when it is not.
+        std::vector<CodeChunk> tied{
+            {"a.py", 1, 2, "a", {1, 0}},
+            {"b.py", 1, 2, "b", {1, 0}},
+        };
+        const auto stable = rank(tied, {1, 0}, 2);
+        if (stable.size() == 2) {
+            check_eq(stable[0].file, std::string("a.py"), "ties keep index order");
+        }
+    }
+
+    // ---- the file format ----
+    {
+        const std::vector<CodeChunk> chunks{
+            {"src/a.py", 1, 20, "def f():\n    pass\n", {0.5f, -0.25f, 0.125f}},
+            {"src/b.py", 5, 25, "class B:\n", {1.0f, 0.0f, -1.0f}},
+        };
+        const auto back = decode_index(encode_index(chunks, "nomic-embed-text"));
+        check_eq(back.size(), chunks.size(), "an index round-trips");
+        if (back.size() == 2) {
+            check_eq(back[0].file, chunks[0].file, "paths survive");
+            check_eq(back[0].start, chunks[0].start, "line numbers survive");
+            check_eq(back[0].text, chunks[0].text, "text survives");
+            check_eq(back[0].vector.size(), chunks[0].vector.size(), "vectors survive");
+            check(std::abs(back[0].vector[1] - (-0.25f)) < 1e-6,
+                  "including negative components");
+        }
+
+        check(decode_index("").empty(), "nothing decodes to nothing");
+        check(decode_index("not json").empty(), "and neither does garbage");
+        check(decode_index(R"({"chunks":[]})").empty(), "an empty index is empty");
+        // A chunk with no file cannot be reported as a hit, so it is dropped.
+        check(decode_index(R"({"chunks":[{"start":1}]})").empty(),
+              "a chunk with no file is dropped");
+    }
+
+    // The index lives where a coder can never reach it: .auspex is in the sandbox
+    // excludes, so it is not copied in, not captured out, and not landable.
+    {
+        const auto path = index_path("/tmp/p");
+        check(path.string().find(".auspex") != std::string::npos,
+              "the index lives under .auspex");
+        check(is_excluded(".auspex"),
+              "which is excluded, so a coder never sees or lands it");
+        check(index_path("").empty(), "and needs a project");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+void test_skills() {
+    using namespace auspex;
+    std::cout << "\nskills\n";
+
+    // ---- parsing ----
+    {
+        const Skill full = parse_skill(
+            "---\n"
+            "name: Release Checklist\n"
+            "description: \"how this project ships\"\n"
+            "---\n"
+            "\n"
+            "# Releasing\n"
+            "Bump the version first.\n",
+            "release");
+        check_eq(full.name, std::string("release-checklist"),
+                 "the frontmatter name wins, slugified");
+        check_eq(full.description, std::string("how this project ships"),
+                 "and the description, unquoted");
+        check(full.body.rfind("# Releasing", 0) == 0,
+              "the body starts after the frontmatter, with no leading blank");
+        check(full.body.find("Bump the version") != std::string::npos, "and is complete");
+        check(full.body.find("description:") == std::string::npos,
+              "the frontmatter is not in the body");
+
+        // A file with no frontmatter is still a skill. Somebody who did not read
+        // the format has still written something useful.
+        const Skill bare = parse_skill("# House style\nTabs, not spaces.\n", "style");
+        check_eq(bare.name, std::string("style"), "the folder names an unmarked skill");
+        check_eq(bare.description, std::string("House style"),
+                 "and its first line describes it, minus the heading marks");
+        check(bare.body.find("Tabs, not spaces") != std::string::npos, "body intact");
+
+        // A "---" further down is a horizontal rule, not a fence. Treating it as
+        // one would swallow the first half of the instructions.
+        const Skill ruled = parse_skill("# Title\n\nsome text\n\n---\n\nmore text\n",
+                                        "ruled");
+        check(ruled.body.find("some text") != std::string::npos,
+              "a rule mid-file does not eat the body");
+        check(ruled.body.find("more text") != std::string::npos, "any of it");
+
+        // Slugs, so a coder can quote a catalogue line back unambiguously.
+        check_eq(parse_skill("", "My Skill!").name, std::string("my-skill"),
+                 "names are slugified");
+        check_eq(parse_skill("", "  spaced  out  ").name, std::string("spaced-out"),
+                 "with runs collapsed and edges trimmed");
+    }
+
+    // ---- the catalogue ----
+    {
+        const std::vector<Skill> skills{
+            {"alpha", "does alpha things", "body a", {}},
+            {"beta",  "does beta things",  "body b", {}},
+        };
+        const std::string catalog = skills_catalog(skills);
+        check(catalog.find("alpha") != std::string::npos, "both are listed");
+        check(catalog.find("beta") != std::string::npos, "by name");
+        check(catalog.find("does alpha things") != std::string::npos, "with descriptions");
+        // The BODIES must not be in the catalogue. That is the entire point:
+        // every prompt carries the lines, and only an asked-for skill costs pages.
+        check(catalog.find("body a") == std::string::npos,
+              "but NOT the bodies -- that is what progressive disclosure means");
+
+        check(skills_catalog({}).empty(),
+              "no skills means nothing is added to the prompt at all");
+    }
+
+    // ---- discovery, on a real tree ----
+    {
+        const auto root = std::filesystem::temp_directory_path() / "auspex-selftest-skills";
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+
+        const auto project = root / "project";
+        const auto put = [](const std::filesystem::path& p, const std::string& text) {
+            std::error_code e;
+            std::filesystem::create_directories(p.parent_path(), e);
+            std::ofstream(p) << text;
+        };
+
+        put(project / ".auspex" / "skills" / "housestyle" / "SKILL.md",
+            "---\nname: house-style\ndescription: from the project\n---\nProject rules.\n");
+        // A folder with no SKILL.md is not a skill.
+        std::filesystem::create_directories(project / ".auspex" / "skills" / "empty", ec);
+
+        const auto found = all_skills(project);
+        check_eq(found.size(), std::size_t{1}, "a project skill is found");
+        if (!found.empty()) {
+            check_eq(found[0].name, std::string("house-style"), "by its frontmatter name");
+            check(found[0].body.find("Project rules") != std::string::npos, "with its body");
+        }
+
+        const auto one = find_skill(project, "house-style");
+        check(one.has_value(), "and can be looked up");
+        // Case-insensitively: the coder is quoting a catalogue line back and its
+        // case is not the point.
+        check(find_skill(project, "HOUSE-STYLE").has_value(), "case-insensitively");
+        check(!find_skill(project, "nope").has_value(), "an unknown name finds nothing");
+        check(!find_skill(project, "").has_value(), "and so does no name");
+
+        // Skills live under .auspex, which a coder can never reach or land.
+        check(is_excluded(".auspex"),
+              "skills live where a coder cannot rewrite them");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- the verb ----
+    {
+        SkillSet set;
+        set.skills  = {{"deploy", "how to ship", "Step one: run the tests.\n", {}}};
+        set.catalog = skills_catalog(set.skills);
+
+        PlannedSubtask subtask{1, "coder", "ship it", ""};
+        const std::string without = coder_prompt(subtask, {}, {}, {}, "", {});
+        const std::string with    = coder_prompt(subtask, {}, {}, {}, "", set);
+
+        check(without.find("skill") == std::string::npos,
+              "no skills, no skill verb offered");
+        check(with.find("\"tool\":\"skill\"") != std::string::npos,
+              "with skills, the verb is offered");
+        check(with.find("deploy — how to ship") != std::string::npos,
+              "and the catalogue line appears");
+        check(with.find("Step one") == std::string::npos,
+              "but the body does not -- it costs nothing until asked for");
+
+        ToolCall call;
+        call.tool  = CoderTool::Skill;
+        call.skill = "deploy";
+        const ToolResult opened = run_tool(call, "/tmp", {}, set);
+        check(opened.ok, "opening a skill works");
+        check(opened.output.find("Step one") != std::string::npos,
+              "and THEN the body arrives");
+
+        call.skill = "nope";
+        check(!run_tool(call, "/tmp", {}, set).ok, "an unknown skill is refused");
+
+        check(tool_from_name("skill") == CoderTool::Skill, "the verb parses");
+        check(tool_from_name("use_skill") == CoderTool::Skill, "and its synonyms");
+        const ToolCall nameless = parse_tool_call(R"({"tool":"skill"})");
+        check(nameless.tool == CoderTool::Unknown, "a skill with no name is refused");
+    }
+}
+
 int main(int argc, char** argv) {
     const std::vector<std::string> args(argv + 1, argv + argc);
 
@@ -5767,11 +6045,19 @@ int main(int argc, char** argv) {
         auspex::PlannedSubtask subtask{1, "coder", task, {}};
         auspex::CoderLimits limits;
         limits.allow_run = args.size() >= 4 && args[3] == "run";
+
+        auspex::SkillSet skills;
+        skills.skills  = auspex::all_skills(project);
+        skills.catalog = auspex::skills_catalog(skills.skills);
+        if (!skills.empty()) {
+            std::cout << skills.skills.size() << " skill(s) offered\n";
+        }
         std::cout << "sandbox " << sandbox.string() << "\n"
                   << "asking " << auspex::Config::load().ollama_model << "…\n\n";
 
         const auspex::CoderOutcome outcome =
-            auspex::run_coder(auspex::Config::load(), subtask, sandbox, limits);
+            auspex::run_coder(auspex::Config::load(), subtask, sandbox, limits, {},
+                              {}, skills);
 
         for (std::size_t i = 0; i < outcome.steps.size(); ++i) {
             const auto& step = outcome.steps[i];
@@ -5924,6 +6210,30 @@ int main(int argc, char** argv) {
         return result.error.empty() ? 0 : 1;
     }
 
+    if (args.size() >= 2 && args[0] == "--index") {
+        const std::filesystem::path project = args[1];
+        const auto report = auspex::build_index(
+            auspex::Config::load(), project,
+            [](int done, int total) {
+                if (done % 25 == 0 || done == total) {
+                    std::cout << "\r  embedding " << done << "/" << total << std::flush;
+                }
+            });
+        std::cout << "\n";
+        if (!report.ok()) { std::cout << report.error << "\n"; return 1; }
+        std::cout << report.files << " files, " << report.chunks << " chunks\n";
+        return 0;
+    }
+    if (args.size() >= 3 && args[0] == "--search") {
+        const auto found = auspex::search_index(auspex::Config::load(), args[1], args[2]);
+        if (!found.ok()) { std::cout << found.error << "\n"; return 1; }
+        for (const auto& hit : found.hits) {
+            std::cout << "  " << hit.file << ":" << hit.start << "-" << hit.end
+                      << "   " << hit.score << "\n";
+        }
+        return 0;
+    }
+
     if (args.size() >= 2 && args[0] == "--css") {
         std::cout << auspex::generate_css(auspex::theme_by_name(args[1]));
         return 0;
@@ -5964,6 +6274,8 @@ int main(int argc, char** argv) {
     test_coder();
     test_auditor();
     test_crew_run();
+    test_code_index();
+    test_skills();
     test_sysmon();
 
     std::cout << "\n" << (checks - failures) << "/" << checks << " checks passed\n";

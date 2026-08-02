@@ -243,6 +243,8 @@ add_library(auspex-core STATIC
     src/coder.cpp
     src/auditor.cpp
     src/crew_run.cpp
+    src/code_index.cpp
+    src/skills.cpp
     src/vad.cpp
     src/voice_gate.cpp
     src/desktop_entries.cpp
