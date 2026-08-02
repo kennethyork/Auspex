@@ -116,6 +116,11 @@ struct RunOptions {
     // On by default, unlike the other options, because it is the one that makes
     // the rest of the run better rather than more thorough -- a Director planning
     // against a filename list is guessing at structure.
+    // Pick a model per SUBTASK by how hard it looks, filling in only where a role
+    // model was not chosen. Off by default: it changes which model runs work, and
+    // that should be asked for.
+    bool        route = false;
+
     bool        research = true;
     std::string researcher_backend = "ollama";
     std::string researcher_model;

@@ -41,6 +41,7 @@
 #include "auspex/panel_dock.hpp"
 #include "auspex/process.hpp"
 #include "auspex/projects.hpp"
+#include "auspex/router.hpp"
 #include "auspex/sandbox.hpp"
 #include "auspex/skills.hpp"
 #include "auspex/session.hpp"
@@ -5773,6 +5774,74 @@ void test_crew_run() {
               "and no writing verb is offered");
 
         std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- the Router ----
+    //
+    // Ordering is the whole design here. "design a cache" is short, so a length
+    // test running before the word test would call it simple -- which is the one
+    // mistake that actually costs something.
+    {
+        const auto tier = [](const std::string& text) {
+            return classify_difficulty(text).tier;
+        };
+
+        check_eq(tier("design a cache layer"), std::string("hard"), "design is hard");
+        check_eq(tier("refactor the parser"), std::string("hard"), "so is refactor");
+        check_eq(tier("fix the race condition"), std::string("hard"), "and concurrency");
+        check_eq(tier("audit for security holes"), std::string("hard"), "and security");
+
+        // Short AND lookup-shaped.
+        check_eq(tier("rename a variable"), std::string("simple"), "a rename is simple");
+        check_eq(tier("what is the capital of France"), std::string("simple"),
+                 "and a lookup");
+        check_eq(tier("add a test"), std::string("simple"), "and something very short");
+
+        check_eq(tier("add rate limiting to the api"), std::string("moderate"),
+                 "ordinary work is moderate");
+
+        // The length gate MUST come after the word test. "design a cache" is 20
+        // characters; if brevity were checked first it would route to the smallest
+        // model available.
+        check_eq(tier("design a cache"), std::string("hard"),
+                 "a SHORT hard task is still hard -- words beat brevity");
+
+        // Code is hard whatever the words say.
+        check_eq(tier("```\nx = 1\n```"), std::string("hard"), "a fenced block is hard");
+        // An INTERNAL indent, not a leading one: the text is trimmed before this
+        // runs, so a single line whose only whitespace is at the front is not code
+        // and is not treated as such. A block with indented lines inside it is.
+        check_eq(tier("def f():\n    return 1"), std::string("hard"),
+                 "and an indented block");
+        check_eq(tier("   rename it"), std::string("simple"),
+                 "while a merely indented one-liner is judged on its words");
+
+        // A very long ask is hard even with no trigger word in it.
+        check_eq(tier(std::string(500, 'a')), std::string("hard"), "and a long request");
+
+        check_eq(tier(""), std::string("moderate"), "nothing is moderate, not simple");
+        check(!classify_difficulty("rename it").reason.empty(),
+              "and every answer says why, so it can be argued with");
+
+        // Roles that do not depend on a subtask get a fixed tier.
+        check_eq(tier_for_role("director"), std::string("hard"),
+                 "the Director reasons over a codebase");
+        check_eq(tier_for_role("auditor"), std::string("hard"), "and reviewing is judgement");
+        check_eq(tier_for_role("researcher"), std::string("moderate"),
+                 "reading and summarising is moderate");
+
+        // PRECEDENCE. An explicit choice wins outright: the router fills gaps, it
+        // does not overrule a person. A setting that silently does nothing is the
+        // bug this project has already shipped once.
+        Config config;
+        config.crew_role_models["tier_hard"] = "big";
+        check_eq(route_model(config, "", "hard"), std::string("big"),
+                 "an unset role takes the tier's model");
+        check_eq(route_model(config, "chosen-by-hand", "hard"),
+                 std::string("chosen-by-hand"),
+                 "but an explicit choice is never overruled");
+        check(route_model(config, "", "simple").empty(),
+              "and an unset tier leaves the decision alone");
     }
 
     // ---- a model per role, with fallbacks ----

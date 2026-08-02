@@ -31,6 +31,7 @@
 #include "auspex/gtk/voice.hpp"
 #include "auspex/ollama_client.hpp"
 #include "auspex/process.hpp"
+#include "auspex/router.hpp"
 #include "auspex/theme.hpp"
 #include "auspex/tts.hpp"
 
@@ -649,9 +650,9 @@ CrewWindow::CrewWindow() {
     // Per-role models are a setting rather than a switch now: crew_director_model,
     // crew_coder_model and crew_auditor_model in config.json. The measured
     // difference is large enough that it belongs in config, not behind a tickbox.
-    route_.set_sensitive(false);
     route_.set_tooltip_text(
-        "Set crew_auditor_model / crew_coder_model in config.json instead");
+        "Pick each coder's model by how hard its piece looks, filling in only where "
+        "a role was left on Default. Set the tiers in the Brain window.");
     debate_.set_tooltip_text(
         "An advocate, a skeptic and a judge argue over every changeset. Three model "
         "calls per piece instead of one.");
@@ -928,6 +929,7 @@ void CrewWindow::start() {
         }
     }
 
+    options.route    = route_.get_active();
     options.debate   = debate_.get_active();
     options.learn    = learn_.get_active();
     options.security = security_.get_active();
@@ -1598,6 +1600,48 @@ BrainWindow::BrainWindow() {
         ++row;
     }
 
+    // ---- the tiers ----
+    tiers_heading_.set_markup(
+        "<b>Router</b> — a model per difficulty, used only where a role above is "
+        "left on Default");
+    tiers_heading_.set_xalign(0.0f);
+    tiers_heading_.set_wrap(true);
+    tiers_.set_row_spacing(6);
+    tiers_.set_column_spacing(12);
+
+    static const std::vector<std::pair<const char*, const char*>> kTiers{
+        {"simple",   "Simple — trivia, renames"},
+        {"moderate", "Moderate — ordinary work"},
+        {"hard",     "Hard — design, debugging"},
+    };
+
+    int tier_row = 0;
+    for (const auto& [tier, caption] : kTiers) {
+        auto entry = std::make_unique<TierRow>();
+        entry->tier = tier;
+        entry->label.set_text(caption);
+        entry->label.set_xalign(0.0f);
+        entry->models.set_hexpand(true);
+        entry->models.property_selected().signal_changed().connect([this] {
+            if (loading_) return;
+            save_models();
+        });
+        tiers_.attach(entry->label, 0, tier_row);
+        tiers_.attach(entry->models, 1, tier_row);
+        tier_rows_.push_back(std::move(entry));
+        ++tier_row;
+    }
+
+    probe_entry_.set_placeholder_text(
+        "Try it — e.g. \"rename a variable\" or \"design a cache layer\"…");
+    probe_entry_.set_hexpand(true);
+    probe_entry_.signal_activate().connect([this] { probe(); });
+    probe_go_.signal_clicked().connect([this] { probe(); });
+    probe_row_.append(probe_entry_);
+    probe_row_.append(probe_go_);
+    probe_result_.set_xalign(0.0f);
+    probe_result_.set_wrap(true);
+
     // ---- the pipeline ----
     map_heading_.set_text("The pipeline");
     map_heading_.set_xalign(0.0f);
@@ -1617,6 +1661,10 @@ BrainWindow::BrainWindow() {
     root_.set_margin(14);
     root_.append(heading_);
     root_.append(roles_);
+    root_.append(tiers_heading_);
+    root_.append(tiers_);
+    root_.append(probe_row_);
+    root_.append(probe_result_);
     root_.append(map_heading_);
     root_.append(map_scroller_);
     root_.append(tokens_);
@@ -1703,6 +1751,26 @@ void BrainWindow::reload() {
         }
         entry->models.set_selected(selected);
     }
+    for (auto& entry : tier_rows_) {
+        std::vector<Glib::ustring> labels;
+        labels.emplace_back("Not set");
+        for (const auto& model : models_) labels.emplace_back(model);
+        entry->models.set_model(Gtk::StringList::create(labels));
+
+        const auto found = config.crew_role_models.find("tier_" + entry->tier);
+        const std::string current =
+            found == config.crew_role_models.end() ? std::string{} : found->second;
+
+        guint selected = 0;
+        for (std::size_t i = 0; i < models_.size(); ++i) {
+            if (models_[i] == current) {
+                selected = static_cast<guint>(i) + 1;
+                break;
+            }
+        }
+        entry->models.set_selected(selected);
+    }
+
     loading_ = false;
 
     if (models_.empty()) status_.set_text("No models listed — is Ollama running?");
@@ -1741,6 +1809,15 @@ void BrainWindow::save_models() {
         // loop -- one spelling of the default rather than two.
         document["crew_" + entry->key + "_backend"] =
             backend == "ollama" ? std::string{} : backend;
+    }
+
+    for (const auto& entry : tier_rows_) {
+        const auto index = entry->models.get_selected();
+        const std::string value =
+            (index == GTK_INVALID_LIST_POSITION || index == 0 || index > models_.size())
+                ? std::string{}
+                : models_[index - 1];
+        document["crew_tier_" + entry->tier + "_model"] = value;
     }
 
     std::error_code ec;
@@ -1832,6 +1909,29 @@ void BrainWindow::refresh_map() {
 
     (void)config;
     show_usage();
+}
+
+void BrainWindow::probe() {
+    const std::string text = trim(std::string(probe_entry_.get_text()));
+    if (text.empty()) {
+        probe_result_.set_text({});
+        return;
+    }
+
+    // No model call. Classifying is word lists and lengths, so the answer is
+    // instant and free -- asking a model how hard something is would spend a call
+    // to decide how to spend a call.
+    const Difficulty how = classify_difficulty(text);
+    const Config config = Config::load();
+
+    const std::string model = tier_model(config, how.tier);
+    probe_result_.set_markup(
+        "<b>" + Glib::Markup::escape_text(how.tier) + "</b>  →  " +
+        Glib::Markup::escape_text(model.empty()
+                                      ? "(no model set for that tier — the role's "
+                                        "own choice is used)"
+                                      : model) +
+        "\n<span alpha='70%'>" + Glib::Markup::escape_text(how.reason) + "</span>");
 }
 
 void BrainWindow::show_usage() {

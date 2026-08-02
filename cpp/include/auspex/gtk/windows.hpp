@@ -442,6 +442,23 @@ private:
     std::vector<std::string> backends_;
     bool loading_ = false;
 
+    // The tiers the Router fills gaps from, and a probe that answers "where would
+    // this go?" without running anything.
+    Gtk::Label  tiers_heading_;
+    Gtk::Grid   tiers_;
+    struct TierRow {
+        Gtk::Label    label;
+        Gtk::DropDown models;
+        std::string   tier;
+    };
+    std::vector<std::unique_ptr<TierRow>> tier_rows_;
+
+    Gtk::Box    probe_row_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Entry  probe_entry_;
+    Gtk::Button probe_go_{"Route it"};
+    Gtk::Label  probe_result_;
+    void probe();
+
     // The pipeline, with the live stage marked.
     Gtk::Label          map_heading_;
     Gtk::ScrolledWindow map_scroller_;

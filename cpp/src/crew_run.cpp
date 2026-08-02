@@ -18,6 +18,7 @@
 #include "auspex/ollama_client.hpp"
 #include "auspex/skills.hpp"
 #include "auspex/projects.hpp"
+#include "auspex/router.hpp"
 
 using json = nlohmann::json;
 
@@ -618,6 +619,8 @@ const std::vector<Faculty>& crew_faculties() {
         {"researcher", "Researcher",
          "reads the project read-only and reports what a team needs to know",
          FacultyState::Always},
+        {"router", "Router", "picks a model per piece by how hard it looks",
+         FacultyState::Optional},
         {"director", "Director", "decomposes the task into independent pieces",
          FacultyState::Always},
         {"roles", "Roles", "assigns a persona to each piece", FacultyState::Always},
@@ -1199,8 +1202,17 @@ RunResult run_crew(const Config& config, const RunOptions& options,
                                                 backend, options.model_for("coder"),
                                                 /*timeout_seconds=*/900, lessons);
             } else {
+                // The coder's model, refined by how hard THIS piece looks. A plan
+                // with a rename and a redesign in it should not run both on the
+                // same model, and no per-role setting can say that.
+                std::string coder_model = options.model_for("coder");
+                if (options.route) {
+                    const Difficulty how = classify_difficulty(
+                        attempt.subtask.title + " " + attempt.subtask.detail);
+                    coder_model = route_model(config, coder_model, how.tier);
+                }
                 attempt.outcome = run_coder(config, attempt.subtask, sandbox,
-                                            options.coder, options.model_for("coder"),
+                                            options.coder, coder_model,
                                             steer_mailbox(result.run_id,
                                                           attempt.subtask.n),
                                             skills, mcp);
