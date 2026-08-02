@@ -47,6 +47,7 @@
 #include "auspex/usage.hpp"
 #include "auspex/symbols.hpp"
 #include "auspex/verify.hpp"
+#include "auspex/gitflow.hpp"
 #include "auspex/watch.hpp"
 #include "auspex/websearch.hpp"
 #include "auspex/panel_dock.hpp"
@@ -7125,6 +7126,100 @@ void test_starter_skills() {
 }
 
 // ---------------------------------------------------------------------------
+// Committing what landed
+//
+// A run leaves changes in your tree and nothing says which run made them. This
+// commits exactly what landed -- and the failure it is written to avoid is
+// sweeping up work you had in progress alongside.
+// ---------------------------------------------------------------------------
+void test_gitflow() {
+    using namespace auspex;
+    std::cout << "\ncommitting what landed\n";
+
+    std::error_code ec;
+    const std::filesystem::path root = "/tmp/auspex-git";
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    if (!in_path("git")) {
+        std::cout << "  (git is not installed; skipping)\n";
+        return;
+    }
+
+    run({"git", "init", "-q"}, true, root.string());
+    run({"git", "config", "user.email", "test@example.com"}, true, root.string());
+    run({"git", "config", "user.name", "test"}, true, root.string());
+    { std::ofstream out(root / "a.py"); out << "a = 1\n"; }
+    run({"git", "add", "-A"}, true, root.string());
+    run({"git", "commit", "-q", "-m", "init"}, true, root.string());
+
+    // ---- what it can see ----
+    {
+        check(is_git_repo(root), "a repository is recognised");
+        check(!is_git_repo("/tmp"), "and a plain directory is not");
+        check(!git_branch(root).empty(), "the branch is reported before anything is done");
+    }
+
+    // ---- the message ----
+    {
+        const std::string message =
+            commit_message("add a retry helper", "crew_123", {"http.py", "test_http.py"});
+        check(message.find("add a retry helper") != std::string::npos,
+              "the subject is what was asked for");
+        check(message.find("crew_123") != std::string::npos,
+              "and the run id is in it -- in six months that is the only thread "
+              "back to the board entry explaining why the code is there");
+        check(message.find("http.py") != std::string::npos, "with the files listed");
+
+        const std::string long_task(200, 'x');
+        const std::string trimmed = commit_message(long_task, "r", {});
+        check(trimmed.substr(0, trimmed.find('\n')).size() < 80,
+              "a very long task is cut to a readable subject");
+    }
+
+    // ---- ONLY what landed ----
+    //
+    // The failure this exists to avoid. Your half-finished work must not end up
+    // inside the crew's commit.
+    {
+        { std::ofstream out(root / "landed.py"); out << "landed = 1\n"; }
+        { std::ofstream out(root / "mine.py"); out << "still working on this\n"; }
+
+        const CommitResult committed =
+            commit_paths(root, {"landed.py"}, "the crew's change");
+        check(committed.ok, "the crew's file commits");
+        check(!committed.commit.empty(), "and reports its hash");
+
+        const auto dirty = git_dirty_paths(root);
+        check(std::find(dirty.begin(), dirty.end(), "mine.py") != dirty.end(),
+              "and YOUR file is still uncommitted -- never `git add -A`");
+        check(std::find(dirty.begin(), dirty.end(), "landed.py") == dirty.end(),
+              "while the crew's is not");
+    }
+
+    // ---- refusals ----
+    {
+        check(!commit_paths(root, {}, "message").ok, "nothing to commit is refused");
+        check(!commit_paths(root, {"a.py"}, "").ok, "and a commit with no message");
+        check(!commit_paths("/tmp", {"a.py"}, "message").ok,
+              "and a directory that is not a repository");
+
+        const auto escaping =
+            commit_paths(root, {"../../etc/passwd"}, "message");
+        check(!escaping.ok, "a path outside the repository is refused");
+        check(escaping.error.find("outside") != std::string::npos, "and says so");
+
+        // Already committed is not an error worth pretending about.
+        const auto again = commit_paths(root, {"landed.py"}, "again");
+        check(!again.ok, "committing an unchanged file is refused");
+        check(again.error.find("already") != std::string::npos,
+              "with a reason that is not a git error message");
+    }
+
+    std::filesystem::remove_all(root, ec);
+}
+
+// ---------------------------------------------------------------------------
 // Watch
 //
 // The one part of Auspex that starts work without being asked, so the guards
@@ -9801,6 +9896,7 @@ int main(int argc, char** argv) {
         if (args.size() >= 6 && args[5] == "debate")   options.debate = true;
         if (args.size() >= 6 && args[5] == "security") options.security = true;
         if (args.size() >= 6 && args[5] == "learn")    options.learn = true;
+        if (args.size() >= 6 && args[5] == "commit")   options.commit = true;
         // Anything else in that slot naming a backend hands the coding to it.
         if (args.size() >= 6 && auspex::is_cli_backend(args[5])) {
             options.coder_backend = args[5];
@@ -9949,6 +10045,7 @@ int main(int argc, char** argv) {
     test_mcp();
     test_roles();
     test_starter_skills();
+    test_gitflow();
     test_watch();
     test_websearch();
     test_context_tuner();

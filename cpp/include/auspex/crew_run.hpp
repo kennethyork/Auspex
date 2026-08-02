@@ -142,6 +142,13 @@ struct RunOptions {
     // both on together.
     int verify_attempts = 0;
 
+    // Commit what the run lands, with a message naming the run and the task.
+    //
+    // OFF, and it must stay off by default: committing is a change to your
+    // repository that you did not type. Only the paths this run actually landed
+    // are staged, so work you had in progress alongside is not swept in.
+    bool        commit = false;
+
     // Write the shipped starter skills that match this task into the project.
     //
     // ON by default, unlike most things here, because the failure mode is mild

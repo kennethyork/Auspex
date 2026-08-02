@@ -237,6 +237,7 @@ add_library(auspex-core STATIC
     src/context_tuner.cpp
     src/websearch.cpp
     src/watch.cpp
+    src/gitflow.cpp
     src/agents.cpp
     src/commands.cpp
     src/crew.cpp

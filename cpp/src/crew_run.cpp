@@ -21,6 +21,7 @@
 #include "auspex/roles.hpp"
 #include "auspex/router.hpp"
 #include "auspex/symbols.hpp"
+#include "auspex/gitflow.hpp"
 #include "auspex/verify.hpp"
 #include "auspex/json_util.hpp"
 
@@ -1769,6 +1770,23 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
     }
 
     publish(/*active=*/false);
+
+    // A record of what this run did, if asked for. AFTER landing, so nothing the
+    // Auditor held is ever committed -- and only the paths that actually landed,
+    // never `git add -A`, so work you had in progress alongside is not swept in.
+    if (options.commit && result.applied > 0 && !landed.files.empty()) {
+        std::vector<std::string> paths;
+        paths.reserve(landed.files.size());
+        for (const auto& file : landed.files) paths.push_back(file.path);
+
+        const CommitResult committed = commit_paths(
+            options.project, paths,
+            commit_message(options.task, result.run_id, paths));
+        note(committed.ok
+                 ? "commit: " + committed.commit + " (" +
+                       std::to_string(committed.staged) + " file(s))"
+                 : "commit: " + committed.error);
+    }
 
     note("done: " + std::to_string(result.applied) + " applied · " +
          std::to_string(result.held) + " held");
