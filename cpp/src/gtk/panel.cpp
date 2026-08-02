@@ -7,9 +7,14 @@
 #include <fstream>
 #include <sstream>
 
+#include <giomm/file.h>
 #include <glibmm/main.h>
 
 #include <glibmm/markup.h>
+
+#include <gtkmm/eventcontrollermotion.h>
+#include <gtkmm/filedialog.h>
+#include <gtkmm/stringlist.h>
 
 #include "auspex/crew.hpp"
 #include "auspex/display.hpp"
@@ -715,6 +720,416 @@ void NotificationButton::rebuild() {
 }
 
 // ---------------------------------------------------------------------------
+// TerminalButton
+// ---------------------------------------------------------------------------
+TerminalButton::TerminalButton(const Config& config) : config_(config) {
+    icon_.set_from_icon_name("utilities-terminal-symbolic");
+    set_child(icon_);
+    set_tooltip_text("Open a terminal — hover to pick a folder and an agent");
+
+    // The old behaviour, unchanged. Somebody who just wants a terminal should not
+    // have to wait out a hover delay or read a menu to get one.
+    signal_clicked().connect([this] { launch_plain(); });
+
+    // ---- the folder ----
+    folder_label_.set_text("Folder");
+    folder_label_.set_xalign(0.0f);
+    folder_label_.add_css_class("subtitle");
+
+    folder_path_.set_xalign(0.0f);
+    folder_path_.add_css_class("subtitle");
+    folder_path_.set_ellipsize(Pango::EllipsizeMode::START);
+    folder_path_.set_max_width_chars(34);
+
+    folders_.property_selected().signal_changed().connect([this] {
+        const auto path = chosen();
+        folder_path_.set_text(path.string());
+        status_.set_text({});
+    });
+
+    browse_.signal_clicked().connect([this] { browse(); });
+
+    popover_box_.set_margin(10);
+    popover_box_.append(folder_label_);
+    popover_box_.append(folders_);
+    popover_box_.append(folder_path_);
+    popover_box_.append(browse_);
+    popover_box_.append(rule_);
+    popover_box_.append(agent_box_);
+
+    status_.set_xalign(0.0f);
+    status_.add_css_class("subtitle");
+    status_.set_wrap(true);
+    status_.set_max_width_chars(34);
+    popover_box_.append(status_);
+
+    popover_.set_child(popover_box_);
+    popover_.set_parent(*this);
+    popover_.set_position(Gtk::PositionType::TOP);   // a bottom-panel button
+
+    // Autohide, and it has to be.
+    //
+    // A GTK4 popover is only its OWN window when it autohides. Without that it is
+    // drawn inside its parent's surface -- and this parent is a dock 42 pixels
+    // tall, so a menu six hundred pixels high is clipped to nothing and the button
+    // looks broken. Turning autohide off to avoid the grab made the popover stop
+    // appearing at all.
+    //
+    // The grab is therefore a fact to work around rather than avoid, and it costs
+    // two things. It swallows the panel's own right-click, so a popover left open
+    // makes the first right-click merely dismiss it; and it makes the BUTTON emit
+    // crossing events the pointer never caused, so neither its `leave` nor its
+    // contains_pointer() can be trusted while the popover is up.
+    //
+    // Both are answered by closing promptly and by asking the POPOVER where the
+    // pointer is -- it owns the grab, so it is the one widget whose answer is
+    // reliable. See schedule_close().
+    popover_.set_autohide(true);
+
+    // ---- hover ----
+    on_button_ = Gtk::EventControllerMotion::create();
+    on_button_->signal_enter().connect([this](double, double) {
+        cancel_close();
+        if (open_.connected() || popover_.get_visible()) return;
+        open_ = Glib::signal_timeout().connect(
+            [this] {
+                // Rebuilt on every open rather than once: agents get installed and
+                // folders get bookmarked while the panel is running, and a list
+                // that only reflects login time is one you learn to distrust.
+                rebuild();
+                popover_.popup();
+                // Armed as it opens. From here the pointer has about a second to
+                // move up into the menu; if it does not, the menu was not wanted.
+                schedule_close();
+                return false;
+            },
+            300);
+    });
+    on_button_->signal_leave().connect([this] {
+        // Only a PENDING open is cancelled here. Once the popover is up this same
+        // signal fires because of the grab rather than because the pointer moved,
+        // so it is not evidence of anything and must not close it.
+        if (open_.connected()) open_.disconnect();
+    });
+    add_controller(on_button_);
+
+    on_popover_ = Gtk::EventControllerMotion::create();
+    popover_box_.add_controller(on_popover_);
+}
+
+void TerminalButton::cancel_close() {
+    if (close_.connected()) close_.disconnect();
+}
+
+void TerminalButton::schedule_close() {
+    cancel_close();
+
+    // Polled rather than driven by a leave event, because the only widget whose
+    // crossing state is trustworthy here is the popover itself -- it holds the
+    // grab. Two consecutive ticks with the pointer outside it, so that skimming
+    // along the popover's edge does not close it mid-reach.
+    //
+    // Closing promptly matters more than usual: while this is up its grab
+    // swallows the panel's right-click, so a menu left open is a panel whose own
+    // menu appears not to work.
+    close_ = Glib::signal_timeout().connect(
+        [this, missed = 0]() mutable {
+            if (!popover_.get_visible()) return false;
+
+            if (on_popover_ && on_popover_->contains_pointer()) {
+                missed = 0;
+                return true;
+            }
+            if (++missed < 2) return true;
+
+            popover_.popdown();
+            return false;
+        },
+        500);
+}
+
+TerminalButton::~TerminalButton() {
+    // The popover is parented to this widget rather than owned by it, so it has to
+    // be unparented explicitly or GTK warns about a finalized widget with children.
+    if (open_.connected()) open_.disconnect();
+    if (close_.connected()) close_.disconnect();
+    popover_.unparent();
+}
+
+std::filesystem::path TerminalButton::chosen() const {
+    const auto index = folders_.get_selected();
+    if (index == GTK_INVALID_LIST_POSITION || index >= projects_.size()) return {};
+    return projects_[index].path;
+}
+
+void TerminalButton::rebuild() {
+    // Keep what was selected across a rebuild, or picking a folder and then
+    // hovering again would silently move you back to the top of the list.
+    const auto previous = chosen();
+
+    projects_ = all_projects();
+    {
+        std::vector<Glib::ustring> labels;
+        for (const auto& project : projects_) labels.emplace_back(project.name);
+        if (labels.empty()) labels.emplace_back("No projects yet");
+        folders_.set_model(Gtk::StringList::create(labels));
+    }
+
+    guint restore = 0;
+    for (std::size_t i = 0; i < projects_.size(); ++i) {
+        if (normal_project_path(projects_[i].path) == normal_project_path(previous)) {
+            restore = static_cast<guint>(i);
+            break;
+        }
+    }
+    // Nothing remembered yet: start where ollamadev thinks the current project is,
+    // so the panel and the engine agree before anything is clicked.
+    if (previous.empty()) {
+        if (const auto preferred = default_project()) {
+            for (std::size_t i = 0; i < projects_.size(); ++i) {
+                if (normal_project_path(projects_[i].path) ==
+                    normal_project_path(preferred->path)) {
+                    restore = static_cast<guint>(i);
+                    break;
+                }
+            }
+        }
+    }
+    folders_.set_selected(restore);
+    folder_path_.set_text(chosen().string());
+
+    const bool have_folder = !projects_.empty();
+    folders_.set_sensitive(have_folder);
+
+    // ---- the agents ----
+    while (Gtk::Widget* child = agent_box_.get_first_child()) agent_box_.remove(*child);
+    agent_rows_.clear();
+
+    auto* plain = Gtk::make_managed<Gtk::Button>("Terminal here");
+    plain->set_has_frame(false);
+    if (auto* text = dynamic_cast<Gtk::Label*>(plain->get_child())) text->set_xalign(0.0f);
+    // "Here" means the folder named just above it, with no dialog. It is the one
+    // row whose label already answers the question the others have to ask.
+    plain->signal_clicked().connect([this] {
+        cancel_close();
+        popover_.popdown();
+        launch_plain();
+    });
+    agent_box_.append(*plain);
+
+    // Only what is installed, and found by resolve_agent_binary() rather than by
+    // $PATH alone -- the panel's PATH is the login one, which does not include the
+    // trees nvm, bun, deno and cargo install into. See agents.hpp.
+    agents_ = available_agents();
+    for (const auto& agent : agents_) {
+        auto* button = Gtk::make_managed<Gtk::Button>(agent.label);
+        button->set_has_frame(false);
+        if (auto* text = dynamic_cast<Gtk::Label*>(button->get_child())) {
+            text->set_xalign(0.0f);
+        }
+        button->set_tooltip_text(agent.path);
+        button->set_sensitive(have_folder);
+        const AgentTool copy = agent;
+        // No popdown here: launch_agent() asks for the folder first, and doing it
+        // there keeps the dismissal and the dialog in one place.
+        button->signal_clicked().connect([this, copy] { launch_agent(copy); });
+        agent_box_.append(*button);
+    }
+
+    if (agents_.empty()) {
+        auto* none = Gtk::make_managed<Gtk::Label>("No coding agents found");
+        none->set_xalign(0.0f);
+        none->add_css_class("subtitle");
+        agent_box_.append(*none);
+    }
+
+    // The crew and the engine's everyday flows, set apart below a rule.
+    //
+    // Everything above opens ONE agent that then waits for you. These go and do
+    // something to the folder -- Ship pushes, Crew plans and edits -- so they do
+    // not belong in the same run of identical rows, one slip of the mouse away
+    // from "open a terminal".
+    //
+    // The set is ollamadev-qt's Start pane, minus the once-only entries: the two
+    // front ends offer the same flows so neither is the odd one out. See
+    // engine_actions() in crew.hpp.
+    if (crew_available()) {
+        auto* rule = Gtk::make_managed<Gtk::Separator>(Gtk::Orientation::HORIZONTAL);
+        rule->set_margin_top(4);
+        rule->set_margin_bottom(4);
+        agent_box_.append(*rule);
+
+        const auto add_row = [this, have_folder](const std::string& label,
+                                                 const std::string& tooltip,
+                                                 sigc::slot<void()> action) {
+            auto* button = Gtk::make_managed<Gtk::Button>(label);
+            button->set_has_frame(false);
+            if (auto* text = dynamic_cast<Gtk::Label*>(button->get_child())) {
+                text->set_xalign(0.0f);
+            }
+            button->set_tooltip_text(tooltip);
+            button->set_sensitive(have_folder);
+            button->signal_clicked().connect(action);
+            agent_box_.append(*button);
+            return button;
+        };
+
+        // The crew opens its WINDOW rather than starting a run. A crew needs a
+        // task, and nothing that edits files should begin from a hover menu -- so
+        // the folder is confirmed in that window's own row rather than here.
+        add_row("Crew…",
+                "Open the crew bench: a Director plans the task, coders build it in "
+                "worktrees, an Auditor reads every diff before it lands",
+                [this] {
+                    const auto folder = chosen();
+                    cancel_close();
+                    popover_.popdown();
+                    if (!is_project_dir(folder) || !on_crew_) return;
+                    remember_project(folder);
+                    on_crew_(folder);
+                });
+
+        // Team asks for a folder the same way Crew does -- by opening its window
+        // with one already chosen -- because a fan-out across four providers is
+        // four agents editing a tree, and that is not a hover-menu decision.
+        add_row("Team…",
+                "One prompt, several providers at once — a terminal each",
+                [this] {
+                    const auto folder = chosen();
+                    cancel_close();
+                    popover_.popdown();
+                    if (!is_project_dir(folder) || !on_team_) return;
+                    remember_project(folder);
+                    on_team_(folder);
+                });
+
+        // Brain has no folder: the router's tiers are a machine-wide preference,
+        // not a property of a project.
+        {
+            auto* button = add_row("Brain…",
+                                   "Which model each difficulty routes to, and where "
+                                   "a given request would go",
+                                   [this] {
+                                       cancel_close();
+                                       popover_.popdown();
+                                       if (on_brain_) on_brain_();
+                                   });
+            button->set_sensitive(true);
+        }
+
+        for (const auto& action : engine_actions()) {
+            add_row(action.label, action.tooltip, [this, action] {
+                ask_folder([this, action](std::filesystem::path folder) {
+                    const auto argv =
+                        terminal_command_argv(config_.terminal, action.argv, folder);
+                    if (argv.empty()) return;
+                    spawn_detached(argv, folder.string());
+                });
+            });
+        }
+    }
+
+    status_.set_text({});
+}
+
+void TerminalButton::launch_plain() {
+    // The chosen folder when the popover has one, otherwise wherever the panel is
+    // -- a bare left-click on a machine with no projects must still open a
+    // terminal, which is what this button has always been for.
+    const auto folder = chosen();
+    const bool usable = is_project_dir(folder);
+
+    const auto argv = usable ? terminal_here(config_.terminal, folder)
+                             : terminal_here(config_.terminal, {});
+    if (argv.empty()) return;
+    spawn_detached(argv, usable ? folder.string() : std::string{});
+    if (usable) remember_project(folder);
+}
+
+void TerminalButton::ask_folder(sigc::slot<void(std::filesystem::path)> then) {
+    auto* root = dynamic_cast<Gtk::Window*>(get_root());
+    if (!root) return;
+
+    cancel_close();
+    popover_.popdown();
+
+    auto dialog = Gtk::FileDialog::create();
+    dialog->set_title("Which folder should it open in?");
+    dialog->set_accept_label("Open here");
+    // Seeded from the dropdown, so the common case is one Enter away and the
+    // uncommon one is possible at all.
+    if (const auto current = chosen(); is_project_dir(current)) {
+        dialog->set_initial_folder(Gio::File::create_for_path(current.string()));
+    }
+
+    dialog->select_folder(
+        *root, [this, dialog, then](const Glib::RefPtr<Gio::AsyncResult>& result) {
+            try {
+                const auto folder = dialog->select_folder_finish(result);
+                if (!folder) return;
+                const std::filesystem::path path = folder->get_path();
+                if (!is_project_dir(path)) return;
+                remember_project(path);
+                then(path);
+            } catch (const Glib::Error&) {
+                // Cancelled, which means launch nothing.
+            }
+        });
+}
+
+void TerminalButton::launch_agent(const AgentTool& agent) {
+    // Re-resolved before the dialog rather than after: there is no point asking
+    // where to open something that is no longer installed.
+    AgentTool fresh = agent;
+    fresh.path = resolve_agent_binary(agent.binary);
+    if (fresh.path.empty()) return;
+
+    ask_folder([this, fresh](std::filesystem::path folder) {
+        const auto argv = agent_terminal_command(config_.terminal, fresh, folder);
+        if (argv.empty()) return;
+        spawn_detached(argv, folder.string());
+    });
+}
+
+void TerminalButton::browse() {
+    auto* root = dynamic_cast<Gtk::Window*>(get_root());
+    if (!root) return;
+
+    // Dismissed first: the popover holds an input grab, and a file dialog opened
+    // underneath one cannot be clicked.
+    popover_.popdown();
+
+    auto dialog = Gtk::FileDialog::create();
+    dialog->set_title("Open a folder");
+    if (const auto current = chosen(); is_project_dir(current)) {
+        dialog->set_initial_folder(Gio::File::create_for_path(current.string()));
+    }
+    dialog->select_folder(*root, [this, dialog](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        try {
+            const auto folder = dialog->select_folder_finish(result);
+            if (!folder) return;
+            const std::filesystem::path path = folder->get_path();
+            if (!is_project_dir(path)) return;
+
+            // Remembered before the rebuild, so it is in the list that rebuild
+            // then selects from.
+            remember_project(path);
+            rebuild();
+            for (std::size_t i = 0; i < projects_.size(); ++i) {
+                if (normal_project_path(projects_[i].path) == normal_project_path(path)) {
+                    folders_.set_selected(static_cast<guint>(i));
+                    break;
+                }
+            }
+            folder_path_.set_text(chosen().string());
+            popover_.popup();
+        } catch (const Glib::Error&) {
+            // Cancelled.
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // CrewButton
 // ---------------------------------------------------------------------------
 CrewButton::CrewButton() {
@@ -1398,11 +1813,13 @@ void Panel::build_bottom() {
     // that is not part of talking to the machine, so it does not belong in the
     // middle of the ones that are.
     if (!config_.terminal.empty()) {
-        terminal_icon_.set_from_icon_name("utilities-terminal-symbolic");
-        terminal_.set_child(terminal_icon_);
-        terminal_.set_tooltip_text("Open a terminal");
-        terminal_.signal_clicked().connect([this] { launch(config_.terminal); });
-        button_box_.append(terminal_);
+        terminal_ = std::make_unique<TerminalButton>(config_);
+        terminal_->set_crew_handler(
+            [this](std::filesystem::path project) { show_crew_in(project); });
+        terminal_->set_team_handler(
+            [this](std::filesystem::path project) { show_team(project); });
+        terminal_->set_brain_handler([this] { show_brain(); });
+        button_box_.append(*terminal_);
     }
 
     box_.append(button_box_);
@@ -1449,9 +1866,19 @@ void Panel::show_panel_menu(double x, double y) {
 
     add("Settings", [this] { show_settings(); });
     add("Calendar", [this] { show_calendar(); });
+    // Above Crew, because it answers the question Crew asks first: which folder.
+    // Offered whether or not an agent is installed -- it opens terminals and file
+    // managers too, and it is where you find out which agents were found.
+    add("Projects", [this] { show_projects(); });
     // Only when ollamadev is installed: a menu entry that always explains it
     // cannot work is worse than no entry.
-    if (crew_available()) add("Crew", [this] { show_crew(); });
+    if (crew_available()) {
+        add("Crew", [this] { show_crew(); });
+        // Team and Brain sit with Crew because all three are the engine's, and
+        // none of them mean anything without it.
+        add("Team", [this] { show_team({}); });
+        add("Brain", [this] { show_brain(); });
+    }
     add("Open a terminal", [this] {
         if (!config_.terminal.empty()) launch(config_.terminal);
     });
@@ -1493,13 +1920,34 @@ void Panel::confirm_quit() {
     });
 }
 
-void Panel::show_crew() {
-    if (crew_window_) {
-        crew_window_->present();
-        return;
-    }
-    crew_window_ = std::make_unique<CrewWindow>();
+void Panel::show_crew() { show_crew_in({}); }
+
+void Panel::show_crew_in(const std::filesystem::path& project) {
+    if (!crew_window_) crew_window_ = std::make_unique<CrewWindow>();
+    // Set BEFORE presenting, so the window is never briefly showing the previous
+    // folder next to a task box you are about to type into.
+    if (!project.empty()) crew_window_->set_project(project);
     crew_window_->present();
+}
+
+void Panel::show_team(const std::filesystem::path& project) {
+    if (!team_window_) team_window_ = std::make_unique<TeamWindow>(config_);
+    if (!project.empty()) team_window_->set_project(project);
+    team_window_->present();
+}
+
+void Panel::show_brain() {
+    if (!brain_window_) brain_window_ = std::make_unique<BrainWindow>();
+    brain_window_->present();
+}
+
+void Panel::show_projects() {
+    if (!projects_window_) {
+        projects_window_ = std::make_unique<ProjectsWindow>(config_);
+        projects_window_->set_crew_handler(
+            [this](std::filesystem::path project) { show_crew_in(project); });
+    }
+    projects_window_->present();
 }
 
 void Panel::show_calendar() {
@@ -1515,16 +1963,6 @@ void Panel::show_calendar() {
         },
         false);
     calendar_window_->present();
-}
-
-void Panel::show_board() {
-    if (board_window_) {
-        board_window_->refresh();
-        board_window_->present();
-        return;
-    }
-    board_window_ = std::make_unique<BoardWindow>();
-    board_window_->present();
 }
 
 void Panel::show_launcher() {

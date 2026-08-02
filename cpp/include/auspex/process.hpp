@@ -17,7 +17,18 @@ struct ProcessResult {
 // Runs argv[0] via execvp. stderr is always discarded: a missing window or an
 // absent helper is an expected, recoverable state, not something to spray across
 // the shell's log every second.
-ProcessResult run(const std::vector<std::string>& argv, bool capture = true);
+//
+// `cwd` is the directory the child runs in; empty inherits this process's. It is
+// applied in the CHILD, after the fork and before the exec, so the panel's own
+// working directory is never disturbed -- chdir is process-wide, and a shell that
+// moved itself to run one command would break every relative path it holds.
+//
+// A cwd that cannot be entered fails the command rather than running it somewhere
+// else. For a tool whose whole job is editing the files in front of it, "the
+// directory was wrong so it worked here instead" is the one outcome worth
+// crashing to avoid.
+ProcessResult run(const std::vector<std::string>& argv, bool capture = true,
+                  const std::string& cwd = {});
 
 // Splits on '\n', dropping empty lines.
 std::vector<std::string> split_lines(const std::string& text);
@@ -29,12 +40,28 @@ std::vector<std::string> split_lines(const std::string& text);
 // Double-forks so the grandchild is reparented to init: the panel then has no
 // child to reap and cannot accumulate zombies, and the launched app survives the
 // panel exiting.
-bool spawn_detached(const std::vector<std::string>& argv);
+//
+// `cwd` as in run(). Note what this returns: the double fork means the parent has
+// already reaped the intermediate child by the time the grandchild reaches chdir,
+// so `true` means "the fork succeeded", NOT "the program started in that
+// directory". Anything that must be sure the directory was usable has to check it
+// before calling -- see is_project_dir() in projects.hpp.
+bool spawn_detached(const std::vector<std::string>& argv, const std::string& cwd = {});
 
 // True if `program` resolves to an executable in PATH. Rejects anything with a
 // path separator or shell metacharacter, so it doubles as the validator for
 // model-supplied application names.
 bool in_path(std::string_view program);
+
+// The absolute path `program` resolves to in PATH, or "" if it does not.
+//
+// Same rejection rules as in_path() -- this is the same lookup, returning WHERE
+// rather than WHETHER. It exists because "is it installed" and "run it" can be
+// answered by two different processes with two different environments: a terminal
+// that spawns its window from a long-lived server process executes the command
+// line in THAT process's PATH, not in the panel's. Passing an absolute path takes
+// the second environment out of the question entirely.
+std::string resolve_in_path(std::string_view program);
 
 // First entry of `candidates` that resolves in PATH, or "" if none do. Used to
 // pick desktop tools at runtime instead of hardcoding one desktop's binaries.

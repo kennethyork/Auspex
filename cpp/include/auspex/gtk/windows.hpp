@@ -32,9 +32,12 @@
 #include <gtkmm/textview.h>
 #include <gtkmm/window.h>
 
+#include "auspex/agents.hpp"
 #include "auspex/config.hpp"
+#include "auspex/crew.hpp"
 #include "auspex/calendar.hpp"
 #include "auspex/desktop_entries.hpp"
+#include "auspex/projects.hpp"
 #include "auspex/timekeeping.hpp"
 
 namespace auspex::gtk {
@@ -67,47 +70,6 @@ private:
     // remove non-child" and does nothing. Owning the rows explicitly is what makes
     // removal work, and removal working is what makes the search filter.
     std::vector<std::unique_ptr<Gtk::ListBoxRow>> rows_;
-};
-
-// What the crew is holding, and the two decisions you can make about each.
-//
-// Deliberately NOT a mirror of `ollamadev board` text: the reason an Auditor held
-// something is the part you actually read before deciding, so it gets equal weight
-// to the summary rather than being a dim second line.
-class BoardWindow : public Gtk::Window {
-public:
-    BoardWindow();
-
-    // Re-reads the board. Called on open and after every decision, because
-    // accepting one changeset can release or invalidate another.
-    void refresh();
-
-private:
-    void decide(int n, bool accept);
-
-    // Refreshes itself while a crew is working.
-    //
-    // Changesets land while you are looking at the window, and a board that only
-    // updates when reopened is a board you have to remember to distrust. Driven by
-    // the modification times of the two files the engine already maintains, so a
-    // quiet minute costs two stats rather than two subprocesses.
-    void watch();
-
-    std::filesystem::file_time_type board_mtime_{};
-    std::filesystem::file_time_type crew_mtime_{};
-    bool have_board_mtime_ = false;
-    bool have_crew_mtime_  = false;
-    Gtk::Label   running_;
-
-    Gtk::Box            root_{Gtk::Orientation::VERTICAL, 8};
-    Gtk::Label          heading_;
-    Gtk::ScrolledWindow scroller_;
-    Gtk::Box            list_{Gtk::Orientation::VERTICAL, 8};
-    Gtk::Box            buttons_{Gtk::Orientation::HORIZONTAL, 8};
-    Gtk::Button         refresh_{"Refresh"};
-    Gtk::Button         close_{"Close"};
-
-    std::vector<std::unique_ptr<Gtk::Widget>> rows_;
 };
 
 // A month view, laid out the way a calendar is expected to look: a heading with
@@ -190,13 +152,32 @@ class CrewWindow : public Gtk::Window {
 public:
     CrewWindow();
 
+    // Points the window at a folder. Called by the project picker, so choosing a
+    // project there and pressing Crew do not have to be told the same thing twice.
+    void set_project(const std::filesystem::path& path);
+
 private:
     void start();
     void refresh_run();
     void refresh_board();
     void decide(int n, bool accept);
+    void choose_project();
+    void show_project();
 
     Gtk::Box root_{Gtk::Orientation::VERTICAL, 12};
+
+    // WHERE. First, above the task, and never blank.
+    //
+    // This is the whole point of the window. `ollamadev crew` plans against, and
+    // applies diffs into, the tree it is started in -- Crew.cpp takes
+    // QDir::currentPath() and never revisits it. Until this existed that tree was
+    // the panel's own working directory, which on a real login is $HOME. So the
+    // Director was decomposing every task against the home directory, and an
+    // accepted changeset would have landed there.
+    std::filesystem::path project_;
+    Gtk::Box    project_row_{Gtk::Orientation::HORIZONTAL, 8};
+    Gtk::Label  project_label_;
+    Gtk::Button project_pick_{"Change…"};
 
     // What to do.
     Gtk::Label  task_label_;
@@ -213,9 +194,17 @@ private:
     Gtk::CheckButton debate_{"Debate"};
     Gtk::CheckButton dedupe_{"Dedupe"};
     Gtk::CheckButton learn_{"Learn"};
+    Gtk::CheckButton security_{"Security scan"};
     Gtk::Box         second_row_{Gtk::Orientation::HORIZONTAL, 14};
     Gtk::Label       coders_label_;
     Gtk::SpinButton  coders_;
+    // --swarm and --amplify. Numbers rather than switches because in both cases the
+    // number IS the cost: swarm is how many coders may run at once, amplify is how
+    // many times the planning and the review are repeated.
+    Gtk::Label       swarm_label_;
+    Gtk::SpinButton  swarm_;
+    Gtk::Label       amplify_label_;
+    Gtk::SpinButton  amplify_;
     Gtk::Label       pack_label_;
     Gtk::DropDown    pack_;
     std::vector<std::string> packs_;
@@ -233,7 +222,9 @@ private:
         Gtk::ScrolledWindow scroller;
         Gtk::Box            body{Gtk::Orientation::VERTICAL, 4};
     };
-    Lane todo_, doing_, done_;
+    // Held last, and hidden when empty -- ollamadev-qt only adds that column when
+    // something is actually held, so an ordinary run still reads as three lanes.
+    Lane todo_, doing_, done_, held_;
     std::vector<std::unique_ptr<Gtk::Widget>> run_rows_;
 
     // Steering a coder that is already running.
@@ -253,12 +244,186 @@ private:
 
     Gtk::Label status_;
 
-    // Both watched by modification time; see BoardWindow for why the two files
-    // answer different questions.
+    // Both watched by modification time. They answer different questions: the
+    // board file says whether anything has landed, the crew file whether anything
+    // is still working -- so a board that watched only one would either miss
+    // arrivals or be unable to say why it is empty.
     std::filesystem::file_time_type run_mtime_{};
     std::filesystem::file_time_type board_mtime_{};
     bool have_run_mtime_   = false;
     bool have_board_mtime_ = false;
+};
+
+// Pick a folder, pick an agent, open it there.
+//
+// The gap this fills: Auspex could already start claude, codex, opencode and the
+// rest -- by voice, into a terminal on the canvas -- but never with a directory.
+// They all read and write the tree they are launched in, so "open a claude code
+// agent" meant "open one wherever the panel happens to be", which is the login
+// directory. That is not a usable way to work on anything.
+//
+// The folder list is ollamadev's own bookmarks (~/.ollamadev/workspaces.json) plus
+// Auspex's recents, so a project adopted in either program appears in both. See
+// projects.hpp for why that file rather than a list of our own.
+//
+// The agent list is only what is INSTALLED. An entry that cannot start is a button
+// that reports a failure you could have been told about before pressing it.
+class ProjectsWindow : public Gtk::Window {
+public:
+    // The crew handler is wired by the Panel, which owns the crew window: choosing
+    // a folder here and starting a crew there should be one gesture, not two
+    // separate places to say the same thing.
+    explicit ProjectsWindow(const Config& config);
+
+    void set_crew_handler(sigc::slot<void(std::filesystem::path)> handler) {
+        on_crew_ = std::move(handler);
+    }
+
+private:
+    void reload();
+    void select(const std::filesystem::path& path);
+    void browse();
+    void open_in(const AgentTool& agent);
+    void open_terminal();
+    void open_files();
+
+    const Config& config_;
+
+    // The chosen folder. Empty only when there are no projects and nothing has been
+    // browsed to, which is the one state where the agent buttons are insensitive --
+    // launching into no directory is exactly the bug this window exists to fix.
+    std::filesystem::path selected_;
+    std::vector<Project>  projects_;
+
+    Gtk::Box            root_{Gtk::Orientation::HORIZONTAL, 0};
+
+    // Folders down the left, because the folder is chosen first and then acted on.
+    Gtk::Box            left_{Gtk::Orientation::VERTICAL, 6};
+    Gtk::Label          left_heading_;
+    Gtk::ScrolledWindow list_scroller_;
+    Gtk::ListBox        list_;
+    Gtk::Button         browse_{"Open another folder…"};
+    std::vector<std::unique_ptr<Gtk::ListBoxRow>> rows_;
+
+    // What to do with it, down the right.
+    Gtk::Box            right_{Gtk::Orientation::VERTICAL, 8};
+    Gtk::Label          chosen_name_;
+    Gtk::Label          chosen_path_;
+    Gtk::Label          agents_heading_;
+    Gtk::Box            agent_box_{Gtk::Orientation::VERTICAL, 6};
+    Gtk::Box            extras_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Button         terminal_{"Terminal"};
+    Gtk::Button         files_{"Files"};
+    Gtk::Button         crew_{"Crew…"};
+    Gtk::Label          status_;
+
+    std::vector<AgentTool>                    agents_;
+    std::vector<std::unique_ptr<Gtk::Widget>> agent_widgets_;
+
+    sigc::slot<void(std::filesystem::path)> on_crew_;
+};
+
+// One prompt, several agents, at once.
+//
+// Ports ollamadev-qt's AgentTeamPane. Tick the providers, type one thing, press
+// Launch, and each gets its own terminal running `ollamadev --backend <id>
+// "<prompt>"` in the chosen folder.
+//
+// This is the piece that was missing when Auspex is compared to the products that
+// sell "an army of agents": the panel could already open agents, but only one at a
+// time and only with an empty prompt, so fanning a question across four of them
+// meant four terminals and four paste operations.
+//
+// The ENGINE does the work, as everywhere else here. Auspex ticks boxes and builds
+// argv; ollamadev knows what a backend is.
+class TeamWindow : public Gtk::Window {
+public:
+    explicit TeamWindow(const Config& config);
+
+    void set_project(const std::filesystem::path& path);
+
+private:
+    void launch();
+    void choose_project();
+    void show_project();
+
+    const Config& config_;
+
+    // Same rule as the crew: every one of these edits the tree it lands in, so the
+    // folder is named on screen and never inferred.
+    std::filesystem::path project_;
+
+    Gtk::Box    root_{Gtk::Orientation::VERTICAL, 10};
+    Gtk::Box    project_row_{Gtk::Orientation::HORIZONTAL, 8};
+    Gtk::Label  project_label_;
+    Gtk::Button project_pick_{"Change…"};
+
+    Gtk::Label          providers_heading_;
+    Gtk::ScrolledWindow providers_scroller_;
+    Gtk::Box            providers_{Gtk::Orientation::VERTICAL, 2};
+    // Parallel to `backends_`. Boxes for providers that are not installed exist but
+    // are insensitive, so the list says what the machine COULD do as well as what
+    // it can -- which is the difference between a short list and a broken one.
+    std::vector<std::unique_ptr<Gtk::CheckButton>> boxes_;
+    std::vector<Backend> backends_;
+
+    Gtk::Label          prompt_label_;
+    Gtk::ScrolledWindow prompt_scroller_;
+    Gtk::TextView       prompt_;
+
+    Gtk::Box    buttons_{Gtk::Orientation::HORIZONTAL, 8};
+    Gtk::Button launch_{"Launch team"};
+    Gtk::Label  status_;
+};
+
+// The crew's brain: which model each difficulty routes to, and where a given
+// request would go.
+//
+// Ports ollamadev-qt's BrainPane. Before this, --route was a switch you could turn
+// on and neither see the effect of nor influence -- the tiers live in ollamadev's
+// own prefs and there was no way to read or write them from Auspex at all.
+class BrainWindow : public Gtk::Window {
+public:
+    BrainWindow();
+
+private:
+    void reload();
+    void probe();
+    void show_usage();
+
+    Gtk::Box   root_{Gtk::Orientation::VERTICAL, 10};
+    Gtk::Label heading_;
+
+    // One row per tier: its name, and the model it resolves to.
+    Gtk::Grid  tiers_;
+    struct TierRow {
+        Gtk::Label     label;
+        Gtk::DropDown  models;
+        std::string    tier;
+    };
+    std::vector<std::unique_ptr<TierRow>> rows_;
+    std::vector<std::string> models_;
+    // Set while the pickers are being filled in from the engine, so their own
+    // change handlers do not fire and write back what was just read.
+    bool loading_ = false;
+
+    // "Where would this go?" -- the probe. Answers without running anything, which
+    // is why route_command() deliberately omits --run.
+    Gtk::Label  probe_label_;
+    Gtk::Box    probe_row_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Entry  probe_entry_;
+    Gtk::Button probe_go_{"Route it"};
+    Gtk::Label  probe_result_;
+
+    // What has been spent, and how much of it stayed on this machine.
+    //
+    // Per PROJECT, unlike the tiers above -- usage.json lives in the project's own
+    // .ollamadev -- so the folder it refers to is named rather than assumed. Qt's
+    // BrainPane shows the same line for whatever project the app has open; this
+    // window has no project of its own, so it takes the current one.
+    Gtk::Label  tokens_;
+
+    Gtk::Label status_;
 };
 
 // Conversation window. Replaces llm_menu.py, including its per-message actions:

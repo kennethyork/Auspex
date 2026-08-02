@@ -29,7 +29,12 @@
 #include "auspex/desktop.hpp"
 #include "auspex/display.hpp"
 #include "auspex/desktop_entries.hpp"
+#include "auspex/coder.hpp"
+#include "auspex/director.hpp"
 #include "auspex/panel_dock.hpp"
+#include "auspex/process.hpp"
+#include "auspex/projects.hpp"
+#include "auspex/sandbox.hpp"
 #include "auspex/session.hpp"
 #include "auspex/sysmon.hpp"
 #include "auspex/timekeeping.hpp"
@@ -2131,21 +2136,47 @@ void test_crew_run_state() {
         options.debate     = true;
         options.dedupe     = true;
         options.learn      = true;
+        options.security   = true;
         options.max_coders = 6;
+        options.swarm      = 8;
+        options.amplify    = 3;
         options.pack       = "tested";
 
         const auto full = crew_run_command("build the thing", options);
         const auto has = [&full](const std::string& flag) {
             return std::find(full.begin(), full.end(), flag) != full.end();
         };
-        check(has("--route"),  "route is passed");
-        check(has("--debate"), "debate is passed");
-        check(has("--dedupe"), "dedupe is passed");
-        check(has("--learn"),  "learn is passed");
-        check(has("--max"),    "a coder cap is passed");
-        check(has("6"),        "with its number");
-        check(has("--pack"),   "a pack is passed");
-        check(has("tested"),   "by name");
+        // Every flag is checked against `ollamadev crew --help`, not invented. An
+        // unrecognised bare argument is treated by ollamadev as a PROMPT rather
+        // than refused, so a misspelled flag would not error -- it would quietly
+        // send its own name to a language model.
+        check(has("--route"),    "route is passed");
+        check(has("--debate"),   "debate is passed");
+        check(has("--dedupe"),   "dedupe is passed");
+        check(has("--learn"),    "learn is passed");
+        check(has("--security"), "security is passed");
+        check(has("--max"),      "a coder cap is passed");
+        check(has("6"),          "with its number");
+        check(has("--swarm"),    "a swarm width is passed");
+        check(has("8"),          "with its number");
+        check(has("--amplify"),  "an amplify factor is passed");
+        check(has("3"),          "with its number");
+        check(has("--pack"),     "a pack is passed");
+        check(has("tested"),     "by name");
+
+        // Each numeric flag is immediately followed by ITS OWN value. Three
+        // number-taking flags in one command line is exactly where an off-by-one
+        // in the argv builder would give --swarm the amplify factor, and the run
+        // would still start -- just wider or narrower than asked for.
+        const auto value_after = [&full](const std::string& flag) -> std::string {
+            const auto it = std::find(full.begin(), full.end(), flag);
+            if (it == full.end() || it + 1 == full.end()) return {};
+            return *(it + 1);
+        };
+        check_eq(value_after("--max"),     std::string("6"), "--max takes the cap");
+        check_eq(value_after("--swarm"),   std::string("8"), "--swarm takes the width");
+        check_eq(value_after("--amplify"), std::string("3"), "--amplify takes the factor");
+        check_eq(value_after("--pack"), std::string("tested"), "--pack takes the name");
 
         // The task stays immediately after the subcommand: flags follow it, and a
         // task that drifted behind a flag would be read as that flag's value.
@@ -2160,6 +2191,12 @@ void test_crew_run_state() {
               "an unset coder cap is left off entirely");
         check(std::find(defaults.begin(), defaults.end(), "--pack") == defaults.end(),
               "and so is an unset pack");
+        check(std::find(defaults.begin(), defaults.end(), "--swarm") == defaults.end(),
+              "an unset swarm width is left off");
+        check(std::find(defaults.begin(), defaults.end(), "--amplify") == defaults.end(),
+              "and so is an unset amplify factor");
+        check(std::find(defaults.begin(), defaults.end(), "--security") == defaults.end(),
+              "and the security scan is opt-in");
     }
 
     // Packs and roles are listed as two columns; only the name is wanted, and a
@@ -3835,10 +3872,20 @@ void test_agents() {
 
     // Terminal invocation. Getting the flag wrong opens an empty terminal, which
     // reads as the agent crashing instantly.
-    const auto claude = *resolve_agent("claude");
+    //
+    // Built by hand with an empty `path` rather than taken from resolve_agent(),
+    // so these assert the FLAG RULES and nothing else. A resolved agent carries an
+    // absolute path that differs per machine -- asserting against it here would
+    // make the check pass or fail on where claude happens to be installed, which
+    // is not what these lines are about. The absolute-path behaviour is checked on
+    // its own in test_projects().
+    const auspex::AgentTool claude{"claude", "Claude Code", "claude", ""};
+    // -x, not -e. xfce4-terminal's -e takes exactly ONE argument and word-splits it
+    // itself, so it cannot carry a command with arguments at all; -x takes the rest
+    // of the line and works for a bare program too. One path rather than two.
     check(agent_terminal_command("xfce4-terminal", claude) ==
-              std::vector<std::string>{"xfce4-terminal", "-e", "claude"},
-          "xfce4-terminal takes -e");
+              std::vector<std::string>{"xfce4-terminal", "-x", "claude"},
+          "xfce4-terminal takes -x");
     check(agent_terminal_command("gnome-terminal", claude) ==
               std::vector<std::string>{"gnome-terminal", "--", "claude"},
           "gnome-terminal wants -- (it deprecated -e and ignores it)");
@@ -3849,6 +3896,15 @@ void test_agents() {
               std::vector<std::string>{"/usr/bin/gnome-terminal", "--", "claude"},
           "the rule matches on basename, so an absolute terminal path still works");
     check(agent_terminal_command("", claude).empty(), "no terminal, no command");
+
+    // resolve_agent() fills the path in, so the voice verb gets an absolute path
+    // without knowing it needed one -- it reaches agent_terminal_command() by a
+    // different route than the panel does, and only one of them would have been
+    // fixed otherwise.
+    if (const auto found = resolve_agent("claude"); found && !found->path.empty()) {
+        check(std::filesystem::path(found->path).is_absolute(),
+              "a resolved agent carries an absolute path for the voice verb too");
+    }
 
     // Every alias in the table must resolve to its own entry -- a duplicate alias
     // between two agents would silently make one of them unreachable by voice.
@@ -3895,6 +3951,1228 @@ void test_sysmon() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Projects — the folder an agent works in
+// ---------------------------------------------------------------------------
+//
+// The bug this whole module exists to fix does not show up as a crash. An agent
+// started with no directory runs somewhere, edits files, and reports success; the
+// only symptom is that the wrong tree changed. So the checks here are about the
+// two things that decide WHICH tree: what comes out of the bookmark file, and what
+// goes into the terminal command line.
+void test_projects() {
+    using namespace auspex;
+    std::cout << "\nprojects\n";
+
+    // ---- reading ollamadev's bookmarks ----
+    //
+    // Real shape, from ~/.ollamadev/workspaces.json. Paths that do not exist are
+    // dropped, so the fixture uses "/" and "/tmp" -- the two directories that can
+    // be relied on to be there on any machine running this test.
+    {
+        const std::string file = R"({
+            "active": "ws_two",
+            "workspaces": [
+                {"id":"ws_one","name":"Older","path":"/","lastOpened":"2026-01-01T00:00:00"},
+                {"id":"ws_two","name":"Newer","path":"/tmp","lastOpened":"2026-07-01T00:00:00"},
+                {"id":"ws_gone","name":"Deleted","path":"/no/such/folder/anywhere",
+                 "lastOpened":"2026-08-01T00:00:00"}
+            ]
+        })";
+
+        const auto projects = parse_bookmarks(file);
+        check_eq(projects.size(), std::size_t{2},
+                 "a bookmark whose folder is gone is dropped, not listed broken");
+        if (projects.size() == 2) {
+            // Most recent first. The deleted one has the newest timestamp and would
+            // have led the list, which is why it is dropped BEFORE sorting.
+            check_eq(projects[0].name, std::string("Newer"), "most recent first");
+            check_eq(projects[1].name, std::string("Older"), "then the older one");
+            check(projects[0].bookmarked, "and both are marked as bookmarks");
+        }
+
+        // The active entry resolves to a PATH. Returning ollamadev's opaque id
+        // would be useless to every caller -- an id means nothing outside that file.
+        const auto active = parse_active_bookmark(file);
+        check(active.has_value(), "the active workspace is found");
+        if (active) check_eq(*active, std::string("/tmp"), "and resolves to its path");
+
+        check(parse_bookmarks("not json at all").empty(), "garbage yields no projects");
+        check(parse_bookmarks("{}").empty(), "and neither does an empty object");
+        check(!parse_active_bookmark("{}").has_value(), "nor an active workspace");
+    }
+
+    // A bookmark with no name falls back to the folder's own, so the list never has
+    // a blank row you cannot tell apart from another blank row.
+    {
+        const auto projects = parse_bookmarks(
+            R"({"workspaces":[{"id":"a","name":"","path":"/tmp"}]})");
+        check_eq(projects.size(), std::size_t{1}, "an unnamed bookmark still counts");
+        if (!projects.empty()) {
+            check_eq(projects[0].name, std::string("tmp"), "named after its folder");
+        }
+    }
+
+    // ---- the recents list ----
+    {
+        std::vector<Project> recents;
+        recents = promote_recent(recents, "/tmp");
+        check_eq(recents.size(), std::size_t{1}, "a first project is remembered");
+
+        recents = promote_recent(recents, "/usr");
+        check_eq(recents.size(), std::size_t{2}, "and a second");
+        if (recents.size() == 2) {
+            check_eq(recents[0].path.string(), std::string("/usr"), "newest first");
+        }
+
+        // Re-opening moves rather than duplicates. Without this the list fills with
+        // one folder and the others fall off the end.
+        recents = promote_recent(recents, "/tmp");
+        check_eq(recents.size(), std::size_t{2}, "re-opening does not duplicate");
+        if (recents.size() == 2) {
+            check_eq(recents[0].path.string(), std::string("/tmp"), "it moves to the front");
+        }
+
+        // Trailing separators are the same folder. Two rows with identical text and
+        // different behaviour would be unexplainable from the screen.
+        recents = promote_recent(recents, "/tmp/");
+        check_eq(recents.size(), std::size_t{2}, "a trailing slash is the same folder");
+
+        // The cap holds, oldest dropped.
+        std::vector<Project> many;
+        for (int i = 0; i < 20; ++i) {
+            many = promote_recent(many, "/tmp/p" + std::to_string(i), 5);
+        }
+        check_eq(many.size(), std::size_t{5}, "the list is capped");
+        if (!many.empty()) {
+            check_eq(many[0].path.string(), std::string("/tmp/p19"),
+                     "keeping the newest");
+        }
+
+        // Round trip, so a list written today still reads tomorrow.
+        const auto decoded = parse_recents(encode_recents(many));
+        check_eq(decoded.size(), many.size(), "recents survive a round trip");
+        if (decoded.size() == many.size() && !decoded.empty()) {
+            check_eq(decoded[0].path, many[0].path, "in the same order");
+        }
+
+        // A hand-edited file of bare strings is accepted, because that is what
+        // somebody opening this file in an editor would write.
+        const auto plain = parse_recents(R"(["/tmp", "/usr"])");
+        check_eq(plain.size(), std::size_t{2}, "bare path strings are accepted");
+        if (plain.size() == 2) check_eq(plain[0].name, std::string("tmp"), "and named");
+
+        check(parse_recents("{}").empty(), "an object is not a recents list");
+        check(parse_recents("garbage").empty(), "and neither is garbage");
+    }
+
+    // ---- the mechanism itself ----
+    //
+    // Everything else in this file is text. This is the one check that the child
+    // process actually STANDS somewhere, because that is what decides which tree
+    // gets edited -- and it is the part with no visible symptom when it is wrong:
+    // the agent runs, reports success, and the wrong files changed.
+    {
+        const auto here = run({"pwd"}, /*capture=*/true, "/tmp");
+        check(here.ok, "a command runs in a given directory");
+        check_eq(trim(here.out), std::string("/tmp"), "and it is that directory");
+
+        const auto elsewhere = run({"pwd"}, /*capture=*/true, "/usr");
+        check_eq(trim(elsewhere.out), std::string("/usr"), "a different one, likewise");
+
+        // The panel's OWN directory must be untouched. chdir is process-wide; if it
+        // ever leaked out of the child, every relative path the shell holds would
+        // start resolving somewhere else.
+        const auto inherited = run({"pwd"});
+        check_eq(trim(inherited.out), std::filesystem::current_path().string(),
+                 "and the shell's own directory is not moved");
+
+        // A directory that cannot be entered FAILS rather than running somewhere
+        // else. "The folder was wrong, so it worked here instead" is the single
+        // outcome worth refusing to start over.
+        const auto missing = run({"pwd"}, /*capture=*/true, "/no/such/folder/anywhere");
+        check(!missing.ok, "an unusable directory fails the command");
+        check(trim(missing.out).empty(), "and produces nothing");
+
+        // A FILE where a directory was expected fails the same way.
+        const auto not_a_dir = run({"pwd"}, /*capture=*/true, "/etc/hostname");
+        check(!not_a_dir.ok, "and so does a path that is not a directory");
+    }
+
+    // ---- comparing two paths ----
+    //
+    // This is what decides whether two rows are the same project. lexically_normal()
+    // alone is not enough: it PRESERVES a trailing separator by design, so "/tmp"
+    // and "/tmp/" would compare unequal and the same folder would be listed twice.
+    {
+        check_eq(normal_project_path("/tmp/"), std::filesystem::path("/tmp"),
+                 "a trailing separator is stripped");
+        check_eq(normal_project_path("/tmp"), std::filesystem::path("/tmp"),
+                 "and one without is left alone");
+        check_eq(normal_project_path("/tmp///"), std::filesystem::path("/tmp"),
+                 "however many there are");
+        check_eq(normal_project_path("/home/me/../me/x"), std::filesystem::path("/home/me/x"),
+                 "and the path is normalised");
+        // The root is nothing BUT a separator. Stripping it would leave an empty
+        // path, which compares equal to every relative one.
+        check_eq(normal_project_path("/"), std::filesystem::path("/"),
+                 "the root survives, because it is all separator");
+        check_eq(normal_project_path(""), std::filesystem::path(""),
+                 "and nothing stays nothing");
+    }
+
+    // ---- is it a folder at all ----
+    {
+        check(is_project_dir("/tmp"), "/tmp is a usable project directory");
+        check(!is_project_dir("/no/such/folder/anywhere"), "a missing path is not");
+        check(!is_project_dir(""), "and neither is nothing");
+        // A FILE is not a directory. This is the check that stops chdir() failing
+        // in the child after the fork, where there is nothing left to report to.
+        check(!is_project_dir("/etc/hostname"), "a regular file is not a directory");
+    }
+
+    // ---- the command line ----
+    //
+    // Two separate things have to be right: the flag that means "start here", and
+    // the flag that means "then run this". Getting the second wrong opens an empty
+    // terminal, which reads as the agent having crashed instantly. Getting the
+    // first wrong is worse and silent: the agent opens, works, and edits the wrong
+    // tree.
+    {
+        const std::filesystem::path dir = "/tmp/project";
+
+        const auto has = [](const std::vector<std::string>& argv, const std::string& s) {
+            return std::find(argv.begin(), argv.end(), s) != argv.end();
+        };
+
+        const auto xfce = terminal_command_in("xfce4-terminal", "claude", dir);
+        check(has(xfce, "--working-directory=/tmp/project"),
+              "xfce4-terminal is told where to start");
+        check(has(xfce, "-x"), "and how to run a command");
+        check_eq(xfce.back(), std::string("claude"), "with the agent last");
+
+        const auto gnome = terminal_command_in("gnome-terminal", "codex", dir);
+        check(has(gnome, "--working-directory=/tmp/project"),
+              "gnome-terminal too -- it spawns from a server and inherits no cwd");
+        check(has(gnome, "--"), "and takes -- rather than the -e it deprecated");
+        check(!has(gnome, "-e"), "never -e");
+
+        const auto kitty = terminal_command_in("kitty", "opencode", dir);
+        check(has(kitty, "--directory"), "kitty spells it --directory");
+        check(!has(kitty, "-e"), "and takes the command bare");
+        check_eq(kitty.back(), std::string("opencode"), "still last");
+
+        const auto konsole = terminal_command_in("konsole", "ollamadev", dir);
+        check(has(konsole, "--workdir"), "konsole spells it --workdir");
+
+        // xterm has no such flag at all. It gets the directory from the inherited
+        // cwd instead, which is why spawn_detached() takes one -- the flag alone
+        // would silently do nothing here.
+        const auto xterm = terminal_command_in("xterm", "aider", dir);
+        check(!has(xterm, "--working-directory=/tmp/project"),
+              "xterm is given no directory flag, because it has none");
+        check(has(xterm, "-e"), "only -e");
+
+        // An absolute terminal path from a PATH lookup still matches by basename.
+        const auto absolute = terminal_command_in("/usr/bin/gnome-terminal", "claude", dir);
+        check(has(absolute, "--"), "an absolute terminal path matches on its basename");
+
+        // No directory is a legitimate request -- it is what the voice verb makes,
+        // because speech has no way to name a folder.
+        const auto nowhere = terminal_command_in("xfce4-terminal", "claude", {});
+        check_eq(nowhere.size(), std::size_t{3}, "no directory means no directory flag");
+
+        check(terminal_command_in("", "claude", dir).empty(), "no terminal, no command");
+        check(terminal_command_in("xfce4-terminal", "", dir).empty(),
+              "and no program, no command");
+
+        // A bare terminal in a folder. Same directory flags, no trailing program --
+        // and crucially no dangling "-e" with nothing after it, which is a terminal
+        // that opens and immediately exits.
+        const auto bare = terminal_here("xfce4-terminal", dir);
+        check_eq(bare.size(), std::size_t{2}, "a bare terminal is two arguments");
+        check(has(bare, "--working-directory=/tmp/project"), "still told where to start");
+        check(!has(bare, "-e"), "and given nothing to run");
+
+        check_eq(terminal_here("xterm", dir).size(), std::size_t{1},
+                 "a terminal with no directory flag is just itself");
+        check(!has(terminal_here("gnome-terminal", dir), "--"),
+              "and no trailing -- either");
+        check(terminal_here("", dir).empty(), "no terminal, nothing to run");
+
+        // ---- commands that have ARGUMENTS ----
+        //
+        // This is where the terminal that is most likely to be installed differs
+        // from every other one, and it fails hard rather than oddly: xfce4-terminal
+        // -e takes a single string, so `-e ollamadev index build` exits with
+        // `Unknown option "index"` and opens no window at all.
+        const std::vector<std::string> multi{"ollamadev", "index", "build"};
+
+        const auto xfce_multi = terminal_command_argv("xfce4-terminal", multi, dir);
+        check(has(xfce_multi, "-x"), "xfce4-terminal needs -x for a command with arguments");
+        check(!has(xfce_multi, "-e"), "never -e, which would swallow only the first word");
+        check_eq(xfce_multi.size(), std::size_t{6},
+                 "terminal, directory, -x, and all three command words");
+        if (xfce_multi.size() == 6) {
+            check_eq(xfce_multi[3], std::string("ollamadev"), "the program");
+            check_eq(xfce_multi[4], std::string("index"),     "then its arguments");
+            check_eq(xfce_multi[5], std::string("build"),     "in order");
+        }
+
+        const auto gnome_multi = terminal_command_argv("gnome-terminal", multi, dir);
+        check_eq(gnome_multi.back(), std::string("build"), "gnome-terminal keeps them too");
+        check(has(gnome_multi, "--"), "after its --");
+
+        const auto kitty_multi = terminal_command_argv("kitty", multi, dir);
+        check_eq(kitty_multi.back(), std::string("build"), "and kitty takes them bare");
+        check(!has(kitty_multi, "-e") && !has(kitty_multi, "-x"),
+              "with no separator at all");
+
+        check(terminal_command_argv("xfce4-terminal", {}, dir).empty(),
+              "an empty command runs nothing");
+        check(terminal_command_argv("", multi, dir).empty(), "and so does no terminal");
+    }
+
+    // ---- the engine's own state words ----
+    //
+    // These were GUESSED at before, and guessed wrong: the lanes looked for
+    // "running", "active" and "working", none of which ollamadev ever writes. Every
+    // coder in flight therefore sat in To do and the board did not move until the
+    // work was finished. The real vocabulary is ollamadev-qt's CoderPane:
+    // todo / doing / done / held / flagged.
+    {
+        const auto lane = [](const char* state) {
+            CrewSubtask s;
+            s.state = state;
+            return crew_lane_of(s);
+        };
+        check(lane("todo")  == CrewLane::Todo,  "todo is to do");
+        check(lane("doing") == CrewLane::Doing, "doing is in flight");
+        check(lane("done")  == CrewLane::Done,  "done is done");
+
+        // Held gets its OWN column, and flagged is Doing. This is ollamadev-qt's
+        // BoardPane mapping rather than a reading of our own: two front ends onto
+        // one engine must not disagree about what a state means. Auspex first put
+        // both in Done, which made a run needing a decision look finished.
+        check(lane("held")    == CrewLane::Held,  "held is its own column");
+        check(lane("flagged") == CrewLane::Doing, "flagged is still in flight");
+
+        // The default is Doing, not To do: an unrecognised state came from an
+        // engine that is doing something, so calling it not-started understates a
+        // live run. Only a state that is genuinely absent means not-started.
+        check(lane("some-new-state") == CrewLane::Doing,
+              "a word the engine adds later reads as in flight");
+        check(lane("") == CrewLane::Todo, "but nothing recorded has not started");
+
+        CrewSubtask held;    held.state = "held";
+        CrewSubtask flagged; flagged.state = "flagged";
+        check(crew_subtask_held(held), "held is held");
+        check(!crew_subtask_held(flagged), "and flagged is not -- it is still working");
+    }
+
+    // Steering targets a LIVE coder. A held changeset has stopped; sending it an
+    // instruction would be talking to nobody.
+    {
+        CrewRun run;
+        run.subtasks = {
+            {1, "coder", "first",  "held",  "", "", ""},
+            {2, "coder", "second", "doing", "", "", ""},
+            {3, "coder", "third",  "todo",  "", "", ""},
+        };
+        const auto target = crew_current_subtask(run);
+        check(target.has_value(), "a running crew has something to steer");
+        if (target) check_eq(target->n, 2, "and it is the coder that is actually running");
+
+        // Nothing in flight: the next thing that will start, never a held one.
+        CrewRun waiting;
+        waiting.subtasks = {
+            {1, "coder", "first",  "held", "", "", ""},
+            {2, "coder", "second", "todo", "", "", ""},
+        };
+        const auto next = crew_current_subtask(waiting);
+        check(next.has_value(), "with nothing running, the next one is named");
+        if (next) check_eq(next->n, 2, "and it is not the held one");
+
+        CrewRun finished;
+        finished.subtasks = {{1, "coder", "only", "done", "", "", ""}};
+        check(!crew_current_subtask(finished).has_value(),
+              "a finished run has nothing to steer");
+    }
+
+    // Which model did the work, and why that one. Without this --route is a switch
+    // you can turn on and never observe.
+    {
+        CrewSubtask routed;
+        routed.backend = "ollama";
+        routed.model   = "gpt-oss:20b-cloud";
+        routed.route   = "hard";
+        check_eq(crew_subtask_model_line(routed),
+                 std::string("gpt-oss:20b-cloud · hard"), "the model and the routing note");
+
+        CrewSubtask plain;
+        plain.backend = "ollama";
+        plain.model   = "qwen2.5-coder:7b";
+        check_eq(crew_subtask_model_line(plain), std::string("qwen2.5-coder:7b"),
+                 "just the model when routing was off");
+
+        // The backend stands in when the model is unknown, rather than showing a
+        // blank line where a name should be.
+        CrewSubtask backend_only;
+        backend_only.backend = "ollama";
+        check_eq(crew_subtask_model_line(backend_only), std::string("ollama"),
+                 "the backend when the model is not recorded");
+
+        check(crew_subtask_model_line({}).empty(), "and nothing when neither is");
+    }
+
+    // The fields have to survive the parse, or everything above is testing a
+    // struct nobody fills in.
+    {
+        const auto run = parse_crew_run(R"({
+            "active": true, "runId": "crew_1", "task": "t",
+            "subtasks": [{"n":1,"role":"coder","title":"x","state":"doing",
+                          "backend":"ollama","model":"gpt-oss:20b-cloud","route":"hard"}]
+        })");
+        check_eq(run.subtasks.size(), std::size_t{1}, "the subtask parses");
+        if (!run.subtasks.empty()) {
+            check_eq(run.subtasks[0].model, std::string("gpt-oss:20b-cloud"),
+                     "with its model");
+            check_eq(run.subtasks[0].route, std::string("hard"), "and its routing note");
+            check_eq(run.subtasks[0].backend, std::string("ollama"), "and its backend");
+        }
+    }
+
+    // ---- backends, and fanning one prompt across them ----
+    {
+        // Real output, header and trailing prose included.
+        const std::string listing =
+            "Backend        Installed  Native tools  Concurrency\n"
+            "─────────────────────────────────────────────────────\n"
+            "Ollama         yes        yes           2 local / 8 cloud\n"
+            "Claude Code    yes        own loop      4\n"
+            "Cursor Agent   yes        own loop      4\n"
+            "Aider          —          own loop      —\n"
+            "\n"
+            "'own loop' means the CLI does its own agentic work and its own file edits;\n"
+            "we hand it a subtask and let it run.\n";
+
+        const auto backends = parse_backends(listing);
+        check_eq(backends.size(), std::size_t{4},
+                 "four backends, and neither the header nor the prose");
+
+        const auto find = [&backends](const std::string& id) -> const Backend* {
+            for (const auto& b : backends) if (b.id == id) return &b;
+            return nullptr;
+        };
+
+        check(find("ollama") && find("ollama")->installed, "Ollama is installed");
+        check(find("claude") && find("claude")->installed, "Claude Code is installed");
+        check(find("aider")  && !find("aider")->installed,
+              "an em dash means not installed, not installed-with-a-funny-name");
+
+        // The ID IS NOT THE LABEL. This is the check that matters: lower-casing and
+        // hyphenating "Cursor Agent" happens to give the right id, and doing the
+        // same to "Gemini CLI" gives "gemini-cli", which --backend does not accept.
+        check(find("cursor-agent") != nullptr,
+              "\"Cursor Agent\" maps to the id --backend actually takes");
+        const auto gemini = parse_backends("Gemini CLI     yes        own loop      4\n");
+        check_eq(gemini.size(), std::size_t{1}, "Gemini CLI is recognised");
+        if (!gemini.empty()) {
+            check_eq(gemini[0].id, std::string("gemini"),
+                     "and its id is gemini, NOT gemini-cli");
+        }
+
+        check(parse_backends("").empty(), "no output, no backends");
+        check(parse_backends("Nonsense Backend  yes\n").empty(),
+              "a label with no id is skipped rather than guessed at");
+
+        // The command a ticked box builds.
+        const auto argv = backend_prompt_command("claude", "add a test for greet()");
+        check_eq(argv.size(), std::size_t{4}, "four arguments");
+        if (argv.size() == 4) {
+            check_eq(argv[0], std::string("ollamadev"), "the engine");
+            check_eq(argv[1], std::string("--backend"), "the flag");
+            check_eq(argv[2], std::string("claude"),    "the id");
+            check_eq(argv[3], std::string("add a test for greet()"),
+                     "and the prompt, whole and last");
+        }
+
+        const auto hostile = backend_prompt_command("claude", "fix \"it\"; rm -rf /");
+        check_eq(hostile.size(), std::size_t{4}, "a hostile prompt is still one argument");
+        if (hostile.size() == 4) {
+            check_eq(hostile[3], std::string("fix \"it\"; rm -rf /"), "kept verbatim");
+        }
+
+        check(backend_prompt_command("", "hello").empty(), "no backend, no command");
+        check(backend_prompt_command("claude", "").empty(), "no prompt, no command");
+        check(backend_prompt_command("claude", "   ").empty(), "and whitespace is no prompt");
+    }
+
+    // ---- the brain ----
+    {
+        check_eq(router_tiers().size(), std::size_t{3}, "three difficulty tiers");
+
+        check(router_get_command("hard") ==
+                  std::vector<std::string>{"ollamadev", "config", "get", "router.hard"},
+              "reading a tier");
+        check(router_set_command("simple", "qwen3.5:2b") ==
+                  std::vector<std::string>{"ollamadev", "config", "set", "router.simple",
+                                           "qwen3.5:2b"},
+              "and writing one");
+        check(router_get_command("").empty(), "no tier, no command");
+        check(router_set_command("hard", "").empty(), "and no model, no command");
+
+        // The probe must NOT run anything -- it answers a question about where work
+        // would go, and --run would turn that into work getting done.
+        const auto probe = route_command("rename a variable");
+        check_eq(probe.size(), std::size_t{3}, "the probe is three arguments");
+        check(std::find(probe.begin(), probe.end(), "--run") == probe.end(),
+              "and never --run: asking where is not the same as going there");
+        check(route_command("").empty(), "nothing to route, no command");
+
+        // Real output.
+        const auto decision =
+            parse_route("→ simple  ollama:gpt-oss:20b-cloud  (short lookup-style question)\n");
+        check_eq(decision.tier, std::string("simple"), "the tier");
+        check_eq(decision.model, std::string("ollama:gpt-oss:20b-cloud"),
+                 "the model, backend prefix and all");
+        check_eq(decision.reason, std::string("short lookup-style question"),
+                 "and the reason, without its brackets");
+
+        // A reason containing spaces must not become extra fields -- which is why
+        // it is taken off before the rest is split.
+        const auto spaced = parse_route("→ hard  minimax-m3:cloud  (needs design and care)\n");
+        check_eq(spaced.model, std::string("minimax-m3:cloud"), "a spaced reason is not a field");
+        check_eq(spaced.reason, std::string("needs design and care"), "it is the reason");
+
+        check(parse_route("").tier.empty(), "no output, no decision");
+        check(parse_route("something went wrong\n").tier.empty(),
+              "and a line that is not an answer is not read as one");
+    }
+
+    // ---- what it cost ----
+    {
+        // A suffix test, not a substring one: a local model called "cloudy-7b" is
+        // not hosted, and counting it as such would misreport the one number this
+        // line exists to give -- how much stayed on the machine.
+        check(is_cloud_model("gpt-oss:20b-cloud"), "-cloud is hosted");
+        check(is_cloud_model("kimi-k3:cloud"),     "and so is :cloud");
+        check(is_cloud_model("GPT-OSS:20B-CLOUD"), "case does not matter");
+        check(!is_cloud_model("qwen3.5:9b"),       "a plain tag is local");
+        check(!is_cloud_model("cloudy-7b"),        "and so is one that merely mentions cloud");
+        check(!is_cloud_model("cloud-llama:7b"),   "including at the front");
+        check(!is_cloud_model(""),                 "nothing is not hosted");
+
+        // Real usage.json.
+        const auto usage = parse_usage(R"({
+            "models": {
+                "gpt-oss:20b-cloud": {"eval": 2535, "prompt": 57855, "turns": 15},
+                "qwen3.5:9b":        {"eval": 500,  "prompt": 9500,  "turns": 3}
+            },
+            "total_eval": 3035, "total_prompt": 67355, "turns": 18,
+            "updated_at": "2026-07-31T00:14:09"
+        })");
+        check(usage.known, "the file parses");
+        check_eq(usage.cloud, 60390LL, "cloud is prompt + eval, not eval alone");
+        check_eq(usage.local, 10000LL, "and so is local");
+        check_eq(usage.turns, 18, "turns come from the top level");
+
+        // Prompt tokens dwarf generated ones, so counting only what came back
+        // would understate a long context by an order of magnitude -- which is
+        // exactly where the local/cloud question matters most.
+        check(usage.cloud > 20 * 2535, "prompt tokens dominate, and are counted");
+
+        const std::string summary = usage_summary(usage);
+        check(summary.find("70.4k tokens") != std::string::npos, "the total, in thousands");
+        check(summary.find("14% local") != std::string::npos, "the local share");
+        check(summary.find("86% cloud") != std::string::npos, "and the rest is cloud");
+
+        // The two percentages always add to 100: the second is derived from the
+        // first rather than computed separately, so they cannot round apart.
+        const auto thirds = parse_usage(
+            R"({"models":{"a:cloud":{"prompt":1,"eval":0},"b":{"prompt":2,"eval":0}}})");
+        const std::string split = usage_summary(thirds);
+        check(split.find("66% local") != std::string::npos, "two thirds local");
+        check(split.find("34% cloud") != std::string::npos,
+              "and the remainder, so they still sum to 100");
+
+        check(usage_summary({}).empty(), "nothing recorded, nothing to say");
+        check(!parse_usage("nonsense").known, "garbage is not a usage file");
+        check(parse_usage(R"({"models":{}})").known, "an empty one is still a file");
+        check(usage_summary(parse_usage(R"({"models":{}})")).empty(),
+              "but it has nothing to report");
+
+        // Small totals are not forced into thousands.
+        const auto small = parse_usage(R"({"models":{"a":{"prompt":40,"eval":10}}})");
+        check(usage_summary(small).find("50 tokens") != std::string::npos,
+              "a small total is given exactly");
+
+        check(usage_path("/tmp/p") ==
+                  std::filesystem::path("/tmp/p/.ollamadev/costs/usage.json"),
+              "usage lives in the project, not in $HOME");
+        check(usage_path("").empty(), "and nowhere without one");
+    }
+
+    // Model names, for the tier pickers.
+    {
+        const auto models = parse_models(
+            "  qwen3.5:397b-cloud\n"
+            "  gpt-oss:20b-cloud\n"
+            "  minimax-m3:cloud\n");
+        check_eq(models.size(), std::size_t{3}, "three models");
+        if (models.size() == 3) {
+            check_eq(models[0], std::string("qwen3.5:397b-cloud"), "trimmed of indent");
+        }
+        // A heading has a space in it; a model name never does. One of these ends up
+        // on a command line, so the distinction is not cosmetic.
+        check(parse_models("Available models:\n  gpt-oss:latest\n").size() == 1,
+              "a heading is not a model");
+        check(parse_models("").empty(), "no output, no models");
+    }
+
+    // ---- the everyday engine flows ----
+    //
+    // The same set ollamadev-qt puts on its Start pane. Every argv is a fixed
+    // literal here, so nothing typed or spoken can reach a process through them.
+    {
+        const auto& actions = engine_actions();
+        check(!actions.empty(), "there are everyday engine flows to offer");
+        for (const auto& action : actions) {
+            check(!action.label.empty(), "each flow is named");
+            check(!action.tooltip.empty(), action.label + " says what it does");
+            check(!action.argv.empty(), action.label + " has a command");
+            if (!action.argv.empty()) {
+                check_eq(action.argv.front(), std::string("ollamadev"),
+                         action.label + " runs the engine and nothing else");
+            }
+        }
+    }
+
+    // The agent table routes through the same builder, so there is one copy of the
+    // terminal quirks rather than two that drift.
+    {
+        const auto agents = known_agents();
+        const bool has_ollamadev =
+            std::any_of(agents.begin(), agents.end(),
+                        [](const AgentTool& a) { return a.key == "ollamadev"; });
+        check(has_ollamadev, "ollamadev is an agent you can open, not only run");
+
+        const auto resolved = resolve_agent("open ollamadev");
+        check(resolved.has_value(), "and it resolves by name");
+        if (resolved) check_eq(resolved->binary, std::string("ollamadev"), "to its binary");
+
+        const AgentTool claude{"claude", "Claude Code", "claude", ""};
+        const auto with_dir = agent_terminal_command("xfce4-terminal", claude, "/tmp");
+        check(std::find(with_dir.begin(), with_dir.end(), "--working-directory=/tmp") !=
+                  with_dir.end(),
+              "an agent carries its directory onto the command line");
+
+        // An agent with a resolved path puts the ABSOLUTE path on the command line,
+        // not the bare name. This is what survives a terminal that spawns its
+        // window from a server process holding a different PATH -- the failure that
+        // opened an empty window and looked like the agent crashing on startup.
+        const AgentTool with_path{"claude", "Claude Code", "claude", "/opt/x/claude"};
+        const auto absolute = agent_terminal_command("xfce4-terminal", with_path, "/tmp");
+        check_eq(absolute.back(), std::string("/opt/x/claude"),
+                 "a resolved agent is launched by absolute path");
+        check_eq(with_dir.back(), std::string("claude"),
+                 "and an unresolved one still falls back to its name");
+    }
+
+    // ---- finding an agent the login PATH cannot see ----
+    //
+    // The panel is started by the display manager, never by a login shell, so its
+    // PATH is missing everything nvm/bun/deno/cargo append to a profile. Agents
+    // installed by those were invisible to the shell that exists to launch them.
+    {
+        check(!agent_search_dirs().empty(),
+              "there are extra directories to search beyond $PATH");
+
+        // Every entry is absolute. A relative one would resolve against the panel's
+        // own working directory, which is whatever the session manager handed it.
+        const bool all_absolute =
+            std::all_of(agent_search_dirs().begin(), agent_search_dirs().end(),
+                        [](const std::filesystem::path& p) { return p.is_absolute(); });
+        check(all_absolute, "and all of them are absolute");
+
+        // Anything found is found as a real file, and $PATH still wins.
+        check(resolve_agent_binary("definitely-not-a-real-agent-xyz").empty(),
+              "an agent that does not exist resolves to nothing");
+
+        const std::string sh = resolve_agent_binary("sh");
+        check(!sh.empty(), "one that does resolves to a path");
+        if (!sh.empty()) {
+            check(std::filesystem::exists(sh), "which exists");
+            check(std::filesystem::path(sh).is_absolute(), "and is absolute");
+        }
+
+        // available_agents() only returns agents it could actually locate, and
+        // every one it returns carries the path it found.
+        for (const auto& agent : available_agents()) {
+            check(!agent.path.empty(), agent.label + " reports where it was found");
+            check(std::filesystem::exists(agent.path), "and it is really there");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sandboxes and changesets — the half of a crew that touches your files
+// ---------------------------------------------------------------------------
+//
+// Nothing here involves a language model, which is the point: capture and apply
+// are pure file operations, so the dangerous part of running a crew can be tested
+// exhaustively without one ever running.
+void test_sandbox() {
+    using namespace auspex;
+    std::cout << "\nsandboxes and changesets\n";
+
+    // ---- the path guard ----
+    //
+    // This is the check standing between a filename a language model chose and an
+    // open() on the user's disk. Everything else in this file is correctness; this
+    // is containment, so it is tested against the ways out that actually work
+    // rather than against the obvious one only.
+    {
+        const std::filesystem::path base = "/tmp/auspex-test-project";
+
+        check(safe_join(base, "src/main.cpp").has_value(), "an ordinary path joins");
+        check(safe_join(base, "./src/main.cpp").has_value(), "a leading ./ is fine");
+
+        check(!safe_join(base, "../outside").has_value(), "a leading .. is refused");
+        check(!safe_join(base, "src/../../outside").has_value(),
+              "and so is one buried in the middle");
+        check(!safe_join(base, "a/../b").has_value(),
+              "even a .. that comes back inside -- there is no honest use for it here");
+        check(!safe_join(base, "/etc/passwd").has_value(), "an absolute path is refused");
+        check(!safe_join(base, "").has_value(), "and so is nothing");
+        check(!safe_join(base, ".").has_value(), "and so is the project itself");
+
+        // The excludes are enforced on WRITE too, not only on copy. Without this a
+        // changeset naming ".git/config" would be applied into the real repository.
+        check(!safe_join(base, ".git/config").has_value(),
+              "a changeset cannot write into .git");
+        check(!safe_join(base, "src/node_modules/x.js").has_value(),
+              "nor into an excluded directory anywhere in the path");
+    }
+
+    // ---- splitting into lines ----
+    //
+    // Where the off-by-one lives. A trailing newline does not create an empty last
+    // line; the absence of one has to be remembered.
+    {
+        bool bare = false;
+        auto lines = diff_lines("a\nb\n", &bare);
+        check_eq(lines.size(), std::size_t{2}, "a trailing newline makes no empty line");
+        check(!bare, "and the file is not bare");
+
+        lines = diff_lines("a\nb", &bare);
+        check_eq(lines.size(), std::size_t{2}, "two lines either way");
+        check(bare, "but this one has no final newline");
+
+        lines = diff_lines("", &bare);
+        check(lines.empty(), "an empty file has no lines");
+
+        lines = diff_lines("\n", &bare);
+        check_eq(lines.size(), std::size_t{1}, "a lone newline is one empty line");
+    }
+
+    // ---- the diff ----
+    {
+        const std::string before = "one\ntwo\nthree\n";
+        const std::string after  = "one\nTWO\nthree\n";
+        const std::string diff   = unified_diff("f.txt", before, after);
+
+        check(diff.rfind("diff --git a/f.txt b/f.txt\n", 0) == 0, "it starts with the header");
+        check(diff.find("--- a/f.txt\n+++ b/f.txt\n") != std::string::npos, "then the file lines");
+        check(diff.find("\n-two\n") != std::string::npos, "the old line is removed");
+        check(diff.find("\n+TWO\n") != std::string::npos, "the new one added");
+        check(diff.find("@@ -") != std::string::npos, "and there is a hunk header");
+
+        // The diff must agree with the classifier the board already renders with,
+        // or a patch would be coloured as though it did something else.
+        const DiffStat stat = diff_stat(diff);
+        check_eq(stat.added, 1, "one line added, by the existing counter");
+        check_eq(stat.removed, 1, "and one removed");
+
+        // Identical files produce a header and nothing else -- NOT an empty string,
+        // because a caller concatenating diffs still wants to see the file named.
+        const std::string same = unified_diff("f.txt", before, before);
+        check(same.find("@@") == std::string::npos, "no hunks when nothing changed");
+
+        // New and deleted files need their mode lines, or `git apply` rejects the
+        // patch under -p1 rather than creating the file.
+        const std::string created = unified_diff("new.txt", "", "hello\n");
+        check(created.find("new file mode 100644") != std::string::npos,
+              "a new file says so");
+        check(created.find("--- /dev/null") != std::string::npos, "and comes from nowhere");
+
+        const std::string removed = unified_diff("gone.txt", "hello\n", "");
+        check(removed.find("deleted file mode 100644") != std::string::npos,
+              "a deleted file says so");
+        check(removed.find("+++ /dev/null") != std::string::npos, "and goes nowhere");
+
+        // A file whose ONLY change is losing its final newline must still diff.
+        // Interning without a distinct identity for a bare last line makes this
+        // produce nothing at all.
+        const std::string newline_only = unified_diff("f.txt", "a\nb\n", "a\nb");
+        check(newline_only.find("@@") != std::string::npos,
+              "losing the final newline is a change");
+        check(newline_only.find("\\ No newline at end of file") != std::string::npos,
+              "and it is marked the way patch expects");
+
+        // Context: an edit in a large file produces a small hunk, not the file.
+        std::string big_before, big_after;
+        for (int i = 0; i < 200; ++i) {
+            big_before += "line " + std::to_string(i) + "\n";
+            big_after  += (i == 100 ? "CHANGED\n" : "line " + std::to_string(i) + "\n");
+        }
+        const std::string big = unified_diff("big.txt", big_before, big_after);
+        check(split_lines(big).size() < 20u, "one edit in 200 lines is a small diff");
+        check_eq(diff_stat(big).added, 1, "with exactly one addition");
+        check_eq(diff_stat(big).removed, 1, "and one removal");
+
+        // Two separate edits are two hunks, not one spanning the whole file.
+        std::string two_after = big_before;
+        {
+            std::string rebuilt;
+            int i = 0;
+            for (const auto& line : split_lines(big_before)) {
+                rebuilt += (i == 10 || i == 150) ? "EDIT\n" : line + "\n";
+                ++i;
+            }
+            two_after = rebuilt;
+        }
+        const std::string two = unified_diff("big.txt", big_before, two_after);
+        int hunks = 0;
+        for (const auto& line : split_lines(two)) {
+            if (line.rfind("@@", 0) == 0) ++hunks;
+        }
+        check_eq(hunks, 2, "two distant edits make two hunks");
+    }
+
+    // ---- capture and apply, against a real tree ----
+    {
+        const auto root = std::filesystem::temp_directory_path() / "auspex-selftest-crew";
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+
+        const auto project = root / "project";
+        const auto sandbox = root / "sandbox";
+        std::filesystem::create_directories(project / "src", ec);
+
+        const auto put = [](const std::filesystem::path& p, const std::string& text) {
+            std::error_code e;
+            std::filesystem::create_directories(p.parent_path(), e);
+            std::ofstream(p) << text;
+        };
+        const auto slurp = [](const std::filesystem::path& p) {
+            std::ifstream in(p);
+            std::ostringstream out;
+            out << in.rdbuf();
+            return out.str();
+        };
+
+        put(project / "src" / "main.cpp", "int main() {}\n");
+        put(project / "README.md", "hello\n");
+        // Things that must never be copied or captured.
+        put(project / ".git" / "config", "[core]\n");
+        put(project / "__pycache__" / "x.pyc", "cached\n");
+
+        std::string error;
+        check(create_sandbox(project, sandbox, &error),
+              "a sandbox is made from the project");
+
+        check(std::filesystem::exists(sandbox / "src" / "main.cpp"),
+              "source files are copied in");
+        check(!std::filesystem::exists(sandbox / ".git"),
+              ".git is not -- a coder must not be able to reach the real history");
+        check(!std::filesystem::exists(sandbox / "__pycache__"),
+              "and neither are caches, which a coder that runs its work creates");
+
+        // Nothing done yet: no changeset.
+        check(capture_changeset(project, sandbox).empty(),
+              "an untouched sandbox has changed nothing");
+
+        // Now the coder works.
+        put(sandbox / "src" / "main.cpp", "int main() { return 0; }\n");
+        put(sandbox / "src" / "extra.cpp", "// new\n");
+        std::filesystem::remove(sandbox / "README.md", ec);
+        // A cache the coder created by running its own work. This is exactly what
+        // the excludes exist for: without them it lands in the user's project.
+        put(sandbox / "__pycache__" / "y.pyc", "junk\n");
+
+        const Changeset changeset = capture_changeset(project, sandbox);
+        check_eq(changeset.files.size(), std::size_t{3},
+                 "one edit, one addition, one deletion -- and no cache");
+
+        const auto named = [&changeset](const std::string& path) -> const ChangedFile* {
+            for (const auto& f : changeset.files) if (f.path == path) return &f;
+            return nullptr;
+        };
+        check(named("src/main.cpp") != nullptr, "the edited file is in it");
+        check(named("src/extra.cpp") != nullptr, "the new one too");
+        check(named("README.md") && named("README.md")->deleted,
+              "and the deleted one is marked deleted");
+        check(named("__pycache__/y.pyc") == nullptr,
+              "the cache the coder left behind is not captured");
+
+        check(changeset.diff.find("+int main() { return 0; }") != std::string::npos,
+              "the diff shows the edit");
+        check(changeset.diff.find("new file mode") != std::string::npos,
+              "and the addition");
+
+        // Applying puts it into the project.
+        std::vector<std::string> wrote;
+        check(apply_changeset(changeset, project, &wrote, &error),
+              "the changeset applies");
+        check_eq(wrote.size(), std::size_t{3}, "three paths written");
+        check_eq(slurp(project / "src" / "main.cpp"),
+                 std::string("int main() { return 0; }\n"), "the edit landed");
+        check(std::filesystem::exists(project / "src" / "extra.cpp"), "the new file landed");
+        check(!std::filesystem::exists(project / "README.md"), "and the deletion took");
+        check(std::filesystem::exists(project / ".git" / "config"),
+              ".git is untouched by an apply");
+
+        // A hostile changeset is refused WHOLE. The safe file must not be written
+        // either -- a half-applied changeset is a state nobody asked for.
+        Changeset hostile;
+        hostile.files.push_back({"safe.txt", "ok\n", false});
+        hostile.files.push_back({"../escaped.txt", "pwned\n", false});
+        error.clear();
+        check(!apply_changeset(hostile, project, nullptr, &error),
+              "a changeset that escapes the project is refused");
+        check(!error.empty(), "and says why");
+        check(!std::filesystem::exists(project / "safe.txt"),
+              "including the safe file beside it -- all or nothing");
+        check(!std::filesystem::exists(root / "escaped.txt"), "nothing escaped");
+
+        check(destroy_sandbox(sandbox), "the sandbox is removed");
+        check(!std::filesystem::exists(sandbox), "and is gone");
+        check(!destroy_sandbox("relative/path"),
+              "a relative sandbox path is refused -- it would delete under the cwd");
+
+        std::filesystem::remove_all(root, ec);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The Director
+// ---------------------------------------------------------------------------
+//
+// Reading the reply is the part that decides how many coders really run, so it is
+// tested against the shapes models actually produce rather than only the one asked
+// for. A mis-parse here does not throw -- it silently plans the wrong job.
+void test_director() {
+    using namespace auspex;
+    std::cout << "\ndirector\n";
+
+    // ---- the prompt ----
+    {
+        const std::string prompt =
+            director_prompt("add rate limiting", {"src/main.cpp", "README.md"}, 4);
+        check(prompt.find("add rate limiting") != std::string::npos, "the task is in it");
+        check(prompt.find("src/main.cpp") != std::string::npos, "and the file listing");
+        check(prompt.find("At most 4") != std::string::npos, "and the cap");
+        check(prompt.find("coder") != std::string::npos, "and the roles it may use");
+        // The parallelism constraint is the whole reason a Director exists; a plan
+        // whose pieces depend on each other cannot be run by coders in separate
+        // copies of the project.
+        check(prompt.find("parallel") != std::string::npos,
+              "and that the pieces run in parallel");
+        check(prompt.find("must not edit the same file") != std::string::npos,
+              "and must not collide");
+
+        // A truncated listing says so. A Director that believes it has seen the
+        // whole project plans as though it has.
+        std::vector<std::string> many;
+        for (int i = 0; i < 500; ++i) many.push_back("f" + std::to_string(i) + ".cpp");
+        const std::string big = director_prompt("t", many, 4);
+        check(big.find("more files not listed") != std::string::npos,
+              "a large project says the listing was cut");
+        check(big.size() < 40000u, "and the prompt stays a sane size");
+    }
+
+    // ---- pulling JSON out of a reply ----
+    {
+        check_eq(extract_json(R"({"a":1})"), std::string(R"({"a":1})"), "bare JSON");
+        check_eq(extract_json("here you go:\n{\"a\":1}\nhope that helps"),
+                 std::string(R"({"a":1})"), "JSON with prose around it");
+        check_eq(extract_json("```json\n{\"a\":1}\n```"), std::string(R"({"a":1})"),
+                 "JSON in a fence");
+        check_eq(extract_json("[1,2]"), std::string("[1,2]"), "a bare array");
+
+        // Balanced, not "up to the last brace": prose after the JSON containing a
+        // brace would otherwise be swallowed and the whole thing fail to parse.
+        check_eq(extract_json("{\"a\":1} and then } stray"), std::string(R"({"a":1})"),
+                 "a stray brace afterwards is not swallowed");
+        // A brace inside a string is not structure.
+        check_eq(extract_json(R"({"a":"}"})"), std::string(R"({"a":"}"})"),
+                 "a brace inside a string is not a close");
+        check_eq(extract_json(R"({"a":"\""})"), std::string(R"({"a":"\""})"),
+                 "and neither is an escaped quote");
+
+        check(extract_json("no json here").empty(), "prose alone yields nothing");
+        check(extract_json("").empty(), "and so does nothing");
+    }
+
+    // ---- reading a plan ----
+    {
+        const Plan plan = parse_plan(R"({
+            "summary": "add a limiter and test it",
+            "subtasks": [
+                {"role": "coder",  "title": "middleware", "detail": "write it"},
+                {"role": "tester", "title": "tests",      "detail": "cover it"}
+            ]})", 4);
+        check(plan.ok(), "a well-formed plan is read");
+        check_eq(plan.summary, std::string("add a limiter and test it"), "with its summary");
+        check_eq(plan.subtasks.size(), std::size_t{2}, "and both pieces");
+        if (plan.subtasks.size() == 2) {
+            check_eq(plan.subtasks[0].n, 1, "numbered from one");
+            check_eq(plan.subtasks[1].n, 2, "densely");
+            check_eq(plan.subtasks[1].role, std::string("tester"), "roles kept");
+        }
+
+        // The cap is enforced on the REPLY, not just requested in the prompt. Each
+        // extra piece is a coder that would really run.
+        const Plan capped = parse_plan(R"({"subtasks":[
+            {"title":"a"},{"title":"b"},{"title":"c"},{"title":"d"},{"title":"e"}]})", 2);
+        check_eq(capped.subtasks.size(), std::size_t{2}, "a model that overshoots is cut");
+
+        // An unknown role is not passed through -- it reaches prompts and routing.
+        const Plan odd = parse_plan(
+            R"({"subtasks":[{"role":"wizard","title":"x"}]})", 4);
+        check_eq(odd.subtasks.size(), std::size_t{1}, "the piece survives");
+        if (!odd.subtasks.empty()) {
+            check_eq(odd.subtasks[0].role, std::string("coder"),
+                     "but an invented role becomes coder");
+        }
+
+        // Shapes models actually produce.
+        check(parse_plan(R"([{"title":"a"}])", 4).ok(), "a bare array works");
+        check(parse_plan(R"({"tasks":[{"title":"a"}]})", 4).ok(), "so does \"tasks\"");
+        check(parse_plan(R"({"subtasks":["do the thing"]})", 4).ok(),
+              "and a list of plain strings");
+        const Plan named = parse_plan(
+            R"({"subtasks":[{"name":"x","description":"y"}]})", 4);
+        check(named.ok(), "name/description are accepted as title/detail");
+
+        // Numbering stays dense when a piece is dropped, because those numbers are
+        // what accept and discard act on.
+        const Plan sparse = parse_plan(
+            R"({"subtasks":[{"title":"a"},{"title":""},{"title":"c"}]})", 4);
+        check_eq(sparse.subtasks.size(), std::size_t{2}, "an empty piece is dropped");
+        if (sparse.subtasks.size() == 2) {
+            check_eq(sparse.subtasks[1].n, 2, "and the numbers close up behind it");
+        }
+
+        // Failures are distinguishable from an empty plan.
+        check(!parse_plan("I cannot help with that", 4).ok(), "prose is not a plan");
+        check(!parse_plan(R"({"summary":"nothing to do"})", 4).ok(),
+              "a plan with no pieces is an error, not an empty run");
+        check(!parse_plan("{ broken", 4).ok(), "and malformed JSON is refused");
+        check(!parse_plan("", 4).ok(), "and so is nothing");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The coder loop
+// ---------------------------------------------------------------------------
+//
+// The loop itself needs a model, but the two halves that decide what it DOES --
+// reading a reply into a call, and running that call against a sandbox -- do not.
+// Those are where a mistake writes the wrong file, so that is where the checks go.
+void test_coder() {
+    using namespace auspex;
+    std::cout << "\ncoder loop\n";
+
+    // ---- naming the verbs ----
+    {
+        check(tool_from_name("read")   == CoderTool::Read,   "read");
+        check(tool_from_name("write")  == CoderTool::Write,  "write");
+        check(tool_from_name("list")   == CoderTool::List,   "list");
+        check(tool_from_name("delete") == CoderTool::Delete, "delete");
+        check(tool_from_name("finish") == CoderTool::Finish, "finish");
+        check(tool_from_name("WRITE")  == CoderTool::Write,  "case does not matter");
+        check(tool_from_name(" read ") == CoderTool::Read,   "nor does whitespace");
+
+        // Synonyms models reach for unprompted. Each maps onto a verb already in
+        // the table, so accepting them makes nothing new reachable -- it only
+        // saves a turn spent correcting spelling.
+        check(tool_from_name("read_file") == CoderTool::Read,  "read_file");
+        check(tool_from_name("cat")       == CoderTool::Read,  "cat");
+        check(tool_from_name("edit")      == CoderTool::Write, "edit");
+        check(tool_from_name("done")      == CoderTool::Finish, "done");
+
+        // Anything else is refused, not guessed at. Guessing means acting on a
+        // verb the model did not ask for.
+        check(tool_from_name("run")     == CoderTool::Unknown, "there is no run verb");
+        check(tool_from_name("shell")   == CoderTool::Unknown, "nor a shell one");
+        check(tool_from_name("bash")    == CoderTool::Unknown, "nor bash");
+        check(tool_from_name("fetch")   == CoderTool::Unknown, "nor anything networked");
+        check(tool_from_name("")        == CoderTool::Unknown, "and nothing is not a verb");
+    }
+
+    // ---- reading a reply ----
+    {
+        const ToolCall read = parse_tool_call(R"({"tool":"read","path":"src/x.py"})");
+        check(read.tool == CoderTool::Read, "a read is read");
+        check_eq(read.path, std::string("src/x.py"), "with its path");
+
+        const ToolCall write =
+            parse_tool_call(R"({"tool":"write","path":"a.py","contents":"  x = 1\n"})");
+        check(write.tool == CoderTool::Write, "a write is a write");
+        // NOT trimmed. Leading whitespace is significant in most languages this
+        // will write, and the trailing newline is the difference between a file
+        // that ends properly and one that does not.
+        check_eq(write.contents, std::string("  x = 1\n"),
+                 "contents keep their leading and trailing whitespace");
+
+        check(parse_tool_call("```json\n{\"tool\":\"list\"}\n```").tool == CoderTool::List,
+              "a fenced reply works");
+        check(parse_tool_call("Sure!\n{\"tool\":\"list\"}\n").tool == CoderTool::List,
+              "and one with prose around it");
+
+        // Alternative keys models use for the same thing.
+        check(parse_tool_call(R"({"action":"list"})").tool == CoderTool::List,
+              "\"action\" is accepted for \"tool\"");
+        check_eq(parse_tool_call(R"({"tool":"read","file":"a.py"})").path,
+                 std::string("a.py"), "and \"file\" for \"path\"");
+
+        // A verb that needs a path and has none fails as UNKNOWN, so the model is
+        // told rather than the call silently doing nothing.
+        const ToolCall pathless = parse_tool_call(R"({"tool":"write","contents":"x"})");
+        check(pathless.tool == CoderTool::Unknown, "a write with no path is refused");
+        check(!pathless.error.empty(), "and says why");
+
+        const ToolCall junk = parse_tool_call("I'll start by looking at the code.");
+        check(junk.tool == CoderTool::Unknown, "prose is not a call");
+        check(!junk.error.empty(), "and the model is told so");
+
+        const ToolCall invented = parse_tool_call(R"({"tool":"run","command":"pytest"})");
+        check(invented.tool == CoderTool::Unknown, "an invented verb is refused");
+        check(invented.error.find("run") != std::string::npos,
+              "by name, so the model can correct itself");
+    }
+
+    // ---- running a call ----
+    {
+        const auto root = std::filesystem::temp_directory_path() / "auspex-selftest-coder";
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+        const auto sandbox = root / "sandbox";
+        std::filesystem::create_directories(sandbox / "src", ec);
+        std::ofstream(sandbox / "src" / "a.py") << "x = 1\n";
+
+        const CoderLimits limits;
+        const auto call = [](CoderTool t, std::string p, std::string c = {}) {
+            ToolCall k;
+            k.tool = t;
+            k.path = std::move(p);
+            k.contents = std::move(c);
+            return k;
+        };
+
+        const ToolResult listed = run_tool(call(CoderTool::List, ""), sandbox, limits);
+        check(listed.ok, "list works");
+        check(listed.output.find("src/a.py") != std::string::npos, "and finds the file");
+
+        const ToolResult got = run_tool(call(CoderTool::Read, "src/a.py"), sandbox, limits);
+        check(got.ok, "read works");
+        check_eq(got.output, std::string("x = 1\n"), "and returns the contents");
+
+        check(!run_tool(call(CoderTool::Read, "nope.py"), sandbox, limits).ok,
+              "reading what is not there fails");
+
+        const ToolResult wrote =
+            run_tool(call(CoderTool::Write, "src/b.py", "y = 2\n"), sandbox, limits);
+        check(wrote.ok, "write works");
+        check(std::filesystem::exists(sandbox / "src" / "b.py"), "and the file appears");
+
+        // Creating through a directory that does not exist yet.
+        check(run_tool(call(CoderTool::Write, "deep/new/c.py", "z\n"), sandbox, limits).ok,
+              "write creates missing directories");
+
+        // ---- containment ----
+        //
+        // The sandbox is a throwaway copy, but a copy is not a jail: "../.." walks
+        // out of the temp directory into the real filesystem exactly as it would
+        // anywhere else. These are the checks that stop it.
+        const ToolResult escape =
+            run_tool(call(CoderTool::Write, "../escaped.py", "pwned\n"), sandbox, limits);
+        check(!escape.ok, "a write above the sandbox is refused");
+        check(!std::filesystem::exists(root / "escaped.py"), "and nothing escaped");
+
+        check(!run_tool(call(CoderTool::Write, "/etc/auspex-pwned", "x"), sandbox, limits).ok,
+              "an absolute path is refused");
+        check(!std::filesystem::exists("/etc/auspex-pwned"), "and nothing was written");
+
+        check(!run_tool(call(CoderTool::Read, "../../etc/passwd"), sandbox, limits).ok,
+              "and a read cannot climb out either");
+        check(!run_tool(call(CoderTool::Write, ".git/config", "[core]"), sandbox, limits).ok,
+              "nor can a write reach .git");
+
+        // ---- deletion ----
+        check(run_tool(call(CoderTool::Delete, "src/b.py"), sandbox, limits).ok,
+              "delete works on a file");
+        check(!std::filesystem::exists(sandbox / "src" / "b.py"), "and it is gone");
+
+        // A directory is refused. Deleting a tree by naming it is the single most
+        // destructive act available in a sandbox that later gets diffed against
+        // the real project.
+        const ToolResult dir = run_tool(call(CoderTool::Delete, "src"), sandbox, limits);
+        check(!dir.ok, "deleting a directory is refused");
+        check(std::filesystem::exists(sandbox / "src"), "and it survives");
+
+        // ---- a truncated read says so ----
+        {
+            std::string big(60'000, 'x');
+            std::ofstream(sandbox / "big.txt") << big;
+            CoderLimits small;
+            small.max_read_bytes = 100;
+            const ToolResult cut = run_tool(call(CoderTool::Read, "big.txt"), sandbox, small);
+            check(cut.ok, "a large file still reads");
+            check(cut.output.size() < 400u, "truncated");
+            // Said out loud, because a coder that thinks it saw the whole file will
+            // rewrite it from the part it saw and delete the rest.
+            check(cut.output.find("truncated") != std::string::npos,
+                  "and the coder is told it was truncated");
+        }
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- the prompt ----
+    {
+        PlannedSubtask subtask{1, "tester", "cover greet()", "write a unit test"};
+        CoderLimits limits;
+
+        const std::string first = coder_prompt(subtask, {"greet.py"}, {}, limits);
+        check(first.find("cover greet()") != std::string::npos, "the piece is named");
+        check(first.find("write a unit test") != std::string::npos, "with its detail");
+        check(first.find("greet.py") != std::string::npos, "and the file listing");
+        check(first.find("\"tool\":\"write\"") != std::string::npos, "the verbs are spelled out");
+        // The limit is stated, so a model can pace itself rather than discovering
+        // the budget by hitting it.
+        check(first.find(std::to_string(limits.max_steps)) != std::string::npos,
+              "and the step budget is stated");
+        check(first.find("cannot run commands") != std::string::npos,
+              "and that it cannot run anything");
+
+        // A write's contents are NOT replayed into the transcript: they are already
+        // on disk, and re-sending them doubles the context exactly when it is most
+        // needed.
+        CoderStep wrote;
+        wrote.call = {CoderTool::Write, "test_greet.py", std::string(5000, 'q'), "", ""};
+        wrote.result = {true, false, "written (5000 bytes)"};
+        const std::string second = coder_prompt(subtask, {"greet.py"}, {wrote}, limits);
+        check(second.find(std::string(200, 'q')) == std::string::npos,
+              "written contents are not replayed into the next prompt");
+        check(second.find("write test_greet.py") != std::string::npos,
+              "but the step is remembered");
+        check(second.size() < first.size() + 500u, "so the prompt stays small");
+    }
+}
+
 int main(int argc, char** argv) {
     const std::vector<std::string> args(argv + 1, argv + argc);
 
@@ -3923,6 +5201,84 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    // A live Director run, against the configured model and a real project.
+    //
+    // Not part of the check suite: it costs tokens and needs a model answering, so
+    // it is a thing you ask for. It is here rather than in a scratch script because
+    // "does the Director actually produce a usable plan" is the question the whole
+    // engine rests on, and it should be answerable with one command.
+    if (args.size() >= 2 && args[0] == "--plan") {
+        const std::string task = args[1];
+        const std::filesystem::path project =
+            args.size() >= 3 ? std::filesystem::path(args[2])
+                             : std::filesystem::current_path();
+
+        std::vector<std::string> files;
+        for (const auto& [path, _] : auspex::list_files(project)) files.push_back(path);
+
+        std::cout << project.string() << " — " << files.size() << " files\n";
+        std::cout << "asking " << auspex::Config::load().ollama_model << "…\n\n";
+
+        const auspex::Plan plan =
+            auspex::plan_task(auspex::Config::load(), task, files, 4);
+        if (!plan.ok()) {
+            std::cout << "  " << plan.error << "\n";
+            return 1;
+        }
+        if (!plan.summary.empty()) std::cout << plan.summary << "\n\n";
+        for (const auto& s : plan.subtasks) {
+            std::cout << "  #" << s.n << "  " << s.role << "  " << s.title << "\n";
+            if (!s.detail.empty()) std::cout << "        " << s.detail << "\n";
+        }
+        return 0;
+    }
+
+    // One coder, end to end: sandbox the project, run the loop, capture what
+    // changed. Nothing is applied -- the diff is printed and the sandbox thrown
+    // away, so this can be pointed at a real project without consequence.
+    if (args.size() >= 3 && args[0] == "--code") {
+        const std::string     task    = args[1];
+        const std::filesystem::path project = args[2];
+
+        const auto sandbox = std::filesystem::temp_directory_path() /
+                             "auspex-code-probe";
+        std::error_code ec;
+        std::filesystem::remove_all(sandbox, ec);
+
+        std::string error;
+        if (!auspex::create_sandbox(project, sandbox, &error)) {
+            std::cout << "sandbox: " << error << "\n";
+            return 1;
+        }
+
+        auspex::PlannedSubtask subtask{1, "coder", task, {}};
+        std::cout << "sandbox " << sandbox.string() << "\n"
+                  << "asking " << auspex::Config::load().ollama_model << "…\n\n";
+
+        const auspex::CoderOutcome outcome =
+            auspex::run_coder(auspex::Config::load(), subtask, sandbox);
+
+        for (std::size_t i = 0; i < outcome.steps.size(); ++i) {
+            const auto& step = outcome.steps[i];
+            std::cout << "  " << (i + 1) << ". " << auspex::tool_name(step.call.tool);
+            if (!step.call.path.empty()) std::cout << " " << step.call.path;
+            std::cout << (step.result.ok ? "  ok" : "  FAILED: " + step.result.output)
+                      << "\n";
+        }
+        std::cout << "\nfinished: " << (outcome.finished ? "yes" : "no");
+        if (!outcome.error.empty()) std::cout << "  (" << outcome.error << ")";
+        if (!outcome.note.empty()) std::cout << "\nnote: " << outcome.note;
+        std::cout << "\n\n";
+
+        const auspex::Changeset changeset =
+            auspex::capture_changeset(project, sandbox);
+        std::cout << changeset.files.size() << " files changed\n\n"
+                  << changeset.diff << "\n";
+
+        std::filesystem::remove_all(sandbox, ec);
+        return outcome.finished ? 0 : 1;
+    }
+
     if (args.size() >= 2 && args[0] == "--css") {
         std::cout << auspex::generate_css(auspex::theme_by_name(args[1]));
         return 0;
@@ -3957,6 +5313,10 @@ int main(int argc, char** argv) {
     test_zoom();
     test_board();
     test_agents();
+    test_projects();
+    test_sandbox();
+    test_director();
+    test_coder();
     test_sysmon();
 
     std::cout << "\n" << (checks - failures) << "/" << checks << " checks passed\n";

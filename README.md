@@ -84,7 +84,7 @@ cpp/build/auspex-probe command "..."        # interpret a command, do NOT run it
 cpp/build/auspex-listen --mic 5             # record and transcribe
 cpp/build/auspex-listen --devices           # list microphones
 cpp/build/auspex-say "hello"                # speak
-cpp/build/auspex-selftest                   # 167 self-checks
+cpp/build/auspex-selftest                   # 1171 self-checks
 ```
 
 `auspex-probe command` is the safe way to see how the model interprets a phrase
@@ -93,6 +93,97 @@ without anything happening.
 The panel's bottom row is: settings · ask/chat · speak-selection · hold-to-dictate ·
 terminal · continuous listening. Left-click the centre button to speak a command;
 right-click it to open the chat window.
+
+## Projects and agents
+
+**Hover the terminal button** on the bottom panel. You get the folder list, every
+coding agent installed, and the everyday `ollamadev` flows — one click deep, without
+opening a window. Left-clicking the button still just opens a terminal, as it always
+did.
+
+```
+Folder   [ Auspex ▾ ]        ← ollamadev's bookmarks + Auspex's recents
+/home/you/Documents/Auspex
+Other folder…
+─────────────────────
+Terminal here
+Claude Code · Codex · Gemini · Cursor Agent · OpenCode · OllamaDev · Qwen Code
+─────────────────────
+Crew…  Chat  Ship  Verify  Index  Doctor
+```
+
+Picking a CLI **asks which folder to open it in**, seeded from the dropdown — so the
+usual folder is one Enter away and a different one is possible without changing the
+default first. Cancelling launches nothing. `Terminal here` is the exception: it says
+where it goes, so it just goes there.
+
+The menu opens on hover after a short delay and closes about a second after you
+leave it, which matters more than tidiness: while a popover is up it holds an input
+grab, so one left open makes the panel's own right-click menu appear not to work.
+
+The same thing with more room is at right-click the panel → **Projects**, which adds
+your file manager.
+
+The bottom section mirrors [ollamadev-qt](https://github.com/kennethyork/ollamadev)'s
+Start pane, so the two front ends offer the same flows and neither is the odd one
+out. `Crew…` opens the crew window on the chosen folder rather than starting a run —
+a crew needs a task, and nothing that edits files should begin from a hover menu.
+
+The folder list is ollamadev's own bookmarks (`~/.ollamadev/workspaces.json`) plus
+Auspex's recents, so a project adopted in either program shows up in both.
+
+**Agents are found outside `$PATH` too.** The panel is started by the display
+manager, never by a login shell, so its `PATH` is missing everything nvm, bun, deno,
+cargo and friends append to a profile — which on a normal machine hides half the
+agents you have installed. Auspex searches those trees as well and launches by
+absolute path, which also immunises it against terminals that spawn their window
+from a long-lived server process holding a different environment.
+
+**Why this window exists:** every one of these tools reads and writes the tree it is
+started in, and the panel had no way to say which tree that was — it inherited its
+own working directory, which at login is `$HOME`. The folder is now chosen
+explicitly and travels with the command, both as the terminal's own
+`--working-directory` flag and as the child process's `chdir`. Neither mechanism
+covers every terminal; together they cover what people actually run.
+
+## The crew
+
+Right-click the panel → **Crew** (only shown when `ollamadev` is installed). A task,
+the brain options worth choosing, three lanes showing what the crew is doing, and
+the changesets it is holding for review — with the diff foldable inline.
+
+The engine is ollamadev: a Director decomposes the task, coders build each piece in
+its own git worktree, and an Auditor reads every diff before it lands. Auspex does
+not reimplement any of that — it builds an argv, starts it in the folder you chose,
+and reads the state files the engine already writes.
+
+The lanes are **To do / Doing / Done / Held**, with Held appearing only when
+something is held — the same mapping as ollamadev-qt's board, so the two front ends
+never disagree about what a state means. Each card names the model doing the work
+and, when `--route` is on, why that model. Coders in flight get their own steer box.
+
+## Team
+
+Right-click the panel → **Team**. Tick several providers, type one prompt, press
+Launch: each gets its own terminal running `ollamadev --backend <id> "<prompt>"` in
+the chosen folder. Providers that aren't installed are shown greyed rather than
+hidden, so the list says what the machine could do as well as what it can.
+
+## Brain
+
+Right-click the panel → **Brain**. Which model each difficulty tier routes to, and a
+probe that answers "where would this request go?" without running it. The tiers are
+read and written through `ollamadev config`, so a change here is the same change the
+Qt front end sees.
+
+Two things worth knowing before you press Accept:
+
+- **The crew edits the folder named at the top of the window.** It is set from
+  ollamadev's active workspace on open; change it before you start.
+- **The board is global**, shared by every project — so a run left holding changes
+  in one folder is listed beside a run in another, under one set of numbers.
+  Anything that would land somewhere other than the folder you are looking at says
+  so on its own row.
 
 ## Requirements
 

@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "auspex/process.hpp"
+#include "auspex/projects.hpp"
 
 namespace auspex {
 
@@ -33,6 +34,11 @@ const std::vector<AgentDefinition>& definitions() {
         {"cursor", "Cursor Agent", "cursor-agent",
          {"cursor", "cursor agent", "cursoragent"}},
         {"opencode", "OpenCode", "opencode", {"opencode", "open code"}},
+        // The crew's own engine. Listed here so "open ollamadev in Auspex" and
+        // "start the crew in Auspex" reach the same folder by the same route --
+        // before this it was the one agent the panel could run but not open.
+        {"ollamadev", "OllamaDev", "ollamadev",
+         {"ollamadev", "ollama dev", "olama dev", "llama dev", "ollamadev cli"}},
         {"qwen", "Qwen Code", "qwen", {"qwen", "qwen code", "quinn", "qwen coder"}},
         {"aider", "Aider", "aider", {"aider", "eider", "aide"}},
     };
@@ -100,17 +106,75 @@ const std::vector<AgentTool>& known_agents() {
     static const std::vector<AgentTool> kTools = [] {
         std::vector<AgentTool> tools;
         for (const auto& def : definitions()) {
-            tools.push_back({.key = def.key, .label = def.label, .binary = def.binary});
+            tools.push_back({.key = def.key, .label = def.label, .binary = def.binary, .path = {}});
         }
         return tools;
     }();
     return kTools;
 }
 
+const std::vector<std::filesystem::path>& agent_search_dirs() {
+    static const std::vector<std::filesystem::path> kDirs = [] {
+        std::vector<std::filesystem::path> dirs;
+        const char* home_env = std::getenv("HOME");
+        if (!home_env || !*home_env) return dirs;
+        const std::filesystem::path home(home_env);
+
+        // The fixed ones, in the order a person would expect them to win.
+        for (const char* relative : {"bin", ".local/bin", ".bun/bin", ".deno/bin",
+                                     ".cargo/bin", ".npm-global/bin", ".volta/bin",
+                                     ".asdf/shims", ".yarn/bin"}) {
+            dirs.push_back(home / relative);
+        }
+        dirs.emplace_back("/usr/local/bin");
+        dirs.emplace_back("/opt/homebrew/bin");   // harmless on Linux, right on macOS
+
+        // Version-manager trees, where the interesting directory is named after a
+        // version and cannot be written down. Enumerated newest-first by name,
+        // which is what these managers' own directory names sort as.
+        const auto add_versioned = [&dirs](const std::filesystem::path& root,
+                                           const std::filesystem::path& suffix) {
+            std::error_code ec;
+            if (!std::filesystem::is_directory(root, ec)) return;
+            std::vector<std::filesystem::path> versions;
+            for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+                if (entry.is_directory(ec)) versions.push_back(entry.path());
+            }
+            std::sort(versions.begin(), versions.end(), std::greater<>());
+            for (const auto& version : versions) dirs.push_back(version / suffix);
+        };
+        add_versioned(home / ".nvm" / "versions" / "node", "bin");
+        add_versioned(home / ".local" / "share" / "fnm" / "node-versions",
+                      std::filesystem::path("installation") / "bin");
+        add_versioned(home / ".nodenv" / "versions", "bin");
+
+        return dirs;
+    }();
+    return kDirs;
+}
+
+std::string resolve_agent_binary(const std::string& binary) {
+    // $PATH first, so a deliberately-installed copy still wins over one that
+    // happens to be lying in a version manager's tree.
+    if (auto found = resolve_in_path(binary); !found.empty()) return found;
+
+    for (const auto& dir : agent_search_dirs()) {
+        std::error_code ec;
+        const auto candidate = dir / binary;
+        if (std::filesystem::exists(candidate, ec) &&
+            !std::filesystem::is_directory(candidate, ec)) {
+            return candidate.string();
+        }
+    }
+    return {};
+}
+
 std::vector<AgentTool> available_agents() {
     std::vector<AgentTool> present;
     for (const auto& tool : known_agents()) {
-        if (in_path(tool.binary)) present.push_back(tool);
+        AgentTool resolved = tool;
+        resolved.path = resolve_agent_binary(tool.binary);
+        if (!resolved.path.empty()) present.push_back(std::move(resolved));
     }
     return present;
 }
@@ -133,8 +197,15 @@ std::optional<AgentTool> resolve_agent(std::string_view spoken) {
         for (const auto& def : definitions()) {
             for (const char* alias : def.aliases) {
                 if (name == alias) {
-                    return AgentTool{
-                        .key = def.key, .label = def.label, .binary = def.binary};
+                    // Resolved here so EVERY caller gets an absolute path without
+                    // having to know it needs one -- the voice verb reaches
+                    // agent_terminal_command() through a different route than the
+                    // panel does, and only one of them would have been fixed.
+                    // Empty when it is not installed, which callers already check.
+                    return AgentTool{.key    = def.key,
+                                     .label  = def.label,
+                                     .binary = def.binary,
+                                     .path   = resolve_agent_binary(def.binary)};
                 }
             }
         }
@@ -144,24 +215,13 @@ std::optional<AgentTool> resolve_agent(std::string_view spoken) {
 
 // ---------------------------------------------------------------------------
 std::vector<std::string> agent_terminal_command(const std::string& terminal,
-                                                const AgentTool& agent) {
-    if (terminal.empty() || agent.binary.empty()) return {};
-
-    // Match on the basename: `terminal` may be an absolute path from PATH lookup.
-    const std::string name = std::filesystem::path(terminal).filename().string();
-
-    // gnome-terminal removed -e in 3.14 and prints a deprecation warning instead of
-    // running anything useful; -- is the supported form. kitty, foot and alacritty
-    // take the command as trailing arguments with no separator at all (alacritty
-    // does have -e, but the bare form works on every version). Everything else in
-    // config.cpp's candidate list understands -e.
-    if (name == "gnome-terminal" || name == "mate-terminal") {
-        return {terminal, "--", agent.binary};
-    }
-    if (name == "kitty" || name == "foot" || name == "alacritty" || name == "wezterm") {
-        return {terminal, agent.binary};
-    }
-    return {terminal, "-e", agent.binary};
+                                                const AgentTool&   agent,
+                                                const std::filesystem::path& directory) {
+    // The resolved absolute path when there is one; see AgentTool::path for why a
+    // bare name is not good enough. Falling back to the name keeps the voice verb
+    // and the tests working with a hand-built AgentTool.
+    const std::string program = agent.path.empty() ? agent.binary : agent.path;
+    return terminal_command_in(terminal, program, directory);
 }
 
 }  // namespace auspex

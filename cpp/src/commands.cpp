@@ -471,7 +471,11 @@ ParseResult parse_action(const std::string& model_output, const CommandContext& 
                                : "I can open " + known;
             return result;
         }
-        if (!in_path(agent->binary)) {
+        // Not in_path(): agents installed by nvm, bun, deno or cargo are not on the
+        // login PATH the panel inherits from the display manager. resolve_agent()
+        // searches those trees too, so this asks whether it was found ANYWHERE
+        // rather than only where a login shell would have looked.
+        if (agent->path.empty()) {
             result.error = agent->label + " is not installed";
             return result;
         }

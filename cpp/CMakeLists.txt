@@ -237,6 +237,10 @@ add_library(auspex-core STATIC
     src/agents.cpp
     src/commands.cpp
     src/crew.cpp
+    src/projects.cpp
+    src/sandbox.cpp
+    src/director.cpp
+    src/coder.cpp
     src/vad.cpp
     src/voice_gate.cpp
     src/desktop_entries.cpp

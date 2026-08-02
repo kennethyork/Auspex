@@ -20,6 +20,7 @@
 // in this file.
 #pragma once
 
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -29,10 +30,41 @@ namespace auspex {
 struct AgentTool {
     std::string key;      // canonical id, and what the model is asked to return
     std::string label;    // how it is spoken back: "Claude Code"
-    std::string binary;   // the executable, resolved in PATH at use time
+    std::string binary;   // the executable's name
+
+    // Where it actually is, absolute. Empty when it is not installed.
+    //
+    // Filled by available_agents() and used instead of `binary` on every command
+    // line, for a reason that cost an afternoon to find: a terminal that spawns
+    // its window from a long-lived server process -- which xfce4-terminal does by
+    // default, and gnome-terminal always -- executes the command in THAT process's
+    // environment. Its PATH is whatever it inherited whenever it started, not the
+    // panel's. A bare name resolved fine in Auspex and then failed to resolve in
+    // the terminal, which opened an empty window and looked like the agent had
+    // crashed on startup.
+    std::string path;
 
     bool operator==(const AgentTool&) const = default;
 };
+
+// Directories searched for an agent BEYOND $PATH.
+//
+// WHY THIS IS NEEDED: the panel is started by the display manager, so its PATH is
+// the login one -- roughly ~/.local/bin plus the system directories. It never runs
+// a login shell, so it never sources the lines that nvm, bun, deno, cargo and
+// friends append to a profile. Every agent installed by one of those was therefore
+// invisible to the panel while being on the PATH of every terminal its owner ever
+// opened, which is as confusing a failure as this can produce: the tool is plainly
+// installed, and the shell that is meant to launch it says it is not.
+//
+// These are fixed literals under $HOME. Nothing here comes from a model, a config
+// file or a command line, so widening the search does not widen what can be run --
+// the NAME is still only ever one from the table above.
+const std::vector<std::filesystem::path>& agent_search_dirs();
+
+// The absolute path `binary` resolves to, searching $PATH first and then the
+// directories above. Empty when it is not installed anywhere Auspex looks.
+std::string resolve_agent_binary(const std::string& binary);
 
 // Every agent Auspex knows how to open, installed or not. Order is the order they
 // are offered to the model, so the better-known ones come first.
@@ -54,15 +86,19 @@ std::optional<AgentTool> resolve_agent(std::string_view spoken);
 // Exposed for testing: the normalisation resolve_agent() applies before matching.
 std::string normalise_agent_name(std::string_view spoken);
 
-// argv that opens `agent` inside `terminal`.
+// argv that opens `agent` inside `terminal`, optionally in `directory`.
 //
-// Terminals disagree about the flag that means "then run this": most take -e,
-// gnome-terminal deprecated it in favour of --, and kitty/foot want the command
-// with no flag at all. Getting this wrong opens an empty terminal, which looks like
-// the agent crashed instantly, so it is decided per terminal rather than hoped for.
+// Terminals disagree about the flag that means "then run this", and about the one
+// that means "starting here". Both tables live in projects.cpp, which this
+// delegates to: one copy, because the failure mode of a second is an empty
+// terminal that reads as the agent having crashed instantly.
 //
-// Empty if either argument is empty.
+// An empty directory means "wherever the caller is", which is what the voice verb
+// wants -- speech has no way to name a folder. The picker passes a real one.
+//
+// Empty if either the terminal or the agent is empty.
 std::vector<std::string> agent_terminal_command(const std::string& terminal,
-                                                const AgentTool& agent);
+                                                const AgentTool&   agent,
+                                                const std::filesystem::path& directory = {});
 
 }  // namespace auspex

@@ -51,8 +51,9 @@ std::vector<BoardItem> parse_board(const std::string& output) {
 
         if (entry.contains("data") && entry["data"].is_object()) {
             const auto& data = entry["data"];
-            item.n      = int_field(data, "n");
-            item.reason = string_field(data, "reason");
+            item.n         = int_field(data, "n");
+            item.reason    = string_field(data, "reason");
+            item.repo_root = string_field(data, "repoRoot");
             if (data.contains("files") && data["files"].is_array()) {
                 item.files = static_cast<int>(data["files"].size());
                 for (const auto& name : data["files"]) {
@@ -75,10 +76,11 @@ std::vector<BoardItem> parse_board(const std::string& output) {
 // Checks if the 'ollamadev' crew is available in the current path
 bool crew_available() { return in_path("ollamadev"); }
 
-std::vector<BoardItem> board_items() {
+std::vector<BoardItem> board_items(const std::filesystem::path& project) {
     if (!crew_available()) return {};
 
-    const auto result = run({"ollamadev", "board", "--json"});
+    const auto result = run({"ollamadev", "board", "--json"}, /*capture=*/true,
+                            project.string());
     if (!result.ok) return {};
     return parse_board(result.out);
 }
@@ -101,14 +103,23 @@ std::vector<std::string> crew_run_command(const std::string& task,
 
     // Flags after the task. Each is a fixed string; the only value that varies is a
     // number, formatted rather than passed through.
-    if (options.route)  argv.push_back("--route");
-    if (options.debate) argv.push_back("--debate");
-    if (options.dedupe) argv.push_back("--dedupe");
-    if (options.learn)  argv.push_back("--learn");
+    if (options.route)    argv.push_back("--route");
+    if (options.debate)   argv.push_back("--debate");
+    if (options.dedupe)   argv.push_back("--dedupe");
+    if (options.learn)    argv.push_back("--learn");
+    if (options.security) argv.push_back("--security");
 
     if (options.max_coders > 0) {
         argv.push_back("--max");
         argv.push_back(std::to_string(options.max_coders));
+    }
+    if (options.swarm > 0) {
+        argv.push_back("--swarm");
+        argv.push_back(std::to_string(options.swarm));
+    }
+    if (options.amplify > 0) {
+        argv.push_back("--amplify");
+        argv.push_back(std::to_string(options.amplify));
     }
 
     // The pack is checked by the caller against the engine's own list before it
@@ -144,16 +155,18 @@ std::vector<std::string> parse_crew_names(const std::string& output) {
     return names;
 }
 
-std::vector<std::string> crew_packs() {
+std::vector<std::string> crew_packs(const std::filesystem::path& project) {
     if (!crew_available()) return {};
-    const auto result = run({"ollamadev", "crew", "pack"});
+    const auto result = run({"ollamadev", "crew", "pack"}, /*capture=*/true,
+                            project.string());
     if (!result.ok) return {};
     return parse_crew_names(result.out);
 }
 
-std::vector<std::string> crew_roles() {
+std::vector<std::string> crew_roles(const std::filesystem::path& project) {
     if (!crew_available()) return {};
-    const auto result = run({"ollamadev", "crew", "role"});
+    const auto result = run({"ollamadev", "crew", "role"}, /*capture=*/true,
+                            project.string());
     if (!result.ok) return {};
     return parse_crew_names(result.out);
 }
@@ -213,6 +226,241 @@ std::vector<std::string> crew_resume_command() {
     return {"ollamadev", "crew", "resume"};
 }
 
+// ---------------------------------------------------------------------------
+// Backends
+// ---------------------------------------------------------------------------
+const std::vector<Backend>& known_backends() {
+    // Copied from CliBackend::ids()/labelFor() in ollamadev-qt rather than derived,
+    // because the mapping is not derivable: "Cursor Agent" -> "cursor-agent" but
+    // "Gemini CLI" -> "gemini", and lower-case-and-hyphenate would give the wrong
+    // answer for the second one while looking right for the first.
+    static const std::vector<Backend> kBackends{
+        {"ollama", "Ollama", false},
+        {"claude", "Claude Code", false},
+        {"codex", "Codex", false},
+        {"gemini", "Gemini CLI", false},
+        {"cursor-agent", "Cursor Agent", false},
+        {"opencode", "OpenCode", false},
+        {"qwen", "Qwen Code", false},
+        {"aider", "Aider", false},
+        {"goose", "Goose", false},
+        {"amp", "Amp", false},
+        {"crush", "Crush", false},
+        {"droid", "Droid", false},
+    };
+    return kBackends;
+}
+
+std::vector<Backend> parse_backends(const std::string& output) {
+    std::vector<Backend> backends;
+
+    for (const auto& line : split_lines(output)) {
+        const std::string row = trim(line);
+        if (row.empty()) continue;
+
+        // The label is a prefix of the row, and rows are columns padded with runs
+        // of spaces. Matching against the known labels LONGEST FIRST matters:
+        // "Claude Code" starts with nothing else, but a shorter label that is a
+        // prefix of a longer one would otherwise win.
+        const Backend* match = nullptr;
+        for (const auto& candidate : known_backends()) {
+            if (row.rfind(candidate.label, 0) != 0) continue;
+            if (!match || candidate.label.size() > match->label.size()) match = &candidate;
+        }
+        if (!match) continue;   // a heading, the rule, or the trailing prose
+
+        // What follows the label is the Installed column: "yes", or an em dash for
+        // one that is not there.
+        const std::string rest = trim(row.substr(match->label.size()));
+        Backend backend  = *match;
+        backend.installed = rest.rfind("yes", 0) == 0;
+        backends.push_back(std::move(backend));
+    }
+
+    return backends;
+}
+
+std::vector<Backend> available_backends() {
+    if (!crew_available()) return {};
+    const auto result = run({"ollamadev", "backends"});
+    if (!result.ok) return {};
+    return parse_backends(result.out);
+}
+
+std::vector<std::string> backend_prompt_command(const std::string& backend_id,
+                                                const std::string& prompt) {
+    const std::string text = trim(prompt);
+    if (backend_id.empty() || text.empty()) return {};
+    // The prompt LAST and whole: ollamadev takes it as a positional, and it is the
+    // only free text on this command line.
+    return {"ollamadev", "--backend", backend_id, text};
+}
+
+// ---------------------------------------------------------------------------
+// The brain
+// ---------------------------------------------------------------------------
+const std::vector<std::string>& router_tiers() {
+    static const std::vector<std::string> kTiers{"simple", "moderate", "hard"};
+    return kTiers;
+}
+
+std::vector<std::string> router_get_command(const std::string& tier) {
+    if (tier.empty()) return {};
+    return {"ollamadev", "config", "get", "router." + tier};
+}
+
+std::vector<std::string> router_set_command(const std::string& tier,
+                                            const std::string& model) {
+    if (tier.empty() || model.empty()) return {};
+    return {"ollamadev", "config", "set", "router." + tier, model};
+}
+
+std::vector<std::string> route_command(const std::string& text) {
+    const std::string trimmed = trim(text);
+    if (trimmed.empty()) return {};
+    // WITHOUT --run. This is the "where would this go" probe; adding --run would
+    // make a question that was meant to be answered into work that gets done.
+    return {"ollamadev", "route", trimmed};
+}
+
+RouteDecision parse_route(const std::string& output) {
+    RouteDecision decision;
+
+    for (const auto& line : split_lines(output)) {
+        std::string row = trim(line);
+        // "→ simple  ollama:gpt-oss:20b-cloud  (short lookup-style question)"
+        constexpr std::string_view kArrow = "→";
+        if (row.rfind(kArrow, 0) != 0) continue;
+        row = trim(row.substr(kArrow.size()));
+
+        // The reason is parenthesised and last; take it off before splitting the
+        // rest on spaces, or a reason containing a space would become a field.
+        if (const auto open = row.find('('); open != std::string::npos) {
+            const auto close = row.rfind(')');
+            if (close != std::string::npos && close > open) {
+                decision.reason = row.substr(open + 1, close - open - 1);
+            }
+            row = trim(row.substr(0, open));
+        }
+
+        std::istringstream fields(row);
+        fields >> decision.tier >> decision.model;
+        return decision;
+    }
+
+    return decision;
+}
+
+bool is_cloud_model(const std::string& tag) {
+    std::string lower = trim(tag);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower.empty()) return false;
+
+    const auto ends_with = [&lower](std::string_view suffix) {
+        return lower.size() >= suffix.size() &&
+               lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    return ends_with("-cloud") || ends_with(":cloud");
+}
+
+std::filesystem::path usage_path(const std::filesystem::path& project) {
+    if (project.empty()) return {};
+    return project / ".ollamadev" / "costs" / "usage.json";
+}
+
+TokenUsage parse_usage(const std::string& json_text) {
+    TokenUsage usage;
+    if (json_text.empty()) return usage;
+
+    const auto document = json::parse(json_text, nullptr, /*allow_exceptions=*/false);
+    if (document.is_discarded() || !document.is_object()) return usage;
+
+    usage.known = true;
+    usage.turns = int_field(document, "turns");
+
+    if (!document.contains("models") || !document["models"].is_object()) return usage;
+
+    for (const auto& [tag, entry] : document["models"].items()) {
+        if (!entry.is_object()) continue;
+        // Prompt AND generated: both are tokens the model processed, and counting
+        // only what came back would understate a long context by an order of
+        // magnitude -- which is exactly where the local/cloud question matters.
+        const long long tokens =
+            static_cast<long long>(int_field(entry, "prompt")) +
+            static_cast<long long>(int_field(entry, "eval"));
+        (is_cloud_model(tag) ? usage.cloud : usage.local) += tokens;
+    }
+
+    return usage;
+}
+
+TokenUsage project_usage(const std::filesystem::path& project) {
+    const auto path = usage_path(project);
+    if (path.empty()) return {};
+
+    std::ifstream in(path);
+    if (!in) return {};   // nothing has run here yet
+
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    return parse_usage(contents.str());
+}
+
+std::string usage_summary(const TokenUsage& usage) {
+    const long long total = usage.total();
+    if (!usage.known || total <= 0) return {};
+
+    // Thousands, one decimal, the way the engine's own stats prints them -- so a
+    // number read here and a number read there look like the same number.
+    std::ostringstream out;
+    if (total >= 1000) {
+        out.setf(std::ios::fixed);
+        out.precision(1);
+        out << (static_cast<double>(total) / 1000.0) << "k tokens";
+    } else {
+        out << total << " tokens";
+    }
+
+    const long long local_pct = usage.local * 100 / total;
+    out << " · " << local_pct << "% local · " << (100 - local_pct) << "% cloud";
+    return out.str();
+}
+
+std::vector<std::string> parse_models(const std::string& output) {
+    std::vector<std::string> models;
+    for (const auto& line : split_lines(output)) {
+        const std::string name = trim(line);
+        if (name.empty()) continue;
+        // A model name has no spaces. Anything with one is a heading or a note,
+        // and a heading pushed onto a command line would be a model that is not.
+        if (name.find(' ') != std::string::npos) continue;
+        models.push_back(name);
+    }
+    return models;
+}
+
+std::vector<std::string> available_models(const std::filesystem::path& project) {
+    if (!crew_available()) return {};
+    const auto result = run({"ollamadev", "models"}, /*capture=*/true, project.string());
+    if (!result.ok) return {};
+    return parse_models(result.out);
+}
+
+const std::vector<EngineAction>& engine_actions() {
+    static const std::vector<EngineAction> kActions{
+        {"Chat", "An interactive agent turn in this folder", {"ollamadev"}},
+        {"Ship", "Stage, scan for secrets, AI commit, then push", {"ollamadev", "ship"}},
+        {"Verify", "Run this project's tests and auto-fix what fails",
+         {"ollamadev", "verify"}},
+        {"Index", "Build the semantic code index for this folder",
+         {"ollamadev", "index", "build"}},
+        {"Doctor", "Check Ollama, the models and the CLIs are healthy",
+         {"ollamadev", "doctor"}},
+    };
+    return kActions;
+}
+
 
 // ---------------------------------------------------------------------------
 // Run state
@@ -269,6 +517,9 @@ CrewRun parse_crew_run(const std::string& json_text) {
             if (entry.contains("state") && entry["state"].is_string()) {
                 subtask.state = entry["state"].get<std::string>();
             }
+            subtask.backend = string_field(entry, "backend");
+            subtask.model   = string_field(entry, "model");
+            subtask.route   = string_field(entry, "route");
             run.subtasks.push_back(std::move(subtask));
         }
     }
@@ -287,6 +538,36 @@ CrewRun current_crew_run(const std::filesystem::path& path) {
     return parse_crew_run(contents.str());
 }
 
+bool crew_subtask_held(const CrewSubtask& subtask) { return subtask.state == "held"; }
+
+CrewLane crew_lane_of(const CrewSubtask& subtask) {
+    // ollamadev-qt's BoardPane mapping, verbatim: held gets its own column, done is
+    // Done, todo is To do, and EVERYTHING ELSE -- flagged included -- is Doing.
+    //
+    // Note the default is Doing, not To do. That is the opposite of what Auspex
+    // guessed at first, and the Qt reading is the right one: an unrecognised state
+    // came from an engine that is doing something with the subtask, so calling it
+    // "not started" understates a run that is live.
+    if (crew_subtask_held(subtask))   return CrewLane::Held;
+    if (subtask.state == "done")      return CrewLane::Done;
+    if (subtask.state == "todo")      return CrewLane::Todo;
+    if (subtask.state.empty())        return CrewLane::Todo;   // nothing recorded yet
+    return CrewLane::Doing;
+}
+
+std::string crew_subtask_model_line(const CrewSubtask& subtask) {
+    std::string line = subtask.model;
+    // The backend only when it is not implied by the model name, which already
+    // carries "-cloud" when it is one. A line reading "ollama · gpt-oss:20b" on
+    // every card is noise that pushes the useful half off the end.
+    if (line.empty()) line = subtask.backend;
+    if (!subtask.route.empty()) {
+        if (!line.empty()) line += " · ";
+        line += subtask.route;
+    }
+    return line;
+}
+
 CrewProgress crew_progress(const CrewRun& run) {
     CrewProgress progress;
     progress.total = static_cast<int>(run.subtasks.size());
@@ -297,11 +578,20 @@ CrewProgress crew_progress(const CrewRun& run) {
 }
 
 std::optional<CrewSubtask> crew_current_subtask(const CrewRun& run) {
-    // The first that is not done. The engine runs coders in parallel, so this is
-    // "the earliest thing still outstanding" rather than literally the only one
-    // being worked on -- which is the right thing to name in one line of panel.
+    // A coder that is actually RUNNING, preferred over one merely outstanding.
+    //
+    // This drives the steer box, and steering is talking to a live coder. A held
+    // changeset has stopped working -- it is waiting on accept or discard -- so
+    // aiming an instruction at it would send words to nobody. Taking the first
+    // "doing" rather than the first not-done is what makes the target real.
     for (const auto& subtask : run.subtasks) {
-        if (subtask.state != "done") return subtask;
+        if (subtask.state == "doing") return subtask;
+    }
+    // Nothing in flight: fall back to the earliest that has neither finished nor
+    // been held, which is what will start next. Better than nothing for the panel
+    // line that names what the crew is up to.
+    for (const auto& subtask : run.subtasks) {
+        if (subtask.state != "done" && !crew_subtask_held(subtask)) return subtask;
     }
     return std::nullopt;
 }

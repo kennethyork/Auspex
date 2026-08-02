@@ -14,7 +14,8 @@
 
 namespace auspex {
 
-ProcessResult run(const std::vector<std::string>& argv, bool capture) {
+ProcessResult run(const std::vector<std::string>& argv, bool capture,
+                  const std::string& cwd) {
     ProcessResult result;
     if (argv.empty()) return result;
 
@@ -31,6 +32,10 @@ ProcessResult run(const std::vector<std::string>& argv, bool capture) {
     }
 
     if (pid == 0) {
+        // Before anything else, and fatal if it fails: everything below assumes
+        // the child is standing in the right tree.
+        if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) ::_exit(127);
+
         const int devnull = ::open("/dev/null", O_WRONLY);
 
         if (capture) {
@@ -79,7 +84,7 @@ ProcessResult run(const std::vector<std::string>& argv, bool capture) {
     return result;
 }
 
-bool spawn_detached(const std::vector<std::string>& argv) {
+bool spawn_detached(const std::vector<std::string>& argv, const std::string& cwd) {
     if (argv.empty()) return false;
 
     const pid_t first = ::fork();
@@ -93,6 +98,9 @@ bool spawn_detached(const std::vector<std::string>& argv) {
         if (second > 0) ::_exit(0);
 
         ::setsid();
+
+        // Same rule as run(): the wrong directory is worse than no run at all.
+        if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) ::_exit(127);
 
         const int devnull = ::open("/dev/null", O_RDWR);
         if (devnull >= 0) {
@@ -119,13 +127,13 @@ bool spawn_detached(const std::vector<std::string>& argv) {
     return true;
 }
 
-bool in_path(std::string_view program) {
-    if (program.empty()) return false;
-    if (program.find('/') != std::string_view::npos) return false;
-    if (program.find_first_of(" \t\n;|&$`<>()") != std::string_view::npos) return false;
+std::string resolve_in_path(std::string_view program) {
+    if (program.empty()) return {};
+    if (program.find('/') != std::string_view::npos) return {};
+    if (program.find_first_of(" \t\n;|&$`<>()") != std::string_view::npos) return {};
 
     const char* path_env = std::getenv("PATH");
-    if (!path_env) return false;
+    if (!path_env) return {};
 
     std::istringstream parts(path_env);
     std::string dir;
@@ -135,11 +143,13 @@ bool in_path(std::string_view program) {
         const std::filesystem::path candidate = std::filesystem::path(dir) / program;
         if (std::filesystem::exists(candidate, ec) &&
             !std::filesystem::is_directory(candidate, ec)) {
-            return true;
+            return candidate.string();
         }
     }
-    return false;
+    return {};
 }
+
+bool in_path(std::string_view program) { return !resolve_in_path(program).empty(); }
 
 std::string first_in_path(const std::vector<std::string>& candidates) {
     for (const auto& candidate : candidates) {

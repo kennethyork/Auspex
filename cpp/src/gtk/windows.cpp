@@ -5,10 +5,13 @@
 #include <fstream>
 #include <sstream>
 
+#include <giomm/file.h>
 #include <glibmm/main.h>
 #include <glibmm/markup.h>
 #include <gtkmm/eventcontrollerkey.h>
+#include <gtkmm/filedialog.h>
 #include <gtkmm/gestureclick.h>
+#include <gtkmm/separator.h>
 #include <gtkmm/stringlist.h>
 
 #include <gdkmm/clipboard.h>
@@ -193,164 +196,6 @@ void LauncherWindow::launch_selected() {
 
     spawn_detached(argv);
     close();
-}
-
-// ---------------------------------------------------------------------------
-// BoardWindow
-// ---------------------------------------------------------------------------
-BoardWindow::BoardWindow() {
-    set_title("Auspex Crew Board");
-    add_css_class("auspex-window");
-    set_default_size(680, 560);
-    set_hide_on_close(true);
-
-    heading_.set_xalign(0.0f);
-    running_.add_css_class("subtitle");
-    running_.set_xalign(0.0f);
-    running_.set_wrap(true);
-    running_.set_visible(false);
-
-    heading_.add_css_class("subtitle");
-
-    scroller_.set_child(list_);
-    scroller_.set_vexpand(true);
-    scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
-
-    refresh_.signal_clicked().connect([this] { refresh(); });
-    close_.signal_clicked().connect([this] { close(); });
-    buttons_.set_halign(Gtk::Align::END);
-    buttons_.append(refresh_);
-    buttons_.append(close_);
-
-    root_.set_margin(12);
-    root_.append(running_);
-    root_.append(heading_);
-    root_.append(scroller_);
-    root_.append(buttons_);
-    set_child(root_);
-
-    signal_map().connect([this] { refresh(); });
-    refresh();
-
-    // Two seconds, and only two stats when nothing has moved. A changeset takes
-    // tens of seconds to arrive, so this is already finer than what it watches.
-    Glib::signal_timeout().connect(
-        [this] {
-            watch();
-            return true;
-        },
-        2000);
-}
-
-void BoardWindow::watch() {
-    std::error_code ec;
-    bool changed = false;
-
-    // The board itself: something landed, or a decision took effect.
-    if (const auto path = board_state_path(); !path.empty()) {
-        const auto stamp = std::filesystem::last_write_time(path, ec);
-        if (!ec && (!have_board_mtime_ || stamp != board_mtime_)) {
-            board_mtime_      = stamp;
-            have_board_mtime_ = true;
-            changed = true;
-        }
-    }
-
-    // The run: worth watching separately so the line at the top of the window can
-    // say a crew is still working even when nothing has landed yet. Those are very
-    // different things to be looking at an empty board for.
-    if (const auto path = crew_state_path(); !path.empty()) {
-        const auto stamp = std::filesystem::last_write_time(path, ec);
-        if (!ec && (!have_crew_mtime_ || stamp != crew_mtime_)) {
-            crew_mtime_      = stamp;
-            have_crew_mtime_ = true;
-            changed = true;
-        }
-    }
-
-    if (!changed) return;
-
-    const CrewRun run = current_crew_run();
-    const std::string status = crew_status_label(run);
-    running_.set_visible(!status.empty());
-    if (!status.empty()) {
-        running_.set_text(status + " \u2014 " + crew_status_detail(run));
-    }
-
-    refresh();
-}
-
-void BoardWindow::refresh() {
-    for (auto& row : rows_) list_.remove(*row);
-    rows_.clear();
-
-    const auto items = board_items();
-    if (items.empty()) {
-        heading_.set_text(crew_available()
-                              ? "The crew is not holding anything."
-                              : "ollamadev is not installed, so there is no crew.");
-        return;
-    }
-    heading_.set_text(std::to_string(items.size()) +
-                      (items.size() == 1 ? " change held for review"
-                                         : " changes held for review"));
-
-    for (const auto& item : items) {
-        auto row = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 4);
-        row->add_css_class("code-block");
-
-        auto* title = Gtk::make_managed<Gtk::Label>();
-        title->set_markup("<b>#" + std::to_string(item.n) + "  " +
-                          Glib::Markup::escape_text(item.summary) + "</b>");
-        title->set_xalign(0.0f);
-        title->set_wrap(true);
-        row->append(*title);
-
-        // The hold reason, given equal weight. This is the sentence that decides
-        // whether you accept, and burying it would make the buttons a coin flip.
-        if (!item.reason.empty()) {
-            auto* reason = Gtk::make_managed<Gtk::Label>();
-            reason->set_markup("<i>" + Glib::Markup::escape_text(item.reason) + "</i>");
-            reason->set_xalign(0.0f);
-            reason->set_wrap(true);
-            row->append(*reason);
-        }
-
-        auto* files = Gtk::make_managed<Gtk::Label>(
-            std::to_string(item.files) + (item.files == 1 ? " file" : " files"));
-        files->set_xalign(0.0f);
-        files->add_css_class("subtitle");
-        row->append(*files);
-
-        auto* actions = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
-        actions->set_halign(Gtk::Align::END);
-
-        auto* accept = Gtk::make_managed<Gtk::Button>("Accept");
-        accept->add_css_class("suggested-action");
-        const int n = item.n;
-        accept->signal_clicked().connect([this, n] { decide(n, true); });
-
-        auto* discard = Gtk::make_managed<Gtk::Button>("Discard");
-        discard->signal_clicked().connect([this, n] { decide(n, false); });
-
-        actions->append(*discard);
-        actions->append(*accept);
-        row->append(*actions);
-
-        list_.append(*row);
-        rows_.push_back(std::move(row));
-    }
-}
-
-void BoardWindow::decide(int n, bool accept) {
-    const auto argv = accept ? crew_accept_command(n) : crew_discard_command(n);
-    if (argv.empty()) return;
-    spawn_detached(argv);
-
-    // Re-read shortly after rather than immediately: the decision is applied by a
-    // separate process, and reading the board before it has written would show the
-    // change still pending and invite a second click on something already actioned.
-    Glib::signal_timeout().connect_once([this] { refresh(); }, 1200);
 }
 
 // ---------------------------------------------------------------------------
@@ -685,8 +530,21 @@ void CalendarWindow::go_today() {
 CrewWindow::CrewWindow() {
     set_title("Auspex Crew");
     add_css_class("auspex-window");
-    set_default_size(720, 720);
+    set_default_size(720, 780);
     set_hide_on_close(true);
+
+    // ---- where ----
+    //
+    // First, because it is the question the rest of the window depends on and the
+    // one that used to have no answer. See windows.hpp for what happened when a
+    // run was started without it.
+    if (const auto initial = default_project()) project_ = initial->path;
+    project_label_.set_xalign(0.0f);
+    project_label_.set_hexpand(true);
+    project_label_.set_ellipsize(Pango::EllipsizeMode::START);   // keep the leaf visible
+    project_pick_.signal_clicked().connect([this] { choose_project(); });
+    project_row_.append(project_label_);
+    project_row_.append(project_pick_);
 
     // ---- the task ----
     task_label_.set_text("What should the crew build?");
@@ -703,7 +561,11 @@ CrewWindow::CrewWindow() {
     resume_.set_tooltip_text(
         "Finish an interrupted run: keep what is done, re-plan what is left");
     resume_.signal_clicked().connect([this] {
-        if (!spawn_detached(crew_resume_command())) {
+        if (!is_project_dir(project_)) {
+            status_.set_text("Choose a folder for the crew to work in first");
+            return;
+        }
+        if (!spawn_detached(crew_resume_command(), project_.string())) {
             status_.set_text("Could not reach the crew");
             return;
         }
@@ -718,10 +580,13 @@ CrewWindow::CrewWindow() {
     debate_.set_tooltip_text("An advocate, a skeptic and a judge vote on every changeset");
     dedupe_.set_tooltip_text("Hold a coder whose work duplicates another's");
     learn_.set_tooltip_text("Remember what this run teaches, for the next one");
+    security_.set_tooltip_text(
+        "A read-only vulnerability scan producing a report; nothing is edited");
     options_.append(route_);
     options_.append(debate_);
     options_.append(dedupe_);
     options_.append(learn_);
+    options_.append(security_);
 
     coders_label_.set_text("Coders");
     coders_.set_range(0, 12);
@@ -729,10 +594,25 @@ CrewWindow::CrewWindow() {
     // Zero shows as "default" rather than as a cap of no coders, and is what leaves
     // the engine's own number alone.
     coders_.set_value(0);
-    coders_.set_tooltip_text("0 leaves ollamadev's own default alone");
+    coders_.set_tooltip_text("--max: how many pieces the Director may plan. "
+                             "0 leaves ollamadev's own default alone");
+
+    swarm_label_.set_text("Swarm");
+    swarm_.set_range(0, 24);
+    swarm_.set_increments(1, 4);
+    swarm_.set_value(0);
+    swarm_.set_tooltip_text("--swarm: raise the cap on coders running at once. 0 off");
+
+    amplify_label_.set_text("Amplify");
+    amplify_.set_range(0, 7);
+    amplify_.set_increments(1, 2);
+    amplify_.set_value(0);
+    amplify_.set_tooltip_text(
+        "--amplify: N Director plans, keep the modal one, then an N-reviewer audit "
+        "panel. The most expensive option here. 0 off");
 
     pack_label_.set_text("Pack");
-    packs_ = crew_packs();
+    packs_ = crew_packs(project_);
     {
         std::vector<Glib::ustring> labels;
         labels.emplace_back("None");
@@ -744,6 +624,10 @@ CrewWindow::CrewWindow() {
 
     second_row_.append(coders_label_);
     second_row_.append(coders_);
+    second_row_.append(swarm_label_);
+    second_row_.append(swarm_);
+    second_row_.append(amplify_label_);
+    second_row_.append(amplify_);
     second_row_.append(pack_label_);
     second_row_.append(pack_);
 
@@ -768,15 +652,19 @@ CrewWindow::CrewWindow() {
         build_lane(todo_,  "To do");
         build_lane(doing_, "Doing");
         build_lane(done_,  "Done");
+        build_lane(held_,  "Held");
 
         lanes_.append(todo_.column);
         lanes_.append(doing_.column);
         lanes_.append(done_.column);
+        lanes_.append(held_.column);
+        // Shown only when something is held; see windows.hpp.
+        held_.column.set_visible(false);
     }
 
     // Steering a coder while it works. The instruction is your words, sent as one
     // argument -- the model never composes what goes to a running coder.
-    steer_.set_placeholder_text("Tell a running coder something\u2026");
+    steer_.set_placeholder_text("Tell the whole crew something\u2026");
     steer_.set_hexpand(true);
     steer_.signal_activate().connect([this] { steer_send_.activate(); });
     steer_send_.signal_clicked().connect([this] {
@@ -796,7 +684,7 @@ CrewWindow::CrewWindow() {
         }
 
         const auto argv = crew_steer_command(target->n, text);
-        if (argv.empty() || !spawn_detached(argv)) {
+        if (argv.empty() || !spawn_detached(argv, project_.string())) {
             status_.set_text("\u26a0 could not reach the crew");
             return;
         }
@@ -818,6 +706,7 @@ CrewWindow::CrewWindow() {
     status_.set_wrap(true);
 
     root_.set_margin(14);
+    root_.append(project_row_);
     root_.append(task_label_);
     root_.append(task_);
     root_.append(options_);
@@ -831,6 +720,7 @@ CrewWindow::CrewWindow() {
     root_.append(status_);
     set_child(root_);
 
+    show_project();
     refresh_run();
     refresh_board();
 
@@ -844,13 +734,96 @@ CrewWindow::CrewWindow() {
         2000);
 }
 
+// ---------------------------------------------------------------------------
+void CrewWindow::show_project() {
+    if (project_.empty()) {
+        project_label_.set_markup("<b>No folder chosen</b> — the crew has nowhere to work");
+        project_label_.set_tooltip_text({});
+        return;
+    }
+
+    // The name in bold and the full path beside it. The name is what you recognise;
+    // the path is what tells you it is the copy you meant, and for something that
+    // edits files both belong on screen at once.
+    const std::string leaf = project_.filename().empty()
+                                 ? project_.string()
+                                 : project_.filename().string();
+    project_label_.set_markup("Working in <b>" + Glib::Markup::escape_text(leaf) +
+                              "</b>  <span alpha='60%'>" +
+                              Glib::Markup::escape_text(project_.string()) + "</span>");
+    project_label_.set_tooltip_text(project_.string());
+
+    if (!is_project_dir(project_)) {
+        project_label_.set_markup("<b>" + Glib::Markup::escape_text(project_.string()) +
+                                  "</b> is gone");
+    }
+}
+
+void CrewWindow::set_project(const std::filesystem::path& path) {
+    if (!is_project_dir(path)) return;
+    project_ = normal_project_path(path);
+    remember_project(project_);
+    show_project();
+
+    // The pack list is per-project: a saved team defined in one repo is not offered
+    // in another. Re-read rather than kept, or picking a folder would leave a menu
+    // describing the folder before it.
+    packs_ = crew_packs(project_);
+    {
+        std::vector<Glib::ustring> labels;
+        labels.emplace_back("None");
+        for (const auto& pack : packs_) labels.emplace_back(pack);
+        pack_.set_model(Gtk::StringList::create(labels));
+        pack_.set_selected(0);
+    }
+
+    // Both watchers forced, so the run and the board are re-read against the folder
+    // just chosen rather than left showing the previous one until a file happens to
+    // change.
+    have_run_mtime_   = false;
+    have_board_mtime_ = false;
+    refresh_run();
+    refresh_board();
+}
+
+void CrewWindow::choose_project() {
+    auto dialog = Gtk::FileDialog::create();
+    dialog->set_title("Which folder should the crew work in?");
+    if (is_project_dir(project_)) {
+        dialog->set_initial_folder(Gio::File::create_for_path(project_.string()));
+    }
+    dialog->select_folder(*this, [this, dialog](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        try {
+            if (const auto folder = dialog->select_folder_finish(result)) {
+                set_project(folder->get_path());
+                status_.set_text({});
+            }
+        } catch (const Glib::Error&) {
+            // Cancelled, which is not an error worth reporting.
+        }
+    });
+}
+
 void CrewWindow::start() {
+    // Checked before anything else. Everything below is about WHAT to build; if
+    // there is no answer to WHERE, none of it should run -- ollamadev would not
+    // refuse, it would pick a folder of its own and edit that.
+    if (!is_project_dir(project_)) {
+        status_.set_text(project_.empty()
+                             ? "Choose a folder for the crew to work in first"
+                             : project_.string() + " is not a folder any more");
+        return;
+    }
+
     CrewOptions options;
     options.route      = route_.get_active();
     options.debate     = debate_.get_active();
     options.dedupe     = dedupe_.get_active();
     options.learn      = learn_.get_active();
+    options.security   = security_.get_active();
     options.max_coders = coders_.get_value_as_int();
+    options.swarm      = swarm_.get_value_as_int();
+    options.amplify    = amplify_.get_value_as_int();
 
     // The pack is taken by INDEX into the list the engine gave us, never from typed
     // text, so an unknown name cannot reach the command line -- ollamadev would
@@ -865,7 +838,7 @@ void CrewWindow::start() {
         return;
     }
 
-    if (!spawn_detached(argv)) {
+    if (!spawn_detached(argv, project_.string())) {
         status_.set_text("Could not start ollamadev");
         return;
     }
@@ -873,7 +846,12 @@ void CrewWindow::start() {
     // Detached rather than held: a crew run outlasts this window, and a run that
     // died because its window was closed would be the worst possible behaviour for
     // something that edits files.
-    status_.set_text("Started. Progress appears below as the Director plans.");
+    //
+    // The folder is named back, because it is the fact the run cannot be undone
+    // without: by the time a diff appears on the board it is too late to wonder
+    // which tree it came out of.
+    status_.set_text("Started in " + project_.string() +
+                     ". Progress appears below as the Director plans.");
     task_.set_text("");
 }
 
@@ -893,7 +871,7 @@ void CrewWindow::refresh_run() {
     run_mtime_      = stamp;
     have_run_mtime_ = true;
 
-    for (Lane* lane : {&todo_, &doing_, &done_}) {
+    for (Lane* lane : {&todo_, &doing_, &done_, &held_}) {
         while (Gtk::Widget* child = lane->body.get_first_child()) lane->body.remove(*child);
     }
     run_rows_.clear();
@@ -910,22 +888,20 @@ void CrewWindow::refresh_run() {
     // crew is a control that can only report that there is nothing to steer.
     steer_row_.set_visible(run.active);
 
-    int counts[3] = {0, 0, 0};
+    int counts[4] = {0, 0, 0, 0};
 
     for (const auto& subtask : run.subtasks) {
-        // Three lanes from whatever words the engine uses. "done" is the only state
-        // named with certainty, and anything actively in flight reads as doing;
-        // everything else has not started. An unrecognised state lands in To do,
-        // which is the reading that overstates least.
+        // The engine's own state words, via crew_lane_of(). This used to look for
+        // "running", "active" and "working" -- none of which ollamadev writes -- so
+        // a coder in flight sat in To do and the lanes never moved until it was
+        // finished.
         Lane* lane  = &todo_;
         int   which = 0;
-        if (subtask.state == "done") {
-            lane = &done_;
-            which = 2;
-        } else if (subtask.state == "running" || subtask.state == "doing" ||
-                   subtask.state == "active" || subtask.state == "working") {
-            lane = &doing_;
-            which = 1;
+        switch (crew_lane_of(subtask)) {
+            case CrewLane::Doing: lane = &doing_; which = 1; break;
+            case CrewLane::Done:  lane = &done_;  which = 2; break;
+            case CrewLane::Held:  lane = &held_;  which = 3; break;
+            case CrewLane::Todo:  break;
         }
         ++counts[which];
 
@@ -945,6 +921,58 @@ void CrewWindow::refresh_run() {
 
         card->append(*who);
         card->append(*title);
+
+        // Which model, and why that one. Without this --route is a switch you can
+        // turn on and never observe: its entire purpose is giving each subtask a
+        // model picked for its difficulty, and the choice was going straight into
+        // the state file and no further.
+        if (const std::string engine = crew_subtask_model_line(subtask); !engine.empty()) {
+            auto* which_model = Gtk::make_managed<Gtk::Label>(engine);
+            which_model->set_xalign(0.0f);
+            which_model->set_wrap(true);
+            which_model->add_css_class("subtitle");
+            card->append(*which_model);
+        }
+
+        // A steer box on the coder itself, as ollamadev-qt's CoderPane has. The
+        // window already had one, but it auto-targeted the earliest running coder
+        // -- fine with one in flight, guesswork with four. This says which.
+        //
+        // NOTE: a rebuild clears what is half-typed here, and the lanes rebuild
+        // whenever the engine rewrites its state file. Steering is a sentence, not
+        // an essay, so this is a real edge and a small one.
+        if (lane == &doing_) {
+            auto* row  = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 4);
+            auto* say  = Gtk::make_managed<Gtk::Entry>();
+            auto* send = Gtk::make_managed<Gtk::Button>("Steer");
+            say->set_placeholder_text("say something to this coder…");
+            say->set_hexpand(true);
+
+            const int target = subtask.n;
+            const auto steer_this = [this, target, say] {
+                const std::string words = trim(std::string(say->get_text()));
+                if (words.empty()) return;
+                const auto argv = crew_steer_command(target, words);
+                if (argv.empty() || !spawn_detached(argv, project_.string())) {
+                    status_.set_text("⚠ could not reach coder " + std::to_string(target));
+                    return;
+                }
+                status_.set_text("✓ steered coder " + std::to_string(target));
+                say->set_text("");
+            };
+            say->signal_activate().connect(steer_this);
+            send->signal_clicked().connect(steer_this);
+
+            row->append(*say);
+            row->append(*send);
+            card->append(*row);
+        } else if (lane == &done_) {
+            auto* finished = Gtk::make_managed<Gtk::Label>("this coder has finished");
+            finished->set_xalign(0.0f);
+            finished->add_css_class("subtitle");
+            card->append(*finished);
+        }
+
         // The one in flight is marked, so the Doing lane still reads at a glance
         // when it holds several.
         if (lane == &doing_) card->add_css_class("recording");
@@ -956,6 +984,8 @@ void CrewWindow::refresh_run() {
     todo_.title.set_text("To do (" + std::to_string(counts[0]) + ")");
     doing_.title.set_text("Doing (" + std::to_string(counts[1]) + ")");
     done_.title.set_text("Done (" + std::to_string(counts[2]) + ")");
+    held_.title.set_text("Held (" + std::to_string(counts[3]) + ")");
+    held_.column.set_visible(counts[3] > 0);
 }
 
 void CrewWindow::refresh_board() {
@@ -973,7 +1003,7 @@ void CrewWindow::refresh_board() {
     while (Gtk::Widget* child = board_box_.get_first_child()) board_box_.remove(*child);
     board_rows_.clear();
 
-    const auto items = board_items();
+    const auto items = board_items(project_);
     if (items.empty()) {
         board_heading_.set_text("Nothing is being held for review.");
         board_scroller_.set_visible(false);
@@ -1025,6 +1055,24 @@ void CrewWindow::refresh_board() {
         files->set_xalign(0.0f);
         files->set_wrap(true);
         files->add_css_class("subtitle");
+
+        // Which tree this would land in, but ONLY when it is not the one being
+        // looked at.
+        //
+        // The board is global -- ~/.ollamadev/board, shared by every project -- so
+        // a run left holding changes in one folder is listed beside a run in
+        // another, under one set of numbers. Accept applies to the repo the engine
+        // recorded, not to the folder above, and without this line there is nothing
+        // on screen to tell you the two are different. Silent when they match,
+        // because a warning shown every time is a warning nobody reads.
+        Gtk::Label* elsewhere = nullptr;
+        if (!item.repo_root.empty() &&
+            normal_project_path(item.repo_root) != normal_project_path(project_)) {
+            elsewhere = Gtk::make_managed<Gtk::Label>("⚠  lands in " + item.repo_root);
+            elsewhere->set_xalign(0.0f);
+            elsewhere->set_wrap(true);
+            elsewhere->add_css_class("error");
+        }
 
         const int n = item.n;
 
@@ -1088,7 +1136,13 @@ void CrewWindow::refresh_board() {
         auto* spacer = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL);
         spacer->set_hexpand(true);
 
-        auto* accept = Gtk::make_managed<Gtk::Button>("Accept");
+        // The file count ON the button, as ollamadev-qt does it. Accept is the
+        // irreversible-ish half of this pair, and "how much am I taking" belongs
+        // where the hand is going rather than two lines above it.
+        auto* accept = Gtk::make_managed<Gtk::Button>(
+            item.files > 0 ? "Accept (" + std::to_string(item.files) +
+                                 (item.files == 1 ? " file)" : " files)")
+                           : std::string("Accept"));
         accept->add_css_class("suggested-action");
         auto* discard = Gtk::make_managed<Gtk::Button>("Discard");
         accept->signal_clicked().connect([this, n] { decide(n, true); });
@@ -1123,6 +1177,7 @@ void CrewWindow::refresh_board() {
         row->append(*summary);
         if (!item.reason.empty()) row->append(*reason);
         row->append(*files);
+        if (elsewhere) row->append(*elsewhere);
         row->append(*buttons);
         row->append(*diff_scroller);
 
@@ -1136,7 +1191,7 @@ void CrewWindow::decide(int n, bool accept) {
     // The buttons are built from a real board so this cannot normally fail -- but
     // the board can change between drawing a row and pressing it, and accepting the
     // wrong changeset is not something to leave to timing.
-    const auto items = board_items();
+    const auto items = board_items(project_);
     if (!board_item(items, n)) {
         status_.set_text("Change " + std::to_string(n) + " is no longer on the board");
         have_board_mtime_ = false;
@@ -1145,7 +1200,7 @@ void CrewWindow::decide(int n, bool accept) {
     }
 
     const auto argv = accept ? crew_accept_command(n) : crew_discard_command(n);
-    if (argv.empty() || !spawn_detached(argv)) {
+    if (argv.empty() || !spawn_detached(argv, project_.string())) {
         status_.set_text("Could not reach the crew");
         return;
     }
@@ -1155,6 +1210,620 @@ void CrewWindow::decide(int n, bool accept) {
     // Forced, because accepting one changeset can release or invalidate another and
     // the file may not have been rewritten yet.
     have_board_mtime_ = false;
+}
+
+// ---------------------------------------------------------------------------
+// TeamWindow
+// ---------------------------------------------------------------------------
+TeamWindow::TeamWindow(const Config& config) : config_(config) {
+    set_title("Auspex Team");
+    add_css_class("auspex-window");
+    set_default_size(620, 620);
+    set_hide_on_close(true);
+
+    if (const auto initial = default_project()) project_ = initial->path;
+    project_label_.set_xalign(0.0f);
+    project_label_.set_hexpand(true);
+    project_label_.set_ellipsize(Pango::EllipsizeMode::START);
+    project_pick_.signal_clicked().connect([this] { choose_project(); });
+    project_row_.append(project_label_);
+    project_row_.append(project_pick_);
+
+    providers_heading_.set_text("Providers — one terminal per pick");
+    providers_heading_.set_xalign(0.0f);
+    providers_heading_.add_css_class("subtitle");
+
+    // Every backend the engine knows, with the uninstalled ones present but
+    // disabled. A list that hid them would answer "why is Goose not here?" with
+    // silence; this answers it with a greyed row and a tooltip.
+    backends_ = available_backends();
+    if (backends_.empty()) backends_ = known_backends();
+
+    for (const auto& backend : backends_) {
+        auto box = std::make_unique<Gtk::CheckButton>(backend.label);
+        box->set_sensitive(backend.installed);
+        box->set_tooltip_text(backend.installed
+                                  ? "ollamadev --backend " + backend.id
+                                  : "not installed on this machine");
+        // Ollama is ticked by default when it is there: it is the one backend that
+        // is local and free, so it is the honest default for a fan-out whose cost
+        // scales with how many boxes are ticked.
+        if (backend.installed && backend.id == "ollama") box->set_active(true);
+        providers_.append(*box);
+        boxes_.push_back(std::move(box));
+    }
+
+    providers_scroller_.set_child(providers_);
+    providers_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    providers_scroller_.set_min_content_height(180);
+
+    prompt_label_.set_text("Prompt for the whole team");
+    prompt_label_.set_xalign(0.0f);
+    prompt_.set_wrap_mode(Gtk::WrapMode::WORD_CHAR);
+    prompt_.set_monospace(false);
+    prompt_scroller_.set_child(prompt_);
+    prompt_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    prompt_scroller_.set_min_content_height(120);
+    prompt_scroller_.set_vexpand(true);
+    prompt_scroller_.add_css_class("code-block");
+
+    launch_.add_css_class("suggested-action");
+    launch_.signal_clicked().connect([this] { launch(); });
+    buttons_.append(launch_);
+
+    status_.set_xalign(0.0f);
+    status_.add_css_class("subtitle");
+    status_.set_wrap(true);
+
+    root_.set_margin(14);
+    root_.append(project_row_);
+    root_.append(providers_heading_);
+    root_.append(providers_scroller_);
+    root_.append(prompt_label_);
+    root_.append(prompt_scroller_);
+    root_.append(buttons_);
+    root_.append(status_);
+    set_child(root_);
+
+    show_project();
+}
+
+void TeamWindow::show_project() {
+    if (!is_project_dir(project_)) {
+        project_label_.set_markup("<b>No folder chosen</b> — the team has nowhere to work");
+        return;
+    }
+    const std::string leaf = project_.filename().empty() ? project_.string()
+                                                         : project_.filename().string();
+    project_label_.set_markup("Working in <b>" + Glib::Markup::escape_text(leaf) +
+                              "</b>  <span alpha='60%'>" +
+                              Glib::Markup::escape_text(project_.string()) + "</span>");
+    project_label_.set_tooltip_text(project_.string());
+}
+
+void TeamWindow::set_project(const std::filesystem::path& path) {
+    if (!is_project_dir(path)) return;
+    project_ = normal_project_path(path);
+    remember_project(project_);
+    show_project();
+}
+
+void TeamWindow::choose_project() {
+    auto dialog = Gtk::FileDialog::create();
+    dialog->set_title("Which folder should the team work in?");
+    if (is_project_dir(project_)) {
+        dialog->set_initial_folder(Gio::File::create_for_path(project_.string()));
+    }
+    dialog->select_folder(*this, [this, dialog](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        try {
+            if (const auto folder = dialog->select_folder_finish(result)) {
+                set_project(folder->get_path());
+                status_.set_text({});
+            }
+        } catch (const Glib::Error&) {
+        }
+    });
+}
+
+void TeamWindow::launch() {
+    if (!is_project_dir(project_)) {
+        status_.set_text("Choose a folder for the team to work in first");
+        return;
+    }
+    if (config_.terminal.empty()) {
+        status_.set_text("No terminal is configured");
+        return;
+    }
+
+    const auto buffer = prompt_.get_buffer();
+    const std::string prompt = trim(std::string(buffer->get_text()));
+    if (prompt.empty()) {
+        status_.set_text("Type a prompt first");
+        return;
+    }
+
+    std::vector<std::string> launched;
+    for (std::size_t i = 0; i < boxes_.size() && i < backends_.size(); ++i) {
+        if (!boxes_[i]->get_active()) continue;
+
+        const auto command = backend_prompt_command(backends_[i].id, prompt);
+        if (command.empty()) continue;
+
+        const auto argv = terminal_command_argv(config_.terminal, command, project_);
+        if (argv.empty() || !spawn_detached(argv, project_.string())) continue;
+        launched.push_back(backends_[i].label);
+    }
+
+    if (launched.empty()) {
+        status_.set_text("Select at least one installed provider");
+        return;
+    }
+
+    remember_project(project_);
+
+    std::string names;
+    for (std::size_t i = 0; i < launched.size(); ++i) {
+        if (i) names += ", ";
+        names += launched[i];
+    }
+    status_.set_text("✓ " + std::to_string(launched.size()) +
+                     (launched.size() == 1 ? " terminal: " : " terminals: ") + names);
+}
+
+// ---------------------------------------------------------------------------
+// BrainWindow
+// ---------------------------------------------------------------------------
+BrainWindow::BrainWindow() {
+    set_title("Auspex Brain");
+    add_css_class("auspex-window");
+    set_default_size(600, 420);
+    set_hide_on_close(true);
+
+    heading_.set_markup("<b>The crew's brain</b> — which model each difficulty routes to");
+    heading_.set_xalign(0.0f);
+    heading_.set_wrap(true);
+
+    tiers_.set_row_spacing(8);
+    tiers_.set_column_spacing(12);
+
+    static const std::vector<std::pair<const char*, const char*>> kTierLabels{
+        {"simple", "Simple (trivia)"},
+        {"moderate", "Moderate (general)"},
+        {"hard", "Hard (design/debug)"},
+    };
+
+    int row = 0;
+    for (const auto& [tier, caption] : kTierLabels) {
+        auto entry = std::make_unique<TierRow>();
+        entry->tier = tier;
+        entry->label.set_text(caption);
+        entry->label.set_xalign(0.0f);
+        entry->models.set_hexpand(true);
+
+        TierRow* raw = entry.get();
+        entry->models.property_selected().signal_changed().connect([this, raw] {
+            if (loading_) return;
+            const auto index = raw->models.get_selected();
+            if (index == GTK_INVALID_LIST_POSITION || index >= models_.size()) return;
+
+            // Written through the engine's own `config set`, so the value lands in
+            // ade-prefs.json exactly where ollamadev looks for it -- and so the Qt
+            // front end sees the same change without either of them knowing about
+            // the other.
+            const auto argv = router_set_command(raw->tier, models_[index]);
+            if (argv.empty() || !run(argv).ok) {
+                status_.set_text("⚠ could not set " + raw->tier);
+                return;
+            }
+            status_.set_text("✓ " + raw->tier + " → " + models_[index]);
+        });
+
+        tiers_.attach(entry->label, 0, row);
+        tiers_.attach(entry->models, 1, row);
+        rows_.push_back(std::move(entry));
+        ++row;
+    }
+
+    probe_label_.set_text("Try the router — where would this go?");
+    probe_label_.set_xalign(0.0f);
+    probe_label_.add_css_class("subtitle");
+    probe_entry_.set_placeholder_text("e.g. \"rename a variable\" or \"design a cache\"…");
+    probe_entry_.set_hexpand(true);
+    probe_entry_.signal_activate().connect([this] { probe(); });
+    probe_go_.signal_clicked().connect([this] { probe(); });
+    probe_row_.append(probe_entry_);
+    probe_row_.append(probe_go_);
+
+    probe_result_.set_xalign(0.0f);
+    probe_result_.set_wrap(true);
+
+    status_.set_xalign(0.0f);
+    status_.add_css_class("subtitle");
+    status_.set_wrap(true);
+
+    root_.set_margin(14);
+    root_.append(heading_);
+    root_.append(tiers_);
+    root_.append(probe_label_);
+    root_.append(probe_row_);
+    root_.append(probe_result_);
+    root_.append(tokens_);
+    root_.append(status_);
+    set_child(root_);
+
+    tokens_.set_xalign(0.0f);
+    tokens_.set_wrap(true);
+    tokens_.set_margin_top(6);
+
+    reload();
+}
+
+void BrainWindow::reload() {
+    models_ = available_models();
+    if (models_.empty()) {
+        status_.set_text("No models listed — is Ollama running?");
+        return;
+    }
+
+    loading_ = true;
+    for (auto& entry : rows_) {
+        std::vector<Glib::ustring> labels;
+        for (const auto& model : models_) labels.emplace_back(model);
+        entry->models.set_model(Gtk::StringList::create(labels));
+
+        // What the tier resolves to right now, including a default the engine
+        // derived rather than one anybody set.
+        const auto argv = router_get_command(entry->tier);
+        std::string current;
+        if (!argv.empty()) {
+            if (const auto result = run(argv); result.ok) current = trim(result.out);
+        }
+
+        guint selected = 0;
+        for (std::size_t i = 0; i < models_.size(); ++i) {
+            if (models_[i] == current) {
+                selected = static_cast<guint>(i);
+                break;
+            }
+        }
+        entry->models.set_selected(selected);
+    }
+    loading_ = false;
+
+    show_usage();
+}
+
+void BrainWindow::show_usage() {
+    const auto project = default_project();
+    if (!project) {
+        tokens_.set_text({});
+        return;
+    }
+
+    const TokenUsage usage = project_usage(project->path);
+    const std::string summary = usage_summary(usage);
+    if (summary.empty()) {
+        tokens_.set_markup("<span alpha='70%'>No tokens recorded in " +
+                           Glib::Markup::escape_text(project->name) + " yet</span>");
+        return;
+    }
+
+    tokens_.set_markup("<b>" + Glib::Markup::escape_text(project->name) + ":</b> " +
+                       Glib::Markup::escape_text(summary));
+    tokens_.set_tooltip_text(usage_path(project->path).string());
+}
+
+void BrainWindow::probe() {
+    const std::string text = trim(std::string(probe_entry_.get_text()));
+    if (text.empty()) {
+        probe_result_.set_text({});
+        return;
+    }
+
+    const auto argv = route_command(text);
+    if (argv.empty()) return;
+
+    const auto result = run(argv);
+    if (!result.ok) {
+        probe_result_.set_text("⚠ the router did not answer");
+        return;
+    }
+
+    const RouteDecision decision = parse_route(result.out);
+    if (decision.tier.empty()) {
+        probe_result_.set_text("⚠ could not read the router's answer");
+        return;
+    }
+
+    std::string text_out = decision.tier + "  →  " + decision.model;
+    if (!decision.reason.empty()) text_out += "\n" + decision.reason;
+    probe_result_.set_markup("<b>" + Glib::Markup::escape_text(decision.tier) +
+                             "</b>  →  " + Glib::Markup::escape_text(decision.model) +
+                             (decision.reason.empty()
+                                  ? ""
+                                  : "\n<span alpha='70%'>" +
+                                        Glib::Markup::escape_text(decision.reason) +
+                                        "</span>"));
+}
+
+// ---------------------------------------------------------------------------
+// ProjectsWindow
+// ---------------------------------------------------------------------------
+ProjectsWindow::ProjectsWindow(const Config& config) : config_(config) {
+    set_title("Auspex Projects");
+    add_css_class("auspex-window");
+    set_default_size(820, 560);
+    set_hide_on_close(true);
+
+    // ---- the folders ----
+    left_heading_.set_text("Projects");
+    left_heading_.set_xalign(0.0f);
+    left_heading_.add_css_class("subtitle");
+
+    list_.set_selection_mode(Gtk::SelectionMode::SINGLE);
+    // Selection, not activation, drives the right-hand side. A single click should
+    // show you what you would be opening; only the agent buttons launch anything.
+    list_.signal_row_selected().connect([this](Gtk::ListBoxRow* row) {
+        if (!row) return;
+        const auto index = static_cast<std::size_t>(row->get_index());
+        if (index < projects_.size()) select(projects_[index].path);
+    });
+
+    list_scroller_.set_child(list_);
+    list_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    list_scroller_.set_vexpand(true);
+
+    browse_.signal_clicked().connect([this] { browse(); });
+
+    left_.set_margin(14);
+    left_.set_size_request(280, -1);
+    left_.append(left_heading_);
+    left_.append(list_scroller_);
+    left_.append(browse_);
+
+    // ---- what to do with one ----
+    chosen_name_.set_xalign(0.0f);
+    chosen_name_.add_css_class("title");
+    chosen_path_.set_xalign(0.0f);
+    chosen_path_.add_css_class("subtitle");
+    chosen_path_.set_wrap(true);
+    chosen_path_.set_selectable(true);   // so it can be copied into a terminal
+
+    agents_heading_.set_text("Open it in");
+    agents_heading_.set_xalign(0.0f);
+    agents_heading_.add_css_class("subtitle");
+
+    // Installed only. Offering an agent that is not there turns a button into a
+    // way of finding out it is missing, which is a thing to be told before you
+    // press rather than after.
+    agents_ = available_agents();
+    if (agents_.empty()) {
+        auto* none = Gtk::make_managed<Gtk::Label>(
+            "No coding agents found in PATH.\n"
+            "Auspex looks for claude, codex, gemini, cursor-agent, opencode, "
+            "ollamadev and aider.");
+        none->set_xalign(0.0f);
+        none->set_wrap(true);
+        none->add_css_class("subtitle");
+        agent_box_.append(*none);
+    }
+    for (const auto& agent : agents_) {
+        auto* button = Gtk::make_managed<Gtk::Button>();
+        auto* row    = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 10);
+        auto* label  = Gtk::make_managed<Gtk::Label>(agent.label);
+        label->set_xalign(0.0f);
+        label->set_hexpand(true);
+        auto* binary = Gtk::make_managed<Gtk::Label>(agent.binary);
+        binary->add_css_class("subtitle");
+        row->append(*label);
+        row->append(*binary);
+        button->set_child(*row);
+        button->set_tooltip_text("Run " + agent.binary + " in a terminal, in this folder");
+        // Captured by value: the button outlives this loop iteration, and agents_
+        // could be reallocated by anything that reloads the list later.
+        const AgentTool copy = agent;
+        button->signal_clicked().connect([this, copy] { open_in(copy); });
+        agent_box_.append(*button);
+    }
+
+    terminal_.set_tooltip_text("A plain terminal, in this folder");
+    terminal_.signal_clicked().connect([this] { open_terminal(); });
+    files_.set_tooltip_text("Open this folder in the file manager");
+    files_.signal_clicked().connect([this] { open_files(); });
+    crew_.set_tooltip_text("Hand this folder to the crew bench");
+    crew_.signal_clicked().connect([this] {
+        if (!is_project_dir(selected_)) return;
+        remember_project(selected_);
+        if (on_crew_) on_crew_(selected_);
+    });
+    // Only when the engine is installed; otherwise it is a button to a window whose
+    // every control would report the same absence.
+    crew_.set_visible(crew_available());
+
+    extras_.append(terminal_);
+    extras_.append(files_);
+    extras_.append(crew_);
+
+    status_.set_xalign(0.0f);
+    status_.add_css_class("subtitle");
+    status_.set_wrap(true);
+
+    right_.set_margin(14);
+    right_.set_hexpand(true);
+    right_.append(chosen_name_);
+    right_.append(chosen_path_);
+    right_.append(agents_heading_);
+    right_.append(agent_box_);
+    right_.append(extras_);
+    right_.append(status_);
+
+    root_.append(left_);
+    root_.append(right_);
+    set_child(root_);
+
+    reload();
+}
+
+void ProjectsWindow::reload() {
+    while (Gtk::Widget* child = list_.get_first_child()) list_.remove(*child);
+    rows_.clear();
+
+    projects_ = all_projects();
+
+    for (const auto& project : projects_) {
+        auto row = std::make_unique<Gtk::ListBoxRow>();
+        auto* box = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 2);
+        box->set_margin(6);
+
+        auto* name = Gtk::make_managed<Gtk::Label>(project.name);
+        name->set_xalign(0.0f);
+
+        // The path under the name, ellipsised from the LEFT: two checkouts of the
+        // same repo differ in their first components, not their last, so trimming
+        // the front is what hides the difference.
+        auto* path = Gtk::make_managed<Gtk::Label>(project.path.string());
+        path->set_xalign(0.0f);
+        path->add_css_class("subtitle");
+        path->set_ellipsize(Pango::EllipsizeMode::START);
+
+        box->append(*name);
+        box->append(*path);
+        row->set_child(*box);
+        row->set_tooltip_text(project.path.string());
+
+        list_.append(*row);
+        rows_.push_back(std::move(row));
+    }
+
+    if (projects_.empty()) {
+        select({});
+        status_.set_text("No projects yet. Use “Open another folder” to pick one.");
+        return;
+    }
+
+    // Start on the one the engine calls current, so the panel and ollamadev agree
+    // about "this project" before anything is clicked.
+    std::size_t start = 0;
+    if (const auto preferred = default_project()) {
+        for (std::size_t i = 0; i < projects_.size(); ++i) {
+            if (normal_project_path(projects_[i].path) ==
+                normal_project_path(preferred->path)) {
+                start = i;
+                break;
+            }
+        }
+    }
+    list_.select_row(*rows_[start]);
+    select(projects_[start].path);
+}
+
+void ProjectsWindow::select(const std::filesystem::path& path) {
+    selected_ = normal_project_path(path);
+
+    const bool usable = is_project_dir(selected_);
+    // One gate for everything that launches. There is no meaningful "open an agent
+    // in no directory" -- that is precisely the behaviour this window replaces.
+    agent_box_.set_sensitive(usable);
+    extras_.set_sensitive(usable);
+
+    if (!usable) {
+        chosen_name_.set_text(selected_.empty() ? "No folder chosen" : "Folder is gone");
+        chosen_path_.set_text(selected_.string());
+        return;
+    }
+
+    const std::string leaf = selected_.filename().empty()
+                                 ? selected_.string()
+                                 : selected_.filename().string();
+    chosen_name_.set_text(leaf);
+    chosen_path_.set_text(selected_.string());
+    status_.set_text({});
+}
+
+void ProjectsWindow::browse() {
+    auto dialog = Gtk::FileDialog::create();
+    dialog->set_title("Open a folder");
+    if (is_project_dir(selected_)) {
+        dialog->set_initial_folder(Gio::File::create_for_path(selected_.string()));
+    }
+    dialog->select_folder(*this, [this, dialog](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        try {
+            const auto folder = dialog->select_folder_finish(result);
+            if (!folder) return;
+            const std::filesystem::path path = folder->get_path();
+            if (!is_project_dir(path)) return;
+
+            // Remembered on browse rather than on launch, so a folder you opened to
+            // look at is in the list next time even if you did not start anything.
+            remember_project(path);
+            reload();
+
+            for (std::size_t i = 0; i < projects_.size(); ++i) {
+                if (normal_project_path(projects_[i].path) == normal_project_path(path)) {
+                    list_.select_row(*rows_[i]);
+                    break;
+                }
+            }
+            select(path);
+        } catch (const Glib::Error&) {
+            // Cancelled.
+        }
+    });
+}
+
+void ProjectsWindow::open_in(const AgentTool& agent) {
+    // Re-checked here rather than trusted from the list. A bookmark outlives the
+    // folder it names, and the gap between drawing this row and pressing it is
+    // however long the window has been open.
+    if (!is_project_dir(selected_)) {
+        status_.set_text("⚠ " + selected_.string() + " is not a folder");
+        return;
+    }
+    if (config_.terminal.empty()) {
+        status_.set_text("⚠ no terminal is configured");
+        return;
+    }
+    // Re-resolved rather than trusting the path found when the window was built:
+    // the list can be minutes old, and an agent updated by its own installer moves
+    // between version directories.
+    AgentTool fresh = agent;
+    fresh.path = resolve_agent_binary(agent.binary);
+    if (fresh.path.empty()) {
+        status_.set_text("⚠ " + agent.binary + " is not installed any more");
+        return;
+    }
+
+    const auto argv = agent_terminal_command(config_.terminal, fresh, selected_);
+    // Both mechanisms, for the reason in projects.hpp: the flag for terminals that
+    // spawn from a server process, the cwd for terminals with no flag.
+    if (argv.empty() || !spawn_detached(argv, selected_.string())) {
+        status_.set_text("⚠ could not start " + agent.label);
+        return;
+    }
+
+    remember_project(selected_);
+    status_.set_text("✓ " + agent.label + " in " + selected_.string());
+}
+
+void ProjectsWindow::open_terminal() {
+    if (!is_project_dir(selected_) || config_.terminal.empty()) return;
+
+    const auto argv = terminal_here(config_.terminal, selected_);
+    if (argv.empty() || !spawn_detached(argv, selected_.string())) {
+        status_.set_text("⚠ could not start the terminal");
+        return;
+    }
+    remember_project(selected_);
+    status_.set_text("✓ terminal in " + selected_.string());
+}
+
+void ProjectsWindow::open_files() {
+    if (!is_project_dir(selected_)) return;
+    if (!spawn_detached({"xdg-open", selected_.string()})) {
+        status_.set_text("⚠ could not open the file manager");
+        return;
+    }
+    status_.set_text("✓ opened " + selected_.string());
 }
 
 // ---------------------------------------------------------------------------

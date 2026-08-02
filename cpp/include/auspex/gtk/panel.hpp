@@ -28,6 +28,7 @@
 #include <gtkmm/label.h>
 #include <gtkmm/gestureclick.h>
 #include <gtkmm/calendar.h>
+#include <gtkmm/eventcontrollermotion.h>
 #include <gtkmm/menubutton.h>
 #include <gtkmm/entry.h>
 #include <gtkmm/scrolledwindow.h>
@@ -192,6 +193,108 @@ private:
     sigc::slot<void()> on_board_;
 };
 
+// The terminal button, with the folder question attached to it.
+//
+// WHY IT IS HERE AND NOT ONLY IN THE PROJECTS WINDOW: opening a coding agent in a
+// project is a thing you do several times an hour, and a whole window is too much
+// furniture for it. Hovering the button you already reach for to get a terminal
+// gives you the same folder list and every installed agent, one click deep.
+//
+// The button itself still does what it always did -- left-click opens a plain
+// terminal -- so nothing that was one click becomes two.
+//
+// HOVER, NOT CLICK, and after a delay: an autohide popover takes an input grab, so
+// popping one up the instant the pointer crosses the button would steal the click
+// of somebody on their way to the volume control next to it.
+class TerminalButton : public Gtk::Button {
+public:
+    explicit TerminalButton(const Config& config);
+    ~TerminalButton() override;
+
+    // Wired by the Panel, which owns the crew window. The folder chosen here goes
+    // with it, so picking a project and starting a crew is one gesture -- the crew
+    // window's first question is which folder, and this already has the answer.
+    void set_crew_handler(sigc::slot<void(std::filesystem::path)> handler) {
+        on_crew_ = std::move(handler);
+    }
+    void set_team_handler(sigc::slot<void(std::filesystem::path)> handler) {
+        on_team_ = std::move(handler);
+    }
+    void set_brain_handler(sigc::slot<void()> handler) {
+        on_brain_ = std::move(handler);
+    }
+
+private:
+    void rebuild();
+    void launch_agent(const AgentTool& agent);
+    void launch_plain();
+    void browse();
+
+    // Asks WHERE, then does it.
+    //
+    // Every one of these opens a CLI that will read and write whatever tree it
+    // lands in, so the folder is confirmed rather than assumed -- the dropdown
+    // above supplies the default, and this is where you get to disagree with it.
+    // Cancelling launches nothing, which is the point: the escape hatch has to be
+    // in front of the action, not after it.
+    //
+    // The popover is dismissed first. It holds an input grab, and a file dialog
+    // opened underneath one cannot be clicked.
+    void ask_folder(sigc::slot<void(std::filesystem::path)> then);
+    // The folder the buttons act on: the dropdown's selection, or empty when there
+    // are no projects at all. Everything that launches re-checks it exists first --
+    // a bookmark outlives the folder it names, and this list can be an hour old.
+    std::filesystem::path chosen() const;
+
+    const Config& config_;
+
+    Gtk::Image   icon_;
+    Gtk::Popover popover_;
+    Gtk::Box     popover_box_{Gtk::Orientation::VERTICAL, 6};
+
+    Gtk::Label    folder_label_;
+    Gtk::DropDown folders_;
+    Gtk::Label    folder_path_;
+    Gtk::Button   browse_{"Other folder…"};
+    Gtk::Separator rule_{Gtk::Orientation::HORIZONTAL};
+    Gtk::Box      agent_box_{Gtk::Orientation::VERTICAL, 2};
+    Gtk::Label    status_;
+
+    std::vector<Project>   projects_;
+    std::vector<AgentTool> agents_;
+    std::vector<std::unique_ptr<Gtk::Widget>> agent_rows_;
+
+    // Opening and closing are both delayed, and each cancels the other.
+    //
+    // `open_` is cancelled if the pointer leaves before it fires, so brushing past
+    // the button on the way to the volume control opens nothing.
+    //
+    // `close_` is what makes it go away again. It has to be a DELAY rather than an
+    // immediate popdown on leave, because the gap between the button and the
+    // popover above it is real estate the pointer has to cross -- closing the
+    // instant it left the button would make the menu impossible to reach. Entering
+    // either the button or the popover cancels it.
+    void schedule_close();
+    void cancel_close();
+
+    sigc::connection open_;
+    sigc::connection close_;
+
+    // Kept so the close timer can ask where the pointer actually is.
+    //
+    // Necessary because popping up an autohide popover takes an INPUT GRAB, and
+    // the grab makes the button underneath emit a `leave` it did not earn -- the
+    // pointer has not moved. Acting on that leave closed the popover 450ms after
+    // opening it, every time. Asking "is the pointer in either of these?" when the
+    // timer fires is the check that tells a real departure from a grab artefact.
+    Glib::RefPtr<Gtk::EventControllerMotion> on_button_;
+    Glib::RefPtr<Gtk::EventControllerMotion> on_popover_;
+
+    sigc::slot<void(std::filesystem::path)> on_crew_;
+    sigc::slot<void(std::filesystem::path)> on_team_;
+    sigc::slot<void()>                      on_brain_;
+};
+
 // Volume, as a panel control rather than a tray icon.
 //
 // The sound icon on a stock Xfce desktop is libpulseaudio-plugin.so running inside
@@ -351,9 +454,17 @@ private:
     void show_launcher();
     void show_settings();
     void show_chat();
-    void show_board();
     void show_calendar();
     void show_crew();
+    // `project` points the crew window at a folder as it opens, so choosing one in
+    // the picker and starting a crew is one gesture rather than the same answer
+    // given twice. Empty leaves whatever the crew window already had.
+    void show_crew_in(const std::filesystem::path& project);
+    void show_projects();
+    // Both take the folder from whatever asked for them, for the same reason the
+    // crew window does: they run agents, and agents edit the tree they land in.
+    void show_team(const std::filesystem::path& project);
+    void show_brain();
 
 public:
     // Wired by the shell to the DesktopWindow, which owns the canvas view. A
@@ -469,8 +580,9 @@ private:
     Gtk::Box                          ask_box_{Gtk::Orientation::HORIZONTAL, 4};
     Gtk::Image                        ask_icon_;
     Gtk::Label                        ask_label_;
-    Gtk::Button                       terminal_;
-    Gtk::Image                        terminal_icon_;
+    // Owned by pointer because it is only built when a terminal is configured, and
+    // because it needs the Config the Panel holds.
+    std::unique_ptr<TerminalButton>   terminal_;
     // A toggle, not a button: this is the always-on ear, the closest equivalent to
     // widgets/voice.py's WhisperingEarButton.
     Gtk::ToggleButton                 ear_;
@@ -483,9 +595,11 @@ private:
     std::unique_ptr<LauncherWindow> launcher_window_;
     std::unique_ptr<SettingsWindow> settings_window_;
     std::unique_ptr<ChatWindow>     chat_window_;
-    std::unique_ptr<BoardWindow>    board_window_;
     std::unique_ptr<CalendarWindow> calendar_window_;
     std::unique_ptr<CrewWindow>     crew_window_;
+    std::unique_ptr<ProjectsWindow> projects_window_;
+    std::unique_ptr<TeamWindow>     team_window_;
+    std::unique_ptr<BrainWindow>    brain_window_;
 
     bool                       watching_geometry_ = false;
     std::optional<std::string> window_id_;
