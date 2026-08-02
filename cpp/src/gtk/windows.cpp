@@ -28,6 +28,7 @@
 #include "auspex/crew.hpp"
 #include "auspex/cli_coder.hpp"
 #include "auspex/crew_run.hpp"
+#include "auspex/usage.hpp"
 #include "auspex/gtk/voice.hpp"
 #include "auspex/ollama_client.hpp"
 #include "auspex/process.hpp"
@@ -602,6 +603,11 @@ CrewWindow::CrewWindow() {
                                 ? std::to_string(result.applied) + " applied \u00b7 " +
                                       std::to_string(result.held) + " held"
                                 : result.error;
+            
+                // What it cost, per model. The engine has metered this all along
+                // and the window never showed it, so a run on a metered model
+                // looked exactly like a run on a local one.
+                last_cost_ = usage_report(result.usage);
             }
             running_.store(false);
             run_changed_.emit();
@@ -634,6 +640,13 @@ CrewWindow::CrewWindow() {
         {
             std::lock_guard lock(log_mutex_);
             if (!last_log_.empty()) status_.set_text(last_log_);
+            // Shown only once there is something to show. A run that spent
+            // nothing -- one that failed before planning -- leaves this hidden
+            // rather than printing an empty table.
+            if (!last_cost_.empty()) {
+                cost_.set_text(last_cost_);
+                cost_.set_visible(true);
+            }
         }
         if (!running_.load()) {
             start_.set_sensitive(true);
@@ -667,11 +680,23 @@ CrewWindow::CrewWindow() {
     security_.set_tooltip_text(
         "A read-only vulnerability hunt instead of building anything. Nothing is "
         "written; the result is a report.");
+    verify_.set_tooltip_text(
+        "After each coder, run this project's tests in its sandbox and hand the "
+        "failures back. This also lets coders run commands, because a test suite "
+        "IS code -- and a coder that broke the suite is told while it can still "
+        "fix it.");
+    starters_.set_active(true);
+    starters_.set_tooltip_text(
+        "Write the shipped skills that match this task into .auspex/skills. "
+        "Anything you have written yourself is never overwritten.");
+
     options_.append(route_);
     options_.append(debate_);
     options_.append(dedupe_);
     options_.append(learn_);
     options_.append(security_);
+    options_.append(verify_);
+    options_.append(starters_);
 
     coders_label_.set_text("Coders");
     coders_.set_range(0, 12);
@@ -810,6 +835,11 @@ CrewWindow::CrewWindow() {
     root_.append(board_heading_);
     root_.append(board_scroller_);
     root_.append(status_);
+
+    cost_.set_xalign(0.0f);
+    cost_.add_css_class("dim-label");
+    cost_.set_visible(false);   // nothing to say until a run has finished
+    root_.append(cost_);
     set_child(root_);
 
     show_project();
@@ -933,6 +963,15 @@ void CrewWindow::start() {
     options.debate   = debate_.get_active();
     options.learn    = learn_.get_active();
     options.security = security_.get_active();
+    options.starter_skills = starters_.get_active();
+
+    // ONE switch, not two. verify_attempts without allow_run runs nothing, so a
+    // person ticking "Run the tests" and getting silence would be right to think
+    // the setting was broken. Ticking it here turns on the ability it needs.
+    if (verify_.get_active()) {
+        options.verify_attempts = 2;
+        options.coder.allow_run = true;
+    }
     if (amplify_.get_value_as_int() > 0) options.amplify = amplify_.get_value_as_int();
 
     // Straight across, whatever roles exist. The engine's fallback chain does the
@@ -980,6 +1019,11 @@ void CrewWindow::start() {
                             ? std::to_string(result.applied) + " applied \u00b7 " +
                                   std::to_string(result.held) + " held"
                             : result.error;
+        
+            // What it cost, per model. The engine has metered this all along
+            // and the window never showed it, so a run on a metered model
+            // looked exactly like a run on a local one.
+            last_cost_ = usage_report(result.usage);
         }
         running_.store(false);
         run_changed_.emit();

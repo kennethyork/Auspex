@@ -77,6 +77,40 @@ bool is_project_dir(const std::filesystem::path& path) {
     return std::filesystem::is_directory(path, ec) && !ec;
 }
 
+std::string unsafe_project_reason(const std::filesystem::path& path) {
+    if (path.empty()) return "no project is chosen";
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(path, ec)) return "that is not a directory";
+
+    const auto normal = normal_project_path(std::filesystem::absolute(path, ec));
+
+    // The filesystem root, or a top-level directory. Nothing anybody wants a crew
+    // copying, and the cost of being wrong is the whole disk.
+    if (!normal.has_relative_path() || normal.parent_path() == normal) {
+        return "that is the filesystem root";
+    }
+
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        const auto home_path = normal_project_path(home);
+        if (normal == home_path) {
+            return "that is your home directory, not a project -- a crew copies the "
+                   "tree once per coder and can write changes back into it";
+        }
+        // The folders that HOLD projects rather than being one. A project inside
+        // any of them is fine; the folder itself is not.
+        for (const char* folder : {"Documents", "Downloads", "Desktop", "Music",
+                                   "Pictures", "Videos", "Public", "Templates"}) {
+            if (normal == normal_project_path(home_path / folder)) {
+                return std::string("that is your ") + folder +
+                       " folder, not a project -- pick the project inside it";
+            }
+        }
+    }
+
+    return {};
+}
+
 std::filesystem::path normal_project_path(const std::filesystem::path& path) {
     if (path.empty()) return path;
 

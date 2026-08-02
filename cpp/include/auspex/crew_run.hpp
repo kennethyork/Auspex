@@ -340,6 +340,32 @@ struct CrewPack {
 };
 
 std::vector<CrewPack> builtin_packs();
+
+// Where a saved pack lives. Auspex's own directory first, then ollamadev's.
+//
+// Reading THEIRS is not tidiness. A pack is a team you stopped having to retype,
+// and somebody who has saved a few has already told this program what they want
+// -- shipping a version that silently cannot see them is a version that has
+// fewer packs than the thing it replaced. Found exactly that way: two saved packs
+// and four custom roles on disk, invisible to every part of Auspex.
+std::vector<std::filesystem::path> crew_pack_dirs();
+
+// One saved pack. nullopt when the JSON is unusable.
+//
+// Accepts ollamadev's spellings (camelCase, "max") as well as ours, because the
+// files on disk are theirs. Keys with no equivalent here are ignored rather than
+// refused -- a pack that mentions something Auspex does not have should still
+// bring across the parts it does.
+std::optional<CrewPack> parse_pack(const std::string& name,
+                                   const std::string& json_text);
+
+// Saved packs, sorted by name.
+std::vector<CrewPack> user_packs();
+
+// Built-ins plus saved, with a saved pack of the same name winning -- the more
+// specific one decides, as everywhere else here.
+std::vector<CrewPack> all_packs();
+
 std::optional<CrewPack> find_pack(const std::string& name);
 
 // --- the roles you can point at a model ----------------------------------------

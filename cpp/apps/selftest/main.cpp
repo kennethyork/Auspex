@@ -6803,7 +6803,9 @@ void test_roles() {
 
         // The merge rule that matters: a file setting only the prompt must not
         // silently turn a read-only role into a writing one.
-        RolePersona reviewer = persona_for("reviewer", {});
+        RolePersona reviewer =
+            *std::find_if(builtin_personas().begin(), builtin_personas().end(),
+                          [](const RolePersona& p) { return p.name == "reviewer"; });
         check(reviewer.read_only, "the built-in reviewer is read-only");
 
         const auto prompt_only =
@@ -6841,9 +6843,19 @@ void test_roles() {
               "a prompt-only role file on disk leaves the reviewer read-only");
         check_eq(persona_for("reviewer", dir).prompt, std::string("Look harder."),
                  "with the new prompt in place");
-        check_eq(persona_for("reviewer", dir).description,
-                 persona_for("reviewer", {}).description,
-                 "and the description it did not mention kept");
+        // Against the BUILT-IN, named explicitly. An empty path now means "every
+        // place a role can live", which includes the user's own -- so comparing
+        // with persona_for(..., {}) would compare against whatever they happen to
+        // have on disk rather than against the thing being overridden.
+        const auto builtin_reviewer =
+            std::find_if(builtin_personas().begin(), builtin_personas().end(),
+                         [](const RolePersona& p) { return p.name == "reviewer"; });
+        check(builtin_reviewer != builtin_personas().end(), "there is a built-in reviewer");
+        if (builtin_reviewer != builtin_personas().end()) {
+            check_eq(persona_for("reviewer", dir).description,
+                     builtin_reviewer->description,
+                     "and the description it did not mention kept");
+        }
 
         {
             std::ofstream out(dir / "auditor-helper.json");
@@ -7106,6 +7118,72 @@ void test_starter_skills() {
               "-- the shipped one does not overwrite it");
 
         std::filesystem::remove_all(root, ec);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A crew is not pointed at a container
+//
+// Found by opening the Crew window and LOOKING at it: it offered $HOME as the
+// working directory with Start enabled. A crew copies the tree once per coder and
+// can write a changeset back into it, so that is gigabytes of copying and an
+// accepted change landing in a home directory.
+// ---------------------------------------------------------------------------
+void test_project_guard() {
+    using namespace auspex;
+    std::cout << "\nproject guard\n";
+
+    const char* home = std::getenv("HOME");
+
+    {
+        check(!unsafe_project_reason("").empty(), "nothing is refused");
+        check(!unsafe_project_reason("/").empty(), "the filesystem root is refused");
+        check(!unsafe_project_reason("/nonexistent-dir-xyz").empty(),
+              "and a path that is not a directory");
+    }
+
+    if (home && *home) {
+        const std::string why = unsafe_project_reason(home);
+        check(!why.empty(), "$HOME is refused");
+        check(why.find("home directory") != std::string::npos,
+              "and says why in words a person can act on");
+
+        // A trailing slash is the same directory. Without normal_project_path this
+        // is the classic way a guard is walked straight past.
+        check(!unsafe_project_reason(std::string(home) + "/").empty(),
+              "and so is $HOME with a trailing slash");
+
+        std::error_code ec;
+        const auto documents = std::filesystem::path(home) / "Documents";
+        if (std::filesystem::is_directory(documents, ec)) {
+            check(!unsafe_project_reason(documents).empty(),
+                  "a folder that HOLDS projects is refused");
+        }
+    }
+
+    // A real project is allowed, git or not. Refusing an unfamiliar directory
+    // would be this program deciding what counts as a project.
+    {
+        std::error_code ec;
+        const std::filesystem::path plain = "/tmp/auspex-plain-project";
+        std::filesystem::remove_all(plain, ec);
+        std::filesystem::create_directories(plain, ec);
+        { std::ofstream out(plain / "main.py"); out << "x = 1\n"; }
+
+        check(unsafe_project_reason(plain).empty(),
+              "an ordinary directory with no git in it is still a project");
+        std::filesystem::remove_all(plain, ec);
+    }
+
+    // The engine refuses, not just the window -- the window is not the only caller.
+    if (home && *home) {
+        RunOptions at_home;
+        at_home.project = home;
+        at_home.task = "do something";
+        const RunResult result = run_crew(Config{}, at_home);
+        check(!result.error.empty(), "run_crew refuses a crew pointed at $HOME");
+        check(result.error.find("home directory") != std::string::npos,
+              "with the same reason, wherever the run was started from");
     }
 }
 
@@ -9342,6 +9420,7 @@ int main(int argc, char** argv) {
     test_mcp();
     test_roles();
     test_starter_skills();
+    test_project_guard();
     test_symbols();
     test_verify();
     test_usage();

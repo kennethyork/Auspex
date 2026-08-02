@@ -220,6 +220,18 @@ private:
     Gtk::CheckButton dedupe_{"Dedupe"};
     Gtk::CheckButton learn_{"Learn"};
     Gtk::CheckButton security_{"Security scan"};
+
+    // Run the project's tests after each coder, and hand back the failures.
+    //
+    // Turning this on also turns on the coders' ability to run commands, because
+    // it IS that ability -- a suite is code, and a switch that quietly needed a
+    // second switch to do anything would be the kind of setting that silently does
+    // nothing. See on_start().
+    Gtk::CheckButton verify_{"Run the tests"};
+
+    // Write the shipped starter skills that match this task into the project.
+    // On by default, matching RunOptions.
+    Gtk::CheckButton starters_{"Starter skills"};
     Gtk::Box         second_row_{Gtk::Orientation::HORIZONTAL, 14};
     Gtk::Label       coders_label_;
     Gtk::SpinButton  coders_;
@@ -260,6 +272,16 @@ private:
     // Which held changesets have their diff open. Kept across a refresh, or the
     // board updating while you are reading a patch would close it under you.
     std::set<int> expanded_;
+
+    // What the last run cost, per model.
+    //
+    // The engine has metered this since usage.hpp existed and nothing in the
+    // window ever showed it, so a run on a metered model looked exactly like a run
+    // on a local one. Blank until a run finishes.
+    Gtk::Label cost_;
+    // Written by the worker under log_mutex_, read on the GTK thread, like
+    // last_log_ beside it -- a std::string touched by two threads otherwise.
+    std::string last_cost_;
 
     // What it is holding.
     Gtk::Label          board_heading_;

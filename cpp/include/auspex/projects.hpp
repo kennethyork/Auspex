@@ -53,6 +53,24 @@ struct Project {
 // because a bookmark outlives the folder it points at.
 bool is_project_dir(const std::filesystem::path& path);
 
+// Why a crew must not be pointed here, or empty when it may be.
+//
+// is_project_dir() answers "is this a directory", which is the wrong question for
+// a crew: a crew COPIES the tree once per coder and can write a changeset back
+// into it. Pointed at $HOME that is gigabytes of copying and an accepted change
+// landing in your home directory.
+//
+// Found by opening the Crew window and looking at it -- it offered $HOME as the
+// working directory with Start enabled, which is the exact failure the window was
+// built to prevent, reappearing as a default. The guard is here rather than in
+// the window because the window is not the only caller.
+//
+// It refuses containers, not unfamiliar projects: $HOME, a filesystem root, and
+// the XDG folders that hold projects rather than being one. A plain directory
+// with no git in it is still allowed -- refusing that would be this program
+// deciding what counts as a project.
+std::string unsafe_project_reason(const std::filesystem::path& path);
+
 // The form two paths are compared in, so "/home/me/x" and "/home/me/x/" are one
 // project rather than two rows of identical-looking text.
 //

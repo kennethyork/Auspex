@@ -20,7 +20,42 @@
 #include "auspex/gtk/panel.hpp"
 #include "auspex/gtk/theming.hpp"
 #include "auspex/gtk/voice.hpp"
+#include "auspex/gtk/windows.hpp"
 #include "auspex/panel_dock.hpp"
+
+namespace {
+
+// Opens one named window, for looking at. False when the name is unknown.
+bool open_single_window(Gtk::Application& app, const std::string& name,
+                        const auspex::Config& config) {
+    if (name == "crew") {
+        auto* window = new auspex::gtk::CrewWindow();
+        app.add_window(*window);
+        window->present();
+        return true;
+    }
+    if (name == "brain") {
+        auto* window = new auspex::gtk::BrainWindow();
+        app.add_window(*window);
+        window->present();
+        return true;
+    }
+    if (name == "projects") {
+        auto* window = new auspex::gtk::ProjectsWindow(config);
+        app.add_window(*window);
+        window->present();
+        return true;
+    }
+    if (name == "team") {
+        auto* window = new auspex::gtk::TeamWindow(config);
+        app.add_window(*window);
+        window->present();
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     // Panels are dock windows that reserve screen edges via _NET_WM_STRUT_PARTIAL.
@@ -32,7 +67,29 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto app = Gtk::Application::create("one.auspex.Shell");
+    // --window <name> opens ONE window and nothing else: no panels, no docking,
+    // no voice.
+    //
+    // This exists because the GUI is the part of Auspex that cannot be driven from
+    // here. Synthesising input is off-limits, so a change to a window could be
+    // read in the source and never looked at -- which is exactly how the engine
+    // came to be several features ahead of anything you can click. A window that
+    // can be opened on its own can at least be SEEN.
+    std::string only_window;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--window") only_window = argv[i + 1];
+    }
+
+    auto app = Gtk::Application::create(
+        only_window.empty() ? "one.auspex.Shell" : "one.auspex.ShellWindow",
+        Gio::Application::Flags::HANDLES_COMMAND_LINE);
+    // Our own flag would otherwise be rejected as unknown before activate runs.
+    app->signal_command_line().connect(
+        [&app](const Glib::RefPtr<Gio::ApplicationCommandLine>&) {
+            app->activate();
+            return 0;
+        },
+        /*after=*/false);
 
     app->signal_startup().connect(
         [] {
@@ -64,6 +121,18 @@ int main(int argc, char** argv) {
         theme = std::make_unique<auspex::gtk::ThemeManager>(Gdk::Display::get_default());
         theme->start_watching();
         std::cout << "auspex-shell: theme '" << theme->current_theme_name() << "'\n";
+
+        // One window, then stop. The stylesheet is installed first: a harness that
+        // skips it renders unstyled GTK, and every judgement made from the result
+        // is about the wrong program.
+        if (!only_window.empty()) {
+            if (!open_single_window(*app, only_window, config)) {
+                std::cerr << "auspex-shell: no window called '" << only_window
+                          << "'\n";
+                app->quit();
+            }
+            return;
+        }
 
         voice = std::make_unique<auspex::gtk::VoiceController>(config);
 

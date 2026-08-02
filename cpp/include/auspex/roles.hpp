@@ -68,8 +68,18 @@ const std::vector<RolePersona>& builtin_personas();
 // ~/.local/share/auspex/crew-roles, or $XDG_DATA_HOME's equivalent.
 std::filesystem::path crew_roles_dir();
 
+// Every directory a role file may live in, most specific first: ours, then
+// ollamadev's ~/.ollamadev/crew-roles.
+//
+// Reading theirs matters more than it looks. Four custom roles were sitting there
+// -- architect, debugger, perf, reviewer -- written by somebody who had already
+// decided what they wanted their crew to be, and Auspex could not see one of
+// them. A replacement that silently has fewer roles than the thing it replaces is
+// not a replacement.
+std::vector<std::filesystem::path> crew_roles_dirs();
+
 // Built-ins with any user file merged over them, sorted by name.
-std::vector<RolePersona> all_personas(const std::filesystem::path& dir = crew_roles_dir());
+std::vector<RolePersona> all_personas(const std::filesystem::path& dir = {});
 
 // Parsing separated from the disk, so the merge rules are testable without
 // creating files in somebody's home directory.
@@ -82,12 +92,12 @@ RolePersona merge_persona(const RolePersona& base, const RolePersona& over);
 // The persona for a role name. An unknown role falls back to `coder` -- a
 // Director that invented a role must never strand a subtask without one.
 RolePersona persona_for(const std::string& role,
-                        const std::filesystem::path& dir = crew_roles_dir());
+                        const std::filesystem::path& dir = {});
 
 // True when this role may not write. Read through the same override path as
 // everything else, so a user role can add a read-only reviewer of its own.
 bool role_is_read_only(const std::string& role,
-                       const std::filesystem::path& dir = crew_roles_dir());
+                       const std::filesystem::path& dir = {});
 
 // The block appended to a coder's prompt. Empty for a persona with no prompt,
 // which adds nothing rather than an empty heading.

@@ -99,7 +99,11 @@ std::optional<RolePersona> parse_persona(const std::string& json_text,
     persona.name = lowered(trim(doc.value("name", fallback_name)));
     if (persona.name.empty()) return std::nullopt;
 
+    // Both spellings: ollamadev writes "desc", and the files on disk are theirs.
     persona.description = trim(doc.value("description", std::string{}));
+    if (persona.description.empty()) {
+        persona.description = trim(doc.value("desc", std::string{}));
+    }
     persona.prompt = trim(doc.value("prompt", std::string{}));
 
     // "permission": "readonly" | "write". ABSENT LEAVES THE BASE VALUE ALONE, and
@@ -130,11 +134,27 @@ RolePersona merge_persona(const RolePersona& base, const RolePersona& over) {
     return merged;
 }
 
+std::vector<std::filesystem::path> crew_roles_dirs() {
+    std::vector<std::filesystem::path> dirs;
+    if (const auto ours = crew_roles_dir(); !ours.empty()) dirs.push_back(ours);
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        dirs.push_back(std::filesystem::path(home) / ".ollamadev" / "crew-roles");
+    }
+    return dirs;
+}
+
 std::vector<RolePersona> all_personas(const std::filesystem::path& dir) {
     std::vector<RolePersona> personas = builtin_personas();
 
+    // An explicit directory means exactly that one -- the tests rely on it. Empty
+    // means every place a role can live, ours before theirs.
+    const std::vector<std::filesystem::path> dirs =
+        dir.empty() ? crew_roles_dirs() : std::vector<std::filesystem::path>{dir};
+
     std::error_code ec;
-    if (!dir.empty() && std::filesystem::is_directory(dir, ec)) {
+    for (const auto& dir : dirs) {
+        if (dir.empty() || !std::filesystem::is_directory(dir, ec)) continue;
+
         std::vector<std::filesystem::path> files;
         for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
             if (!entry.is_regular_file()) continue;

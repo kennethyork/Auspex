@@ -490,6 +490,12 @@ RunResult scan_security(const Config& config, const RunOptions& requested,
         result.error = "no such project";
         return finish(result);
     }
+    // A directory is not a project. See unsafe_project_reason(): pointed at $HOME
+    // this would copy the tree once per coder and could land a change in it.
+    if (const std::string why = unsafe_project_reason(options.project); !why.empty()) {
+        result.error = why;
+        return finish(result);
+    }
 
     // NO SANDBOX, and no coder. Nothing here can write: the scan reads the project
     // and produces text. A vulnerability hunt that could also edit files would need
@@ -705,9 +711,136 @@ std::vector<CrewPack> builtin_packs() {
     return packs;
 }
 
+std::vector<std::filesystem::path> crew_pack_dirs() {
+    std::vector<std::filesystem::path> dirs;
+    if (const auto home = data_home(); !home.empty()) dirs.push_back(home / "crew-packs");
+    // ollamadev's. Somebody with packs saved there has already said what team they
+    // want; not reading them would mean shipping fewer packs than the thing this
+    // replaces.
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        dirs.push_back(std::filesystem::path(home) / ".ollamadev" / "crew-packs");
+    }
+    return dirs;
+}
+
+std::optional<CrewPack> parse_pack(const std::string& name,
+                                   const std::string& json_text) {
+    const json doc = json::parse(json_text, nullptr, /*allow_exceptions=*/false);
+    if (doc.is_discarded() || !doc.is_object()) return std::nullopt;
+    if (trim(name).empty()) return std::nullopt;
+
+    CrewPack pack;
+    pack.name = name;
+
+    // Both spellings. The files on disk are ollamadev's, so theirs is not a
+    // fallback -- it is the common case.
+    const auto text = [&doc](std::initializer_list<const char*> keys) -> std::string {
+        for (const char* key : keys) {
+            if (doc.contains(key) && doc[key].is_string()) {
+                return trim(doc[key].get<std::string>());
+            }
+        }
+        return {};
+    };
+    const auto number = [&doc](std::initializer_list<const char*> keys, int fallback) {
+        for (const char* key : keys) {
+            if (doc.contains(key) && doc[key].is_number_integer()) {
+                return doc[key].get<int>();
+            }
+        }
+        return fallback;
+    };
+    const auto flag = [&doc](std::initializer_list<const char*> keys, bool fallback) {
+        for (const char* key : keys) {
+            if (doc.contains(key) && doc[key].is_boolean()) {
+                return doc[key].get<bool>();
+            }
+        }
+        return fallback;
+    };
+
+    pack.options.focus        = text({"focus"});
+    pack.options.max_subtasks = number({"max", "max_subtasks"}, pack.options.max_subtasks);
+    pack.options.amplify      = number({"amplify"}, pack.options.amplify);
+    pack.options.route        = flag({"route"}, pack.options.route);
+    pack.options.debate       = flag({"debate"}, pack.options.debate);
+    pack.options.learn        = flag({"learn"}, pack.options.learn);
+    pack.options.research     = flag({"research"}, pack.options.research);
+    pack.options.security     = flag({"security"}, pack.options.security);
+    pack.options.verify_attempts =
+        number({"verify", "verify_attempts"}, pack.options.verify_attempts);
+    if (pack.options.verify_attempts > 0) pack.options.coder.allow_run = true;
+
+    // Per-role models and backends, under either spelling.
+    for (const auto& role : configurable_roles()) {
+        const std::string camel = role.key;
+        std::string Camel = camel;
+        if (!Camel.empty()) Camel[0] = static_cast<char>(std::toupper(Camel[0]));
+
+        if (const auto model =
+                text({(camel + "Model").c_str(), (camel + "_model").c_str()});
+            !model.empty()) {
+            pack.options.role_models[role.key] = model;
+        }
+        if (const auto backend =
+                text({(camel + "Backend").c_str(), (camel + "_backend").c_str()});
+            !backend.empty()) {
+            pack.options.role_backends[role.key] = backend;
+        }
+    }
+
+    // Keys with no equivalent here -- skills, hosts, land -- are ignored rather
+    // than refused: a pack that mentions something Auspex does not have should
+    // still bring across the parts it does.
+    return pack;
+}
+
+std::vector<CrewPack> user_packs() {
+    std::vector<CrewPack> packs;
+    std::error_code ec;
+
+    for (const auto& dir : crew_pack_dirs()) {
+        if (dir.empty() || !std::filesystem::is_directory(dir, ec)) continue;
+
+        std::vector<std::filesystem::path> files;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() != ".json") continue;
+            files.push_back(entry.path());
+        }
+        std::sort(files.begin(), files.end());   // same order twice
+
+        for (const auto& file : files) {
+            const std::string name = file.stem().string();
+            // The FIRST directory wins, so an Auspex pack shadows an ollamadev one
+            // of the same name rather than the other way round.
+            if (std::any_of(packs.begin(), packs.end(),
+                            [&](const CrewPack& p) { return p.name == name; })) {
+                continue;
+            }
+            if (auto parsed = parse_pack(name, read_whole(file))) {
+                packs.push_back(std::move(*parsed));
+            }
+        }
+    }
+    return packs;
+}
+
+std::vector<CrewPack> all_packs() {
+    std::vector<CrewPack> packs = builtin_packs();
+    for (auto& saved : user_packs()) {
+        const auto at = std::find_if(packs.begin(), packs.end(),
+                                     [&](const CrewPack& p) { return p.name == saved.name; });
+        // A saved pack of the same name wins: the more specific one decides.
+        if (at != packs.end()) *at = std::move(saved);
+        else packs.push_back(std::move(saved));
+    }
+    return packs;
+}
+
 std::optional<CrewPack> find_pack(const std::string& name) {
     if (name.empty()) return std::nullopt;
-    for (const auto& pack : builtin_packs()) {
+    for (const auto& pack : all_packs()) {
         if (pack.name == name) return pack;
     }
     return std::nullopt;
@@ -1096,6 +1229,12 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
 
     if (!is_project_dir(options.project)) {
         result.error = "no such project";
+        return finish(result);
+    }
+    // A directory is not a project. See unsafe_project_reason(): pointed at $HOME
+    // this would copy the tree once per coder and could land a change in it.
+    if (const std::string why = unsafe_project_reason(options.project); !why.empty()) {
+        result.error = why;
         return finish(result);
     }
 

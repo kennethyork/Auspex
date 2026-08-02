@@ -43,8 +43,21 @@ const std::vector<std::string>& director_roles() {
 }
 
 bool is_known_role(const std::string& role) {
-    const auto& roles = director_roles();
-    return std::find(roles.begin(), roles.end(), role) != roles.end();
+    // The BUILT-IN list, plus any role the user has written.
+    //
+    // director_prompt offers role_catalog(all_personas()), so the Director is
+    // already told about a custom architect or perf role -- and until this also
+    // knew about them, choosing one was silently collapsed to "coder". The
+    // Director was being shown a menu and then overruled, which is worse than
+    // never offering the choice.
+    if (const auto& roles = director_roles();
+        std::find(roles.begin(), roles.end(), role) != roles.end()) {
+        return true;
+    }
+    for (const auto& persona : all_personas()) {
+        if (persona.name == role) return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
