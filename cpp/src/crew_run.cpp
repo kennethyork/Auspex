@@ -630,9 +630,16 @@ std::vector<CrewPack> builtin_packs() {
     quick.options.parallel     = 1;
     packs.push_back(quick);
 
+    // "tested" already existed here meaning "coders may run tests", and ollamadev
+    // has one of the same name meaning "work test-first". They are the same
+    // intention stated at two levels, so they are merged rather than shipped as
+    // two packs a person has to choose between.
     CrewPack tested;
     tested.name = "tested";
     tested.options.coder.allow_run = true;
+    tested.options.focus =
+        "build with test-first discipline -- every change covered by a test that "
+        "runs green; do not finish with failing or missing tests";
     packs.push_back(tested);
 
     CrewPack audit;
@@ -644,6 +651,53 @@ std::vector<CrewPack> builtin_packs() {
     learning.name = "learning";
     learning.options.learn = true;
     packs.push_back(learning);
+
+    // --- what kind of thing is being built --------------------------------------
+    //
+    // A SECOND AXIS. The five above say how the crew should WORK -- debate it,
+    // keep it to one coder, let it run tests. These say what it is WORKING ON,
+    // which changes what a sensible plan looks like and what the coders should
+    // already know. Ported from ollamadev-qt, where they are the packs people
+    // actually reach for.
+    //
+    // A pack sets `focus`, and focus does two things: the Director plans against
+    // it, and the project-type starters are matched on it.
+    const auto project = [&packs](const char* name, const char* focus,
+                                  int amplify = 0) {
+        CrewPack pack;
+        pack.name = name;
+        pack.options.focus = focus;
+        // Where an adversarial panel pays for itself. A bugfix and a refactor are
+        // both "change as little as possible", which is exactly the judgement one
+        // reviewer is worst at and several are best at.
+        pack.options.amplify = amplify;
+        packs.push_back(pack);
+    };
+
+    project("web-app",
+            "a web application -- an HTML/CSS/JS frontend plus its backend; "
+            "prioritise a working UI, sensible routing, and a clean separation of "
+            "concerns");
+    project("rest-api",
+            "a REST API -- clear resource endpoints, input validation, consistent "
+            "error responses, and a test for each route");
+    project("cli-tool",
+            "a command-line tool -- argument parsing, a helpful --help, clear error "
+            "messages, and correct exit codes");
+    project("data-pipeline",
+            "a data-processing pipeline -- robust parsing, transformation, "
+            "validation, and explicit handling of malformed or edge-case input");
+    project("library",
+            "a reusable library or package -- a small clear public API, "
+            "documentation on it, no side effects on import, and unit tests");
+    project("bugfix",
+            "find and fix the bug with the smallest correct change, then add a "
+            "regression test that fails before the fix and passes after",
+            /*amplify=*/3);
+    project("refactor",
+            "refactor for clarity and structure WITHOUT changing behaviour; keep "
+            "the public API stable and the diff reviewable",
+            /*amplify=*/3);
 
     return packs;
 }
@@ -1139,7 +1193,13 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
     // edited: a starter you disagree with should be changeable, and the next run
     // will leave your version alone. Anything you already had wins outright.
     if (options.starter_skills) {
-        const auto matched = skills_for_focus(options.task);
+        // Two axes, matched against two different things. The capability starters
+        // answer "what does this TASK need"; the project starters answer "what
+        // does this KIND OF PROJECT need", which the task never says.
+        auto matched = skills_for_focus(options.task);
+        for (const auto& spec : project_starters_for(options.focus)) {
+            matched.push_back(spec);
+        }
         const auto written =
             materialize_skills(matched, options.project, skills.skills);
         if (!written.empty()) {
@@ -1208,7 +1268,8 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
         note("plan: asking " + options.director_backend);
         const std::string reply =
             ask_cli(options.director_backend, options.model_for("director"),
-                    director_prompt(options.task, files, options.max_subtasks, hint),
+                    director_prompt(options.task, files, options.max_subtasks,
+                                    hint, options.focus),
                     options.project);
         plan = parse_plan(reply, options.max_subtasks);
     } else if (options.amplify > 1) {

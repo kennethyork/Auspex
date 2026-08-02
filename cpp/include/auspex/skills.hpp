@@ -96,6 +96,22 @@ const std::vector<SkillSpec>& starter_skills();
 // here is a coder reading five irrelevant documents.
 std::vector<SkillSpec> skills_for_focus(const std::string& focus, int cap = 4);
 
+// Project-type starters: what a KIND of project needs, as opposed to what a task
+// needs. Ported from ollamadev-qt's crew team library.
+//
+// Matched against the crew's FOCUS, never against the task. "a SaaS product"
+// says scope every query by tenant; "an e-commerce store" says keep money in
+// integer minor units. Neither is derivable from "add a discount field", which
+// is the task a coder would otherwise be given alone.
+const std::vector<SkillSpec>& project_starters();
+
+// The project starters whose triggers appear in `focus`, most specific first.
+//
+// A tighter cap than the capability starters: a project has ONE type, and
+// matching three means the triggers were vague rather than that the project is
+// three things.
+std::vector<SkillSpec> project_starters_for(const std::string& focus, int cap = 2);
+
 // Write each spec to `base/.auspex/skills/<name>/SKILL.md`. Returns the names now
 // available there.
 //

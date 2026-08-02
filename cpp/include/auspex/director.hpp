@@ -68,9 +68,14 @@ struct Plan {
 // `hint` is anything already known about WHERE the work is -- in practice the
 // semantic index's answer, which turns a filename list into a filename list plus
 // "these ones matter". Empty when there is no index; planning must work without.
+// `focus` is what KIND of thing is being built, in a sentence -- "an e-commerce
+// store", "a REST API". It goes ABOVE the task, because it changes what a
+// sensible plan looks like: the same "add a discount field" is cut up differently
+// for a shop than for a library.
 std::string director_prompt(const std::string& task,
                             const std::vector<std::string>& files,
-                            int max_subtasks, const std::string& hint = {});
+                            int max_subtasks, const std::string& hint = {},
+                            const std::string& focus = {});
 
 // Reads the Director's reply.
 //

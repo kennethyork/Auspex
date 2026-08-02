@@ -6901,6 +6901,118 @@ void test_starter_skills() {
         }
     }
 
+    // ---- project-type starters ----
+    //
+    // A second axis: the capability starters answer "what does this TASK need",
+    // these answer "what does this KIND of project need". A shop keeps money in
+    // integer minor units, and no task ever says so.
+    {
+        const auto& library = project_starters();
+        check(library.size() >= 30, "the ported project library is here");
+        for (const auto& spec : library) {
+            check(!spec.name.empty(), "every project starter is named");
+            check(!spec.triggers.empty(), "and can be matched: " + spec.name);
+            check(!spec.body.empty(), "and says something: " + spec.name);
+            for (const auto& trigger : spec.triggers) {
+                std::string lower = trigger;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) {
+                                   return static_cast<char>(std::tolower(c));
+                               });
+                check(trigger == lower,
+                      "triggers are lowercase or they could never fire: " + trigger);
+            }
+        }
+
+        const auto shop = project_starters_for("an e-commerce store with a checkout");
+        check(!shop.empty(), "a shop matches something");
+        if (!shop.empty()) {
+            check_eq(shop[0].name, std::string("ecommerce"), "and it is the shop starter");
+            check(shop[0].body.find("minor units") != std::string::npos,
+                  "which carries the thing a task would never say");
+        }
+
+        check(project_starters_for("").empty(), "an empty focus matches nothing");
+
+        // Two axes, kept apart. A TASK about tests must not pull in a project type.
+        check(project_starters_for("add unit tests for the parser").empty(),
+              "a task-shaped sentence matches no project type");
+    }
+
+    // ---- every project pack reaches its own starter ----
+    //
+    // The invariant that was broken on arrival: the data-pipeline PACK said
+    // "a data-processing pipeline" and the data-pipeline STARTER triggered only on
+    // "data pipeline", so the two halves of one preset never met. A pack naming a
+    // project type must light up the starter of that type, or the preset is half
+    // a preset and nothing says so.
+    {
+        for (const auto& pack : builtin_packs()) {
+            if (pack.options.focus.empty()) continue;
+
+            const bool names_a_type =
+                std::any_of(project_starters().begin(), project_starters().end(),
+                            [&](const SkillSpec& s) { return s.name == pack.name; }) ||
+                pack.name == "cli-tool" || pack.name == "data-pipeline";
+            if (!names_a_type) continue;   // behaviour packs: bugfix, refactor, tested
+
+            check(!project_starters_for(pack.options.focus).empty(),
+                  "the " + pack.name + " pack's focus matches a project starter");
+        }
+
+        // And the behaviour packs deliberately match none.
+        for (const char* name : {"bugfix", "refactor", "tested"}) {
+            const auto pack = find_pack(name);
+            check(pack.has_value(), std::string("there is a ") + name + " pack");
+            if (pack) {
+                check(project_starters_for(pack->options.focus).empty(),
+                      std::string(name) +
+                          " is about HOW to work, so it matches no project type");
+            }
+        }
+    }
+
+    // ---- the packs themselves ----
+    {
+        check(builtin_packs().size() >= 12, "both axes of packs are present");
+        for (const char* name : {"careful", "quick", "tested", "security", "learning",
+                                 "web-app", "rest-api", "cli-tool", "data-pipeline",
+                                 "library", "bugfix", "refactor"}) {
+            check(find_pack(name).has_value(), std::string("there is a ") + name + " pack");
+        }
+        check(!find_pack("no-such-pack").has_value(), "and an unknown name yields none");
+
+        // The merged one: ollamadev's "tested" means work test-first, Auspex's
+        // meant coders may run tests. Same intention at two levels, so one pack.
+        const auto tested = find_pack("tested");
+        check(tested && tested->options.coder.allow_run,
+              "tested lets coders run the tests");
+        check(tested && !tested->options.focus.empty(),
+              "and tells them to write them first");
+
+        // Where an adversarial panel actually pays for itself.
+        const auto bugfix = find_pack("bugfix");
+        check(bugfix && bugfix->options.amplify == 3,
+              "bugfix reviews with a panel -- 'change as little as possible' is the "
+              "judgement one reviewer is worst at");
+    }
+
+    // ---- the Director is told what is being built ----
+    {
+        const std::string plain = director_prompt("add a discount field", {}, 4);
+        check(plain.find("What is being built") == std::string::npos,
+              "with no focus the prompt says nothing about one");
+
+        const std::string focused =
+            director_prompt("add a discount field", {}, 4, {}, "an e-commerce store");
+        check(focused.find("What is being built") != std::string::npos,
+              "with a focus it does");
+        check(focused.find("e-commerce store") != std::string::npos, "and names it");
+        check(focused.find("What is being built") < focused.find("The task:"),
+              "above the task, because it changes what a good plan looks like "
+              "rather than adding detail to one");
+    }
+
     // ---- matching ----
     {
         const auto sql = skills_for_focus("fix the SQL injection in the user query");
@@ -8631,6 +8743,18 @@ int main(int argc, char** argv) {
         // "run" as a 6th argument turns on command execution for the coders.
         // Opt-in on the command line as well as in the struct, because this is the
         // switch that lets a model start a process.
+        // A pack first, so the flags below can still override one knob of it.
+        if (args.size() >= 6) {
+            if (const auto pack = auspex::find_pack(args[5])) {
+                const auto project = options.project;
+                const auto task = options.task;
+                const int max_subtasks = options.max_subtasks;
+                options = pack->options;
+                options.project = project;
+                options.task = task;
+                options.max_subtasks = max_subtasks;
+            }
+        }
         if (args.size() >= 6 && args[5] == "run")      options.coder.allow_run = true;
         if (args.size() >= 6 && args[5] == "debate")   options.debate = true;
         if (args.size() >= 6 && args[5] == "security") options.security = true;
@@ -8654,7 +8778,13 @@ int main(int argc, char** argv) {
         std::cout << "\nrun " << result.run_id << ": " << result.applied
                   << " applied · " << result.held << " held\n\n";
 
+        // THIS run's holds, not the whole board. The board is global and outlives
+        // every run on it, so printing all of it after a run shows entries from
+        // other projects under this run's heading -- which cost me an hour reading
+        // a stale "the Auditor could not be reached" as though it were current.
+        // --board still shows everything, which is its job.
         for (const auto& item : auspex::read_board()) {
+            if (item.repo_root != options.project.string()) continue;
             std::cout << "  #" << item.n << "  " << item.summary << "\n"
                       << "      " << item.reason << "\n"
                       << "      " << item.files << " files, lands in "

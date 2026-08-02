@@ -1,5 +1,6 @@
 #include "auspex/ollama_client.hpp"
 
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -44,6 +45,20 @@ std::string join_url(std::string base, const std::string& path) {
 }  // namespace
 
 OllamaClient::OllamaClient(Config config) : config_(std::move(config)) {
+    // curl_global_init BEFORE any easy handle, exactly once, and safe to race on.
+    //
+    // libcurl will do this implicitly from curl_easy_init if nobody has -- and
+    // that implicit path is explicitly NOT thread-safe. Auspex builds a client per
+    // model call and the crew makes those from coder worker threads, so the
+    // implicit init is reached from several threads at once.
+    //
+    // What it looks like when it goes wrong is not a crash: it is a request that
+    // quietly fails. Chased for a while as "the Auditor could not be reached",
+    // which was true and said nothing about why -- the Auditor is simply the call
+    // that happens after the threads have started.
+    static std::once_flag once;
+    std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+
     curl_ = curl_easy_init();
 }
 
@@ -108,12 +123,37 @@ OllamaClient::HttpResult OllamaClient::post_json(const std::string& path,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout.count()));
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
-    const CURLcode rc = curl_easy_perform(curl);
-    curl_slist_free_all(headers);
-    if (rc != CURLE_OK) return result;
+    // Retried on 429 and 5xx, and ONLY those.
+    //
+    // A hosted model answering "temporarily overloaded, please retry shortly" is
+    // not a failure, it is a queue -- and treating it as one threw away a coder's
+    // entire finished work, because an audit that cannot happen holds. Measured:
+    // the Auditor failed on three runs out of three with a 503 while a smaller
+    // request to the same model on the same connection succeeded.
+    //
+    // Only on a real HTTP status, never on a transport error. A request that hung
+    // has already spent the whole timeout, and retrying it would multiply a stall
+    // by three rather than recover from anything.
+    constexpr int kAttempts = 3;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        result.body.clear();
+        const CURLcode rc = curl_easy_perform(curl);
+        if (rc != CURLE_OK) break;
 
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status);
-    result.ok = result.status >= 200 && result.status < 300;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status);
+        result.ok = result.status >= 200 && result.status < 300;
+        if (result.ok) break;
+
+        const bool worth_retrying =
+            result.status == 429 || (result.status >= 500 && result.status < 600);
+        if (!worth_retrying || attempt == kAttempts - 1) break;
+
+        // Backing off rather than hammering: the server has just said it is out of
+        // capacity, and asking again immediately is how a queue becomes a spiral.
+        std::this_thread::sleep_for(std::chrono::seconds(1 + 2 * attempt));
+    }
+
+    curl_slist_free_all(headers);
     return result;
 }
 
@@ -154,11 +194,30 @@ std::optional<GenerateResult> OllamaClient::generate(const std::string& model,
     if (opts.temperature >= 0)  options["temperature"] = opts.temperature;
     if (!options.empty())       req["options"] = std::move(options);
 
+    last_error_.clear();
+
     const auto res = post_json("/api/generate", safe_dump(req), std::chrono::seconds(120));
-    if (!res.ok) return std::nullopt;
+    if (!res.ok) {
+        // The server's own words where it gave any -- "temporarily overloaded" is
+        // a different problem from "nothing is listening", and only one of them is
+        // fixed by picking another model.
+        const json body = json::parse(res.body, nullptr, false);
+        if (!body.is_discarded() && body.is_object() && body.contains("error") &&
+            body["error"].is_string()) {
+            last_error_ = body["error"].get<std::string>();
+        } else if (res.status > 0) {
+            last_error_ = "the model server answered " + std::to_string(res.status);
+        } else {
+            last_error_ = "the model server could not be reached";
+        }
+        return std::nullopt;
+    }
 
     const json j = json::parse(res.body, nullptr, false);
-    if (j.is_discarded() || !j.is_object() || !j.contains("response")) return std::nullopt;
+    if (j.is_discarded() || !j.is_object() || !j.contains("response")) {
+        last_error_ = "the model server sent a reply that could not be understood";
+        return std::nullopt;
+    }
 
     GenerateResult out;
     out.response = j.value("response", std::string{});

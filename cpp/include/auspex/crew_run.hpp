@@ -74,6 +74,17 @@ struct RunOptions {
     int max_subtasks = 4;
     int parallel     = 4;
 
+    // What KIND of thing this crew is building, in a sentence.
+    //
+    // Not the task -- the task is "add a discount field"; the focus is "an
+    // e-commerce store". The Director plans against it, and it is what the
+    // project-type starters are matched on, because "keep money in integer minor
+    // units" is not derivable from the task and is exactly the thing a coder gets
+    // wrong once and you find out about at checkout.
+    //
+    // Usually set by a pack rather than typed: see builtin_packs().
+    std::string focus;
+
     // Empty uses config.ollama_model for every role.
     std::string model;
 

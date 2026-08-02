@@ -552,7 +552,13 @@ Audit audit_changeset(const Config& config, const PlannedSubtask& subtask,
                                        options);
     if (!reply) {
         Audit unreachable;
-        unreachable.reason = "the Auditor could not be reached, so this was not reviewed";
+        // The server's reason, not our guess at it. "Could not be reached" was
+        // wrong often enough to be actively misleading: the real answer was
+        // usually "that model is temporarily overloaded", which tells you to pick
+        // another one rather than to go looking for a network fault.
+        const std::string why = ollama.last_error();
+        unreachable.reason =
+            "not reviewed: " + (why.empty() ? "the Auditor could not be reached" : why);
         return unreachable;   // Hold. An unreviewed change is not an approved one.
     }
 

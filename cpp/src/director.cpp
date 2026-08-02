@@ -50,7 +50,8 @@ bool is_known_role(const std::string& role) {
 // ---------------------------------------------------------------------------
 std::string director_prompt(const std::string& task,
                             const std::vector<std::string>& files,
-                            int max_subtasks, const std::string& hint) {
+                            int max_subtasks, const std::string& hint,
+                            const std::string& focus) {
     if (max_subtasks < 1) max_subtasks = 1;
 
     std::ostringstream out;
@@ -92,6 +93,13 @@ std::string director_prompt(const std::string& task,
     // Before the task, so it is read as context for it rather than as an
     // afterthought. A filename list says what exists; this says what is relevant.
     if (!hint.empty()) out << hint;
+
+    // Above the task, because it changes what a good plan looks like rather than
+    // adding detail to one: the same task is cut up differently for a shop than
+    // for a library.
+    if (!trim(focus).empty()) {
+        out << "What is being built:\n" << trim(focus) << "\n\n";
+    }
 
     out << "The task:\n" << task << "\n\n";
 

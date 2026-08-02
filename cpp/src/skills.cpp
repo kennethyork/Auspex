@@ -389,16 +389,20 @@ const std::vector<SkillSpec>& starter_skills() {
     return kLibrary;
 }
 
-std::vector<SkillSpec> skills_for_focus(const std::string& focus, int cap) {
+namespace {
+
+// Which of `library` matches `text`, most specific first.
+//
+// Shared by both libraries because the rule is the same one: score is the LENGTH
+// of the longest trigger that occurs, so a long trigger ("progressive web app")
+// beats a short one ("api") and the vague matches are what the cap drops.
+std::vector<SkillSpec> matching(const std::vector<SkillSpec>& library,
+                                const std::string& text, int cap) {
     std::vector<SkillSpec> chosen;
-    const std::string text = lowered(trim(focus));
     if (text.empty() || cap <= 0) return chosen;
 
-    // Score = the LENGTH of the longest trigger that occurs. A long trigger
-    // ("database migration") is a much stronger signal than a short one ("api"),
-    // so when the cap bites it is the vague matches that go.
     std::vector<std::pair<std::size_t, const SkillSpec*>> hits;
-    for (const auto& spec : starter_skills()) {
+    for (const auto& spec : library) {
         std::size_t best = 0;
         for (const auto& trigger : spec.triggers) {
             if (text.find(trigger) != std::string::npos) {
@@ -409,7 +413,7 @@ std::vector<SkillSpec> skills_for_focus(const std::string& focus, int cap) {
     }
 
     // stable_sort, so two equally specific matches keep the library's order and
-    // the same task picks the same skills twice.
+    // the same text picks the same skills twice.
     std::stable_sort(hits.begin(), hits.end(),
                      [](const auto& a, const auto& b) { return a.first > b.first; });
 
@@ -419,6 +423,16 @@ std::vector<SkillSpec> skills_for_focus(const std::string& focus, int cap) {
         chosen.push_back(*spec);
     }
     return chosen;
+}
+
+}  // namespace
+
+std::vector<SkillSpec> project_starters_for(const std::string& focus, int cap) {
+    return matching(project_starters(), lowered(trim(focus)), cap);
+}
+
+std::vector<SkillSpec> skills_for_focus(const std::string& focus, int cap) {
+    return matching(starter_skills(), lowered(trim(focus)), cap);
 }
 
 std::vector<std::string> materialize_skills(const std::vector<SkillSpec>& specs,

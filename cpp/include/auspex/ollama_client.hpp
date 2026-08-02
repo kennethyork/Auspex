@@ -118,6 +118,15 @@ public:
                                std::chrono::seconds timeout = std::chrono::minutes(15),
                                std::chrono::seconds interval = std::chrono::seconds(30));
 
+    // Why the last call failed, in the server's own words when it gave any.
+    //
+    // generate() returns nullopt for every kind of failure, which made every one
+    // of them read as "could not be reached". That sentence cost a long chase: the
+    // real answer was a 503 saying the model was temporarily overloaded, which is
+    // both obvious and immediately actionable once you can see it. A caller that
+    // reports a failure to a person should report THIS, not its own guess.
+    const std::string& last_error() const { return last_error_; }
+
     const Config& config() const { return config_; }
 
 private:
@@ -132,7 +141,8 @@ private:
                          std::chrono::seconds timeout);
     OracleStatus verify_model(const StatusCallback& on_update);
 
-    Config config_;
+    Config      config_;
+    std::string last_error_;
     void*  curl_ = nullptr;  // CURL* — kept opaque to avoid leaking curl.h here
 };
 
