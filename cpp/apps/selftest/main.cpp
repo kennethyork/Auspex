@@ -40,6 +40,7 @@
 #include "auspex/director.hpp"
 #include "auspex/eval.hpp"
 #include "auspex/hooks.hpp"
+#include "auspex/json_util.hpp"
 #include "auspex/linters.hpp"
 #include "auspex/roles.hpp"
 #include "auspex/usage.hpp"
@@ -4897,6 +4898,48 @@ void test_changeset_conflicts() {
         std::ofstream out(root / "calc.py");
         out << text;
     };
+
+    // ---- a file in your project cannot crash the shell ----
+    //
+    // nlohmann's dump() THROWS on a string that is not valid UTF-8, from deep
+    // inside a serialiser called from a dozen places, so in practice the process
+    // dies. Every string this program puts in JSON can come from a file it did not
+    // write -- a prompt carries file contents, a manifest carries a diff.
+    //
+    // Found by pointing the crew at a second real repository: it died on
+    // json.exception.type_error.316 before the Director had said anything, because
+    // that project has two files whose bytes are not UTF-8.
+    {
+        // A lone continuation byte: valid nowhere, and exactly what a truncated
+        // multi-byte sequence at a read boundary looks like.
+        const std::string bad = std::string("prefix \xC3 suffix\n") + "\xFF\xFE more";
+
+        bool threw = false;
+        try {
+            (void)nlohmann::json{{"contents", bad}}.dump();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        check(threw, "the plain dump really does throw on this input");
+
+        std::string dumped;
+        bool safe_threw = false;
+        try {
+            dumped = safe_dump(nlohmann::json{{"contents", bad}});
+        } catch (const std::exception&) {
+            safe_threw = true;
+        }
+        check(!safe_threw, "and safe_dump does not");
+        check(!dumped.empty(), "producing something rather than nothing");
+        check(dumped.find("prefix") != std::string::npos,
+              "with the valid text still readable");
+        check(dumped.find("suffix") != std::string::npos,
+              "on both sides of the bad byte");
+
+        // And it still parses, which is what the run state and the manifest need.
+        const auto reparsed = nlohmann::json::parse(dumped, nullptr, false);
+        check(!reparsed.is_discarded(), "and the result is valid JSON");
+    }
 
     // ---- a coder's changeset is what IT changed ----
     //

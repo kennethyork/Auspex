@@ -10,6 +10,7 @@
 #include "auspex/ollama_client.hpp"
 #include "auspex/process.hpp"
 #include "auspex/sandbox.hpp"
+#include "auspex/json_util.hpp"
 
 using json = nlohmann::json;
 
@@ -148,7 +149,7 @@ std::string encode_index(const std::vector<CodeChunk>& chunks,
     }
     // Compact: an index of a real project is thousands of vectors of hundreds of
     // floats, and pretty-printing it would triple a file nobody reads by eye.
-    return document.dump();
+    return safe_dump(document);
 }
 
 std::vector<CodeChunk> decode_index(const std::string& json_text) {

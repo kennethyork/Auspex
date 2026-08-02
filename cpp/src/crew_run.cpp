@@ -20,6 +20,7 @@
 #include "auspex/projects.hpp"
 #include "auspex/roles.hpp"
 #include "auspex/router.hpp"
+#include "auspex/json_util.hpp"
 
 using json = nlohmann::json;
 
@@ -140,7 +141,7 @@ bool save_changeset(const std::filesystem::path& dir, const Changeset& changeset
         ++index;
     }
 
-    if (!write_atomically(dir / "manifest.json", manifest.dump(2))) {
+    if (!write_atomically(dir / "manifest.json", safe_dump(manifest, 2))) {
         return fail("could not write the manifest");
     }
     return true;
@@ -741,7 +742,7 @@ std::string encode_board(const std::vector<BoardItem>& items) {
 
         array.push_back(std::move(entry));
     }
-    return array.dump(2);
+    return safe_dump(array, 2);
 }
 
 std::vector<BoardItem> read_board() {
@@ -839,7 +840,7 @@ std::string encode_state(const std::string& run_id, const std::string& task,
     }
     document["subtasks"] = std::move(subtasks);
 
-    return document.dump(2);
+    return safe_dump(document, 2);
 }
 
 }  // namespace

@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include "auspex/process.hpp"
+#include "auspex/json_util.hpp"
 
 namespace auspex {
 
@@ -135,7 +136,7 @@ std::string hook_payload(HookEvent event, const std::string& subject,
         {"subject", subject},
         {"detail", detail},
     };
-    return payload.dump();
+    return safe_dump(payload);
 }
 
 HookOutcome run_pre_tool_hooks(const std::string& subject, const std::string& detail,

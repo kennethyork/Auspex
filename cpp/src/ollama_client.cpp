@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include "auspex/usage.hpp"
+#include "auspex/json_util.hpp"
 
 using json = nlohmann::json;
 
@@ -153,7 +154,7 @@ std::optional<GenerateResult> OllamaClient::generate(const std::string& model,
     if (opts.temperature >= 0)  options["temperature"] = opts.temperature;
     if (!options.empty())       req["options"] = std::move(options);
 
-    const auto res = post_json("/api/generate", req.dump(), std::chrono::seconds(120));
+    const auto res = post_json("/api/generate", safe_dump(req), std::chrono::seconds(120));
     if (!res.ok) return std::nullopt;
 
     const json j = json::parse(res.body, nullptr, false);
@@ -204,7 +205,7 @@ std::vector<float> OllamaClient::embed(const std::string& model,
     body["model"]  = model;
     body["prompt"] = text;
 
-    const auto reply = post_json("/api/embeddings", body.dump(), timeout);
+    const auto reply = post_json("/api/embeddings", safe_dump(body), timeout);
     if (!reply.ok) return {};
 
     const auto document = json::parse(reply.body, nullptr, /*allow_exceptions=*/false);

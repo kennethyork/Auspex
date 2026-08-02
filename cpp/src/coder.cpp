@@ -11,6 +11,7 @@
 #include "auspex/code_index.hpp"
 #include "auspex/sandbox.hpp"
 #include "auspex/roles.hpp"
+#include "auspex/json_util.hpp"
 
 using json = nlohmann::json;
 
@@ -568,9 +569,9 @@ ToolCall parse_tool_call(const std::string& reply) {
         // through so what reaches the server is JSON we produced, not a string
         // the model claimed was JSON.
         if (document.contains("arguments") && document["arguments"].is_object()) {
-            call.mcp_arguments = document["arguments"].dump();
+            call.mcp_arguments = safe_dump(document["arguments"]);
         } else if (document.contains("args") && document["args"].is_object()) {
-            call.mcp_arguments = document["args"].dump();
+            call.mcp_arguments = safe_dump(document["args"]);
         } else {
             call.mcp_arguments = "{}";
         }
