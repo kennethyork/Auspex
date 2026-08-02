@@ -356,6 +356,8 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
         return outcome;
     }
 
+    outcome.model = model.empty() ? config.ollama_model : model;
+
     OllamaClient ollama(config);
 
     GenerateOptions options;

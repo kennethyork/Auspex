@@ -27,6 +27,7 @@
 #include "auspex/canvas.hpp"
 #include "auspex/commands.hpp"
 #include "auspex/crew.hpp"
+#include "auspex/crew_run.hpp"
 #include "auspex/desktop.hpp"
 #include "auspex/display.hpp"
 #include "auspex/desktop_entries.hpp"
@@ -5310,9 +5311,193 @@ void test_auditor() {
         check(!parse_audit(R"({"verdict":"hold"})").reason.empty(),
               "a reasonless hold is still given a reason");
 
+        // The quote is carried through, so it can be checked against the patch.
+        const Audit quoted = parse_audit(
+            R"({"verdict":"hold","rule":4,"quote":"    return a * b","reason":"broken"})");
+        check(quoted.held(), "a rule-and-quote hold is a hold");
+        check_eq(quoted.quote, std::string("    return a * b"), "and keeps its quote");
+    }
+
+    // ---- is the objection about a line that exists? ----
+    //
+    // A run held CORRECT Python with the reason "the docstring is incorrectly
+    // placed before the return statement instead of after the function definition
+    // and before the code" -- which describes one position twice and was simply
+    // wrong. A hold whose evidence is not in the patch is an invention, and this
+    // is the only way to tell that from a real objection without reading the code.
+    {
+        const std::string diff =
+            "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " def mul(a, b):\n"
+            "+    \"\"\"Multiply two numbers.\"\"\"\n"
+            "     return a * b\n";
+
+        check(quote_is_real("return a * b", diff), "a line that is there is found");
+        check(quote_is_real("+    \"\"\"Multiply two numbers.\"\"\"", diff),
+              "including one quoted with its margin");
+        check(quote_is_real("return   a  *  b", diff),
+              "and one quoted with careless whitespace");
+        check(quote_is_real("def mul(a, b):", diff), "context lines count too");
+
+        check(!quote_is_real("import os", diff), "a line that is not there is not found");
+        check(!quote_is_real("return a + b", diff),
+              "and neither is a plausible near-miss");
+        check(!quote_is_real("", diff), "an empty quote proves nothing");
+        check(!quote_is_real("anything", ""), "and neither does an empty diff");
+    }
+
+    {
         // The default-constructed Audit holds. This is the property the whole file
         // rests on: a forgotten assignment must not land a patch.
         check(Audit{}.held(), "an Audit holds until something says otherwise");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run orchestration
+// ---------------------------------------------------------------------------
+void test_crew_run() {
+    using namespace auspex;
+    std::cout << "\nrun orchestration\n";
+
+    const auto file_of = [](const std::string& path) {
+        return ChangedFile{path, "contents of " + path, false};
+    };
+
+    // ---- overlap ----
+    //
+    // Coders work in separate copies and cannot see each other, so nothing stops
+    // two of them editing one file. Applying both means the second silently
+    // overwrites the first -- INCLUDING the parts the Auditor approved. This is
+    // the check that turns that into a held decision instead.
+    {
+        Changeset a; a.files = {file_of("src/main.cpp"), file_of("README.md")};
+        Changeset b; b.files = {file_of("src/other.cpp")};
+        Changeset c; c.files = {file_of("README.md")};
+
+        check(overlapping_files(a, b).empty(), "independent changesets do not overlap");
+
+        const auto shared = overlapping_files(a, c);
+        check_eq(shared.size(), std::size_t{1}, "a shared file is found");
+        if (!shared.empty()) check_eq(shared[0], std::string("README.md"), "by name");
+
+        // Both directions, because which one is "first" is an accident of
+        // scheduling and must not change the answer.
+        check_eq(overlapping_files(c, a).size(), std::size_t{1}, "and in either order");
+
+        Changeset both; both.files = {file_of("src/main.cpp"), file_of("README.md")};
+        check_eq(overlapping_files(a, both).size(), std::size_t{2}, "two shared files");
+
+        check(overlapping_files({}, a).empty(), "nothing overlaps an empty changeset");
+        check(overlapping_files({}, {}).empty(), "or two of them");
+
+        // A deletion still counts as touching the file. Landing an edit and a
+        // deletion of one file in either order is a coin flip, which is exactly
+        // what holding is for.
+        Changeset deleter;
+        deleter.files = {{"README.md", "", true}};
+        check_eq(overlapping_files(a, deleter).size(), std::size_t{1},
+                 "a deletion collides with an edit");
+    }
+
+    // ---- the changeset store ----
+    //
+    // A decision outlives the process: a run finishes, the board sits there, and
+    // you accept something after lunch. If this does not round-trip, that accept
+    // applies the wrong bytes or nothing at all.
+    {
+        const auto root = std::filesystem::temp_directory_path() / "auspex-selftest-store";
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+
+        Changeset original;
+        original.files = {
+            {"src/a.py", "print('a')\n", false},
+            {"src/b.py", "", true},                       // a deletion
+            {"weird.txt", std::string("line\0with nul", 12), false},
+        };
+        original.diff = "diff --git a/src/a.py b/src/a.py\n+print('a')\n";
+
+        std::string error;
+        check(save_changeset(root, original, &error), "a changeset saves");
+
+        const Changeset loaded = load_changeset(root);
+        check_eq(loaded.files.size(), original.files.size(), "and loads back");
+        check_eq(loaded.diff, original.diff, "with its diff");
+        if (loaded.files.size() == 3) {
+            check_eq(loaded.files[0].contents, original.files[0].contents,
+                     "contents survive");
+            check(loaded.files[1].deleted, "a deletion is still a deletion");
+            check(loaded.files[1].contents.empty(), "and carries no contents");
+            // Contents go in their own files rather than into the JSON, so a byte
+            // that cannot be escaped into a JSON string still survives.
+            check_eq(loaded.files[2].contents, original.files[2].contents,
+                     "and so do awkward bytes");
+        }
+
+        check(load_changeset(root / "nope").empty(), "a missing store loads as empty");
+        check(load_changeset({}).empty(), "and so does no store at all");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- the board round-trip ----
+    //
+    // encode_board() writes what parse_board() reads. These are two functions in
+    // two files and nothing but this check keeps them agreeing.
+    {
+        BoardItem item;
+        item.n          = 3;
+        item.id         = "crew_1_2";
+        item.kind       = "crew_branch";
+        item.summary    = "coder #2 — write tests";
+        item.reason     = "overlaps another coder on README.md";
+        item.repo_root  = "/home/me/project";
+        item.store      = "/home/me/.local/share/auspex/crew/crew_1/changeset/c2";
+        item.diff       = "diff --git a/x b/x\n+y\n";
+        item.files      = 2;
+        item.file_names = {"a.py", "b.py"};
+
+        const auto parsed = parse_board(encode_board({item}));
+        check_eq(parsed.size(), std::size_t{1}, "a board round-trips");
+        if (!parsed.empty()) {
+            check_eq(parsed[0].n, item.n, "its number");
+            check_eq(parsed[0].summary, item.summary, "its summary");
+            check_eq(parsed[0].reason, item.reason, "the reason it was held");
+            check_eq(parsed[0].repo_root, item.repo_root, "where it belongs");
+            // Without this the work is unreachable and accept can only fail.
+            check_eq(parsed[0].store, item.store, "and where the work is kept");
+            check_eq(parsed[0].diff, item.diff, "and the diff");
+            check_eq(parsed[0].files, item.files, "and the file count");
+        }
+
+        check(parse_board(encode_board({})).empty(), "an empty board round-trips too");
+    }
+
+    // ---- state the panel can read ----
+    //
+    // Auspex writes its own state file now, but in ollamadev's SHAPE, so the
+    // readers the panel already has work unchanged. If this drifts, the lanes go
+    // blank during a run and nothing says why.
+    {
+        const auto path = auspex_run_state_path();
+        check(!path.empty(), "there is a state path");
+        check(path.string().find("/auspex/") != std::string::npos,
+              "under Auspex's own directory, not ollamadev's");
+        // Two engines writing one file with no lock between them produces a board
+        // with entries from two runs under one set of numbers.
+        check(path.string().find(".ollamadev") == std::string::npos,
+              "so the two engines cannot corrupt each other's state");
+
+        check(!auspex_board_path().empty(), "and a board path");
+        check(auspex_board_path() != path, "which is not the same file");
+
+        const auto store = changeset_store("crew_123", 2);
+        check(store.string().find("crew_123") != std::string::npos,
+              "a store is scoped to its run");
+        check(store.string().find("c2") != std::string::npos, "and to its coder");
+        check(changeset_store("", 1).empty(), "and needs a run id");
     }
 }
 
@@ -5496,6 +5681,37 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // A real orchestrated run. This one APPLIES what the Auditor passes, so point
+    // it at a scratch project, not at anything you mind about.
+    if (args.size() >= 3 && args[0] == "--run") {
+        auspex::RunOptions options;
+        options.task    = args[1];
+        options.project = args[2];
+        if (args.size() >= 4) options.max_subtasks = std::atoi(args[3].c_str());
+
+        auspex::RunEvents events;
+        events.log = [](const std::string& line) { std::cout << "  " << line << "\n"; };
+
+        std::cout << options.project.string() << "\n\n";
+        const auspex::RunResult result =
+            auspex::run_crew(auspex::Config::load(), options, events);
+
+        if (!result.error.empty()) {
+            std::cout << "\n" << result.error << "\n";
+            return 1;
+        }
+        std::cout << "\nrun " << result.run_id << ": " << result.applied
+                  << " applied · " << result.held << " held\n\n";
+
+        for (const auto& item : auspex::read_board()) {
+            std::cout << "  #" << item.n << "  " << item.summary << "\n"
+                      << "      " << item.reason << "\n"
+                      << "      " << item.files << " files, lands in "
+                      << item.repo_root << "\n";
+        }
+        return 0;
+    }
+
     if (args.size() >= 2 && args[0] == "--css") {
         std::cout << auspex::generate_css(auspex::theme_by_name(args[1]));
         return 0;
@@ -5535,6 +5751,7 @@ int main(int argc, char** argv) {
     test_director();
     test_coder();
     test_auditor();
+    test_crew_run();
     test_sysmon();
 
     std::cout << "\n" << (checks - failures) << "/" << checks << " checks passed\n";

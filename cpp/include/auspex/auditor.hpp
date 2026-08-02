@@ -42,6 +42,13 @@ struct Audit {
     // Anything the Auditor noticed that did not on its own justify a hold. Shown
     // under the reason rather than replacing it.
     std::vector<std::string> notes;
+    // The line from the diff the Auditor says is wrong, when it named one.
+    //
+    // Asked for so the objection has to point at text that really exists. Whether
+    // it DOES is checkable: see quote_is_real(), which is how a hold that quotes
+    // something the diff never contained gets marked as the invention it is.
+    std::string quote;
+
     // True when the verdict came from a deterministic check rather than a model.
     // Worth surfacing: "a secret was found" is a fact, "this looks wrong" is an
     // opinion, and a person deciding should know which they are reading.
@@ -93,6 +100,14 @@ std::string auditor_prompt(const PlannedSubtask& subtask, const Changeset& chang
 // saying which way it failed. A reply of "yes" is not an accept: the word asked
 // for is "accept", and accepting near-misses is how a garbled reply lands a patch.
 Audit parse_audit(const std::string& reply);
+
+// Whether the Auditor's quoted line actually appears in the diff it reviewed.
+//
+// A hold whose evidence is not in the patch is an invention, and this is the one
+// way to tell that apart from a real objection without reading the code yourself.
+// Compared with whitespace collapsed and any leading +/- dropped, so a quote that
+// is right about the text and careless about the margin still counts.
+bool quote_is_real(const std::string& quote, const std::string& diff);
 
 // The whole pass: deterministic checks, then the model. Blocking.
 Audit audit_changeset(const Config& config, const PlannedSubtask& subtask,

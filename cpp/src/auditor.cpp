@@ -166,14 +166,26 @@ std::string auditor_prompt(const PlannedSubtask& subtask, const Changeset& chang
     if (!subtask.detail.empty()) out << subtask.detail << "\n";
     out << "\n";
 
-    out << "Hold it if any of these is true:\n"
-           "- It does not do what was asked.\n"
-           "- It does something that was NOT asked for as well.\n"
-           "- It deletes or rewrites work that has nothing to do with the task.\n"
-           "- It is obviously broken: a syntax error, a call to something that "
-           "does not exist.\n"
-           "- It adds a credential, a key, or a password.\n"
-           "Accept it if it plainly does what was asked and nothing else.\n\n";
+    // The rules are NUMBERED and the answer must name one.
+    //
+    // An observed run held correct Python with the reason "the docstring is
+    // incorrectly placed before the return statement instead of after the function
+    // definition and before the code" -- which describes the same position twice
+    // and was simply wrong. Free-form prose lets a model narrate an objection it
+    // has not checked. Making it pick a numbered rule AND quote the line it
+    // objects to forces the reason to point at text that really exists.
+    out << "Hold it ONLY if one of these is true. Nothing else is a reason to "
+           "hold.\n"
+           "  1. It does not do what was asked.\n"
+           "  2. It does something that was NOT asked for as well.\n"
+           "  3. It deletes or rewrites work unrelated to the task.\n"
+           "  4. It is broken: a syntax error, or a call to something that does "
+           "not exist.\n"
+           "  5. It adds a credential, a key, or a password.\n\n";
+
+    out << "Do NOT hold for style, formatting, naming, missing type hints, or "
+           "because you would have written it differently. Working code that does "
+           "what was asked is an accept even if it is not how you would do it.\n\n";
 
     out << "Files changed:\n";
     for (const auto& file : changeset.files) {
@@ -192,10 +204,51 @@ std::string auditor_prompt(const PlannedSubtask& subtask, const Changeset& chang
     out << "The change:\n" << diff << "\n\n";
 
     out << "Answer with JSON only:\n"
-           "{\"verdict\": \"accept\" or \"hold\", \"reason\": \"one sentence, "
-           "required when holding\"}\n";
+           "{\"verdict\": \"accept\" or \"hold\",\n"
+           " \"rule\": the number above you are holding under, or 0 to accept,\n"
+           " \"quote\": the exact line from the diff that is wrong, when holding,\n"
+           " \"reason\": one sentence}\n";
 
     return out.str();
+}
+
+bool quote_is_real(const std::string& quote, const std::string& diff) {
+    // Whitespace collapsed and any leading +/-/space dropped on BOTH sides. A model
+    // that is right about the text and careless about the margin, or that
+    // re-indents while quoting, is making a real objection badly -- not inventing
+    // one, which is what this is for.
+    const auto flatten = [](const std::string& text) {
+        std::string out;
+        bool space = false;
+        for (const char c : text) {
+            if (std::isspace(static_cast<unsigned char>(c))) {
+                space = !out.empty();
+                continue;
+            }
+            if (space) out.push_back(' ');
+            space = false;
+            out.push_back(c);
+        }
+        return out;
+    };
+
+    // The margin is stripped from BOTH sides. A model that copies a line straight
+    // out of the patch brings its leading '+' with it, and refusing that would
+    // call the most careful kind of quoting an invention.
+    const auto strip_margin = [](std::string text) {
+        if (!text.empty() && (text[0] == '+' || text[0] == '-' || text[0] == ' ')) {
+            text.erase(0, 1);
+        }
+        return text;
+    };
+
+    const std::string needle = flatten(strip_margin(quote));
+    if (needle.empty()) return false;
+
+    for (const auto& line : split_lines(diff)) {
+        if (flatten(strip_margin(line)).find(needle) != std::string::npos) return true;
+    }
+    return false;
 }
 
 Audit parse_audit(const std::string& reply) {
@@ -228,6 +281,11 @@ Audit parse_audit(const std::string& reply) {
     if (verdict == "hold") {
         audit.reason = reason.empty() ? "the Auditor held it without saying why"
                                       : reason;
+        // NOT trimmed. Indentation is frequently the whole objection ("this is
+        // inside the loop"), and a quote shown to a person should look like the
+        // line it came from. quote_is_real() flattens whitespace itself, so
+        // keeping it costs the comparison nothing.
+        audit.quote = string_field(document, "quote");
         return audit;
     }
 
@@ -269,7 +327,19 @@ Audit audit_changeset(const Config& config, const PlannedSubtask& subtask,
 
     const std::string text =
         reply->response.empty() ? reply->thinking : reply->response;
-    return parse_audit(text);
+    Audit audit = parse_audit(text);
+
+    // A hold that quotes something the patch never contained is an invention. It
+    // still holds -- failing closed does not bend for this -- but it is labelled,
+    // because "the Auditor objected to a line that is not there" is the single
+    // most useful thing a person deciding can be told.
+    if (audit.held() && !audit.quote.empty() &&
+        !quote_is_real(audit.quote, changeset.diff)) {
+        audit.notes.push_back(
+            "the Auditor quoted a line that is not in this diff, so its reason may "
+            "be invented: \"" + audit.quote + "\"");
+    }
+    return audit;
 }
 
 }  // namespace auspex

@@ -54,6 +54,7 @@ std::vector<BoardItem> parse_board(const std::string& output) {
             item.n         = int_field(data, "n");
             item.reason    = string_field(data, "reason");
             item.repo_root = string_field(data, "repoRoot");
+            item.store     = string_field(data, "store");
             if (data.contains("files") && data["files"].is_array()) {
                 item.files = static_cast<int>(data["files"].size());
                 for (const auto& name : data["files"]) {

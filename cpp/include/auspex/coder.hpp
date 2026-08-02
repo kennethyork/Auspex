@@ -87,6 +87,9 @@ struct CoderOutcome {
     std::vector<CoderStep> steps;
     // Set when the loop stopped for a reason that is not "the coder finished".
     std::string            error;
+    // Which model did it. Carried so the run's state file can name it per subtask,
+    // which is what makes routing observable on the board.
+    std::string            model;
 
     int writes() const;
 };

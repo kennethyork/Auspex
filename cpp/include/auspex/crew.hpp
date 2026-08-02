@@ -45,6 +45,11 @@ struct BoardItem {
     // be the one you are looking at, and a bare summary gives you no way to notice.
     std::string repo_root;
 
+    // The directory the held changeset was saved into, so a decision made later --
+    // after the run has finished and its process has gone -- can still apply it.
+    // Empty for a board written by ollamadev, which stores its work elsewhere.
+    std::string store;
+
     // The unified diff, straight from the board's "detail" field.
     //
     // Carried here rather than fetched on demand because there is nothing to fetch
