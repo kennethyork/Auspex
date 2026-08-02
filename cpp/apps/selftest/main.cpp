@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "auspex/agents.hpp"
+#include "auspex/auditor.hpp"
 #include "auspex/autostart.hpp"
 #include "auspex/calendar.hpp"
 #include "auspex/notifications.hpp"
@@ -5173,6 +5174,148 @@ void test_coder() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The Auditor
+// ---------------------------------------------------------------------------
+//
+// One property matters more than the rest: it must FAIL CLOSED. Every way of not
+// getting a clear accept -- no reply, bad JSON, a verdict that is not one of the
+// two words, an unreachable model -- has to end in a hold. So most of these checks
+// are about the ways it could wrongly say yes, not the ways it could say no.
+void test_auditor() {
+    using namespace auspex;
+    std::cout << "\nauditor\n";
+
+    const auto diff_of = [](const std::vector<std::string>& added) {
+        std::string d = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1,1 +1,2 @@\n";
+        for (const auto& line : added) d += "+" + line + "\n";
+        return d;
+    };
+    const auto changeset_of = [&diff_of](const std::vector<std::string>& added) {
+        Changeset c;
+        c.files.push_back({"f.py", "x", false});
+        c.diff = diff_of(added);
+        return c;
+    };
+
+    // ---- secrets ----
+    {
+        check(!scan_secrets(diff_of({"AWS_KEY = \"AKIAIOSFODNN7EXAMPLE\""})).empty(),
+              "an AWS key id is found");
+        check(!scan_secrets(diff_of({"-----BEGIN RSA PRIVATE KEY-----"})).empty(),
+              "and a private key header");
+        check(!scan_secrets(diff_of({"t = \"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\""})).empty(),
+              "and a GitHub token");
+        check(!scan_secrets(diff_of({"password = \"hunter2correcthorse\""})).empty(),
+              "and a credential assigned to an obvious name");
+
+        // REMOVED lines are not findings. Flagging them would make it impossible
+        // to land a changeset that cleans a secret up.
+        const std::string removal =
+            "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1,1 +1,0 @@\n"
+            "-AWS_KEY = \"AKIAIOSFODNN7EXAMPLE\"\n";
+        check(scan_secrets(removal).empty(), "removing a secret is not a finding");
+
+        // Nor are the file headers, which begin with +++ and are not additions.
+        check(scan_secrets("diff --git a/f b/f\n--- a/f\n+++ b/f\n").empty(),
+              "the +++ header is not an added line");
+
+        // Placeholders. An Auditor that holds every example and test fixture is one
+        // whose holds stop being read.
+        check(scan_secrets(diff_of({"api_key = \"your_api_key_here\""})).empty(),
+              "a placeholder is not a secret");
+        check(scan_secrets(diff_of({"password = \"changeme123\""})).empty(),
+              "nor is changeme");
+        check(scan_secrets(diff_of({"token = os.environ[\"TOKEN\"]"})).empty(),
+              "nor is reading one from the environment");
+        check(scan_secrets(diff_of({"secret = \"********\""})).empty(),
+              "nor is a masked value");
+        check(scan_secrets(diff_of({"api_key = \"${API_KEY}\""})).empty(),
+              "nor a template");
+
+        check(scan_secrets(diff_of({"x = 1", "def f(): pass"})).empty(),
+              "ordinary code is not a secret");
+        check(scan_secrets("").empty(), "and neither is nothing");
+    }
+
+    // ---- the deterministic pass ----
+    {
+        const AuditLimits limits;
+
+        check(deterministic_audit({}, limits).held(), "an empty changeset is held");
+        check(deterministic_audit({}, limits).certain, "and that is a certainty");
+
+        Changeset secret = changeset_of({"AWS_KEY = \"AKIAIOSFODNN7EXAMPLE\""});
+        const Audit caught = deterministic_audit(secret, limits);
+        check(caught.held(), "a changeset adding a credential is held");
+        check(caught.certain, "certainly");
+        check(!caught.notes.empty(), "and says what it found");
+
+        // Too many files: the Director was asked for independent pieces, and one
+        // rewriting half the project is not the piece that was planned.
+        Changeset sprawling;
+        for (int i = 0; i < 50; ++i) {
+            sprawling.files.push_back({"f" + std::to_string(i) + ".py", "x", false});
+        }
+        check(deterministic_audit(sprawling, limits).held(), "a sprawling change is held");
+
+        // Too large to have been read. Not a judgement on the code.
+        Changeset huge = changeset_of({"x = 1"});
+        huge.diff = std::string(limits.max_diff_bytes + 1, 'x');
+        const Audit unread = deterministic_audit(huge, limits);
+        check(unread.held(), "a diff too large to review is held");
+        check(unread.reason.find("too large") != std::string::npos, "and says so");
+
+        // A path that escapes is caught here too, though capture_changeset should
+        // never produce one -- which is why it is checked.
+        Changeset escaped;
+        escaped.files.push_back({"../outside.py", "x", false});
+        check(deterministic_audit(escaped, limits).held(), "an escaping path is held");
+
+        // Clean work passes the deterministic pass -- which is permission to ask
+        // the model, not a verdict.
+        check(!deterministic_audit(changeset_of({"def f(): return 1"}), limits).held(),
+              "ordinary work passes the certain checks");
+    }
+
+    // ---- reading a verdict: every ambiguity must hold ----
+    {
+        const Audit accepted = parse_audit(R"({"verdict":"accept"})");
+        check(!accepted.held(), "an explicit accept is an accept");
+
+        const Audit held = parse_audit(R"({"verdict":"hold","reason":"it deletes the tests"})");
+        check(held.held(), "an explicit hold is a hold");
+        check_eq(held.reason, std::string("it deletes the tests"), "with its reason");
+
+        check(parse_audit(R"({"verdict":"ACCEPT"})").held() == false,
+              "case does not matter");
+
+        // Near-misses. Treating any of these as an accept is how a garbled reply
+        // lands a patch.
+        check(parse_audit(R"({"verdict":"yes"})").held(), "\"yes\" is not accept");
+        check(parse_audit(R"({"verdict":"ok"})").held(), "nor is \"ok\"");
+        check(parse_audit(R"({"verdict":"approved"})").held(), "nor \"approved\"");
+        check(parse_audit(R"({"verdict":"looks good to me"})").held(), "nor prose");
+        check(parse_audit(R"({"verdict":""})").held(), "nor an empty verdict");
+        check(parse_audit(R"({"reason":"seems fine"})").held(), "nor no verdict at all");
+
+        // Broken replies.
+        check(parse_audit("").held(), "no reply holds");
+        check(parse_audit("I think it's fine!").held(), "prose holds");
+        check(parse_audit("{ broken").held(), "malformed JSON holds");
+        check(parse_audit("[1,2,3]").held(), "and so does the wrong shape");
+
+        // A hold with no reason still gets one, because that sentence is what a
+        // person reads before deciding.
+        check(!parse_audit(R"({"verdict":"hold"})").reason.empty(),
+              "a reasonless hold is still given a reason");
+
+        // The default-constructed Audit holds. This is the property the whole file
+        // rests on: a forgotten assignment must not land a patch.
+        check(Audit{}.held(), "an Audit holds until something says otherwise");
+    }
+}
+
 int main(int argc, char** argv) {
     const std::vector<std::string> args(argv + 1, argv + argc);
 
@@ -5279,6 +5422,80 @@ int main(int argc, char** argv) {
         return outcome.finished ? 0 : 1;
     }
 
+    // The whole pipeline on one project, without the orchestration: plan, then for
+    // each piece sandbox / code / capture / audit. Nothing is applied -- the
+    // verdicts are printed and the sandboxes thrown away.
+    if (args.size() >= 3 && args[0] == "--crew") {
+        const std::string           task    = args[1];
+        const std::filesystem::path project = args[2];
+        const auspex::Config        config  = auspex::Config::load();
+
+        std::vector<std::string> files;
+        for (const auto& [path, _] : auspex::list_files(project)) files.push_back(path);
+
+        std::cout << project.string() << " — " << files.size() << " files, model "
+                  << config.ollama_model << "\n\n";
+
+        const auspex::Plan plan = auspex::plan_task(config, task, files, 3);
+        if (!plan.ok()) {
+            std::cout << "director: " << plan.error << "\n";
+            return 1;
+        }
+        std::cout << "director: " << plan.summary << "\n";
+        for (const auto& s : plan.subtasks) {
+            std::cout << "  #" << s.n << " " << s.role << "  " << s.title << "\n";
+        }
+        std::cout << "\n";
+
+        int accepted = 0, held = 0;
+        for (const auto& subtask : plan.subtasks) {
+            const auto sandbox = std::filesystem::temp_directory_path() /
+                                 ("auspex-crew-probe-" + std::to_string(subtask.n));
+            std::error_code ec;
+            std::filesystem::remove_all(sandbox, ec);
+
+            std::string error;
+            if (!auspex::create_sandbox(project, sandbox, &error)) {
+                std::cout << "#" << subtask.n << " sandbox: " << error << "\n";
+                continue;
+            }
+
+            const auspex::CoderOutcome out =
+                auspex::run_coder(config, subtask, sandbox);
+            const auspex::Changeset changeset =
+                auspex::capture_changeset(project, sandbox);
+            const auspex::Audit audit =
+                auspex::audit_changeset(config, subtask, changeset);
+
+            std::cout << "#" << subtask.n << " " << subtask.title << "\n"
+                      << "   coder: " << out.steps.size() << " steps, "
+                      << out.writes() << " writes, "
+                      << (out.finished ? "finished" : "did not finish");
+            if (!out.error.empty()) std::cout << " (" << out.error << ")";
+            std::cout << "\n   changed: " << changeset.files.size() << " files\n"
+                      << "   auditor: " << (audit.held() ? "HELD" : "accept")
+                      << (audit.certain ? " (certain)" : "");
+            if (!audit.reason.empty()) std::cout << " — " << audit.reason;
+            std::cout << "\n\n";
+
+            // The diff for anything held. A verdict you cannot check against the
+            // code is indistinguishable from a confident hallucination, and this
+            // is the one place a person would go to tell the difference.
+            if (audit.held() && !changeset.diff.empty()) {
+                for (const auto& line : auspex::split_lines(changeset.diff)) {
+                    std::cout << "   | " << line << "\n";
+                }
+                std::cout << "\n";
+            }
+
+            audit.held() ? ++held : ++accepted;
+            std::filesystem::remove_all(sandbox, ec);
+        }
+
+        std::cout << accepted << " would land · " << held << " held\n";
+        return 0;
+    }
+
     if (args.size() >= 2 && args[0] == "--css") {
         std::cout << auspex::generate_css(auspex::theme_by_name(args[1]));
         return 0;
@@ -5317,6 +5534,7 @@ int main(int argc, char** argv) {
     test_sandbox();
     test_director();
     test_coder();
+    test_auditor();
     test_sysmon();
 
     std::cout << "\n" << (checks - failures) << "/" << checks << " checks passed\n";

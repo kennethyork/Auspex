@@ -241,6 +241,7 @@ add_library(auspex-core STATIC
     src/sandbox.cpp
     src/director.cpp
     src/coder.cpp
+    src/auditor.cpp
     src/vad.cpp
     src/voice_gate.cpp
     src/desktop_entries.cpp
