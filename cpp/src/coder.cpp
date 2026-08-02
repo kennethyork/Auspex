@@ -10,6 +10,7 @@
 #include "auspex/process.hpp"
 #include "auspex/code_index.hpp"
 #include "auspex/sandbox.hpp"
+#include "auspex/symbols.hpp"
 #include "auspex/roles.hpp"
 #include "auspex/json_util.hpp"
 
@@ -45,6 +46,7 @@ std::string_view tool_name(CoderTool tool) {
         case CoderTool::List:   return "list";
         case CoderTool::Read:   return "read";
         case CoderTool::Write:  return "write";
+        case CoderTool::Replace: return "replace";
         case CoderTool::Delete: return "delete";
         case CoderTool::Run:    return "run";
         case CoderTool::Skill:  return "skill";
@@ -63,6 +65,7 @@ CoderTool tool_from_name(const std::string& name) {
     if (lower == "list")   return CoderTool::List;
     if (lower == "read")   return CoderTool::Read;
     if (lower == "write")  return CoderTool::Write;
+    if (lower == "replace") return CoderTool::Replace;
     if (lower == "delete") return CoderTool::Delete;
     if (lower == "finish") return CoderTool::Finish;
     if (lower == "run")    return CoderTool::Run;
@@ -75,8 +78,12 @@ CoderTool tool_from_name(const std::string& name) {
     // nothing new becomes reachable.
     if (lower == "ls" || lower == "list_files" || lower == "dir") return CoderTool::List;
     if (lower == "read_file" || lower == "open" || lower == "cat") return CoderTool::Read;
-    if (lower == "write_file" || lower == "edit" || lower == "create") {
-        return CoderTool::Write;
+    if (lower == "write_file" || lower == "create") return CoderTool::Write;
+    // "edit" means a PART of a file to most models, which is what replace is.
+    // Mapping it to write was how a one-line intention became a whole-file
+    // rewrite.
+    if (lower == "edit" || lower == "str_replace" || lower == "substitute") {
+        return CoderTool::Replace;
     }
     if (lower == "open_skill" || lower == "use_skill" || lower == "load_skill") {
         return CoderTool::Skill;
@@ -130,7 +137,8 @@ int CoderOutcome::writes() const {
     int n = 0;
     for (const auto& step : steps) {
         if (step.result.ok &&
-            (step.call.tool == CoderTool::Write || step.call.tool == CoderTool::Delete)) {
+            (step.call.tool == CoderTool::Write || step.call.tool == CoderTool::Delete ||
+             step.call.tool == CoderTool::Replace)) {
             ++n;
         }
     }
@@ -174,7 +182,7 @@ std::string coder_prompt(const PlannedSubtask& subtask,
                          const std::vector<CoderStep>& steps,
                          const CoderLimits& limits,
                          const std::string& steered, const SkillSet& skills,
-                         const McpAccess& mcp) {
+                         const McpAccess& mcp, const std::string& hint) {
     std::ostringstream out;
 
     out << "You are working alone on one piece of a larger job.\n"
@@ -193,6 +201,11 @@ std::string coder_prompt(const PlannedSubtask& subtask,
     if (!subtask.detail.empty()) out << subtask.detail << "\n";
     out << "\n";
 
+    // Where the names in this piece live. Before the tool table, because it
+    // changes the FIRST call a coder makes -- read from line 1165 rather than
+    // read and hope.
+    if (!trim(hint).empty()) out << hint << "\n";
+
     // A person has said something. Placed high and marked, because the whole point
     // of steering is that it outranks the plan the coder is working to.
     if (!steered.empty()) {
@@ -205,6 +218,9 @@ std::string coder_prompt(const PlannedSubtask& subtask,
     out << "Answer with ONE JSON object per turn, naming one tool:\n"
            "  {\"tool\":\"list\"}                                   what files exist\n"
            "  {\"tool\":\"read\",\"path\":\"file.py\"}                 read a file\n"
+           "  {\"tool\":\"read\",\"path\":\"file.py\",\"from\":400}      ... from a line\n"
+           "  {\"tool\":\"replace\",\"path\":\"file.py\",\"find\":\"…\",\"replace\":\"…\"}\n"
+           "                                                    change PART of a file\n"
            "  {\"tool\":\"write\",\"path\":\"file.py\",\"contents\":\"…\"}  replace a file "
            "entirely, or create it\n"
            "  {\"tool\":\"delete\",\"path\":\"file.py\"}               remove a file\n"
@@ -283,6 +299,30 @@ std::string coder_prompt(const PlannedSubtask& subtask,
     }
 
     if (!steps.empty()) {
+        // WHICH READS ARE REPLAYED IN FULL.
+        //
+        // Newest first, until the budget is spent; everything older becomes a line
+        // naming the file. A read is capped at 24KB, so five of them replayed every
+        // turn is 125KB per call -- measured on this very project, where one run
+        // spent 1.6 MILLION input tokens on a task whose answer was one line. The
+        // cost is per turn and multiplies by the step budget, which is why it is
+        // invisible until the files are real.
+        //
+        // The newest read is what the coder is working from. An older one it still
+        // needs it can read again -- and the repeat guard nudges rather than kills,
+        // so re-reading is cheap in a way it did not used to be.
+        std::vector<bool> replay(steps.size(), false);
+        {
+            std::size_t spent = 0;
+            for (std::size_t i = steps.size(); i-- > 0;) {
+                if (steps[i].call.tool != CoderTool::Read) continue;
+                const std::size_t size = steps[i].result.output.size();
+                if (spent + size > limits.max_replayed_reads && spent > 0) break;
+                replay[i] = true;
+                spent += size;
+            }
+        }
+
         out << "What you have done so far:\n";
         for (std::size_t i = 0; i < steps.size(); ++i) {
             const CoderStep& step = steps[i];
@@ -312,6 +352,13 @@ std::string coder_prompt(const PlannedSubtask& subtask,
                                                  "piece is done, finish now."))
                             : step.result.output)
                     << "\n";
+            } else if (step.call.tool == CoderTool::Read && !replay[i]) {
+                // Stated, not silently dropped. A coder that cannot see a file it
+                // read must know it can read it again, or it will assume the
+                // contents were empty.
+                out << "     -> read earlier ("
+                    << step.result.output.size() / 1000
+                    << "KB); read it again if you still need it\n";
             } else {
                 out << "     -> " << step.result.output << "\n";
             }
@@ -518,6 +565,28 @@ ToolCall parse_tool_call(const std::string& reply) {
         return call;
     }
 
+    for (const char* key : {"find", "old", "old_string", "search"}) {
+        if (document.contains(key) && document[key].is_string()) {
+            call.find = document[key].get<std::string>();
+            break;
+        }
+    }
+    for (const char* key : {"replace", "new", "new_string", "with"}) {
+        if (document.contains(key) && document[key].is_string()) {
+            call.replace_with = document[key].get<std::string>();
+            break;
+        }
+    }
+
+    // Where a read should start. Several spellings, because a model asked for an
+    // offset will reach for whichever word it knows.
+    for (const char* key : {"from", "from_line", "offset", "start", "start_line"}) {
+        if (document.contains(key) && document[key].is_number_integer()) {
+            call.from_line = document[key].get<int>();
+            break;
+        }
+    }
+
     // "tool" is the asked-for key; the others are what models produce anyway.
     std::string name = string_field(document, "tool");
     if (name.empty()) name = string_field(document, "action");
@@ -642,7 +711,7 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
     // that asks for `write` anyway must get a refusal, not a written file.
     if (limits.read_only &&
         (call.tool == CoderTool::Write || call.tool == CoderTool::Delete ||
-         call.tool == CoderTool::Run)) {
+         call.tool == CoderTool::Replace || call.tool == CoderTool::Run)) {
         result.output = "this is a read-only pass; you may only list, read and finish";
         return result;
     }
@@ -779,15 +848,111 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
                 result.output = call.path + " is not a text file";
                 return result;
             }
-            // Truncated, and SAID to be: a coder that thinks it has seen a whole
-            // file will rewrite it from the part it saw and delete the rest.
+            // From a line, when asked. This is what makes a file bigger than the
+            // cap reachable at all -- see ToolCall::from_line.
+            int first_line = 1;
+            if (call.from_line > 1) {
+                std::size_t at = 0;
+                int line = 1;
+                while (line < call.from_line && at < contents.size()) {
+                    const auto next = contents.find('\n', at);
+                    if (next == std::string::npos) { at = contents.size(); break; }
+                    at = next + 1;
+                    ++line;
+                }
+                if (at >= contents.size()) {
+                    result.output = call.path + " has fewer than " +
+                                    std::to_string(call.from_line) + " lines";
+                    return result;
+                }
+                contents = contents.substr(at);
+                first_line = line;
+            }
+
+            // Truncated, and SAID to be -- with the line to ask for next, so the
+            // notice is something the coder can act on rather than just a warning.
+            // A coder that thinks it has seen a whole file will rewrite it from
+            // the part it saw and delete the rest.
             if (contents.size() > limits.max_read_bytes) {
                 contents.resize(limits.max_read_bytes);
-                contents += "\n... (truncated; this file is longer than shown. Do "
-                            "not rewrite it whole from this.)";
+                const int shown =
+                    first_line +
+                    static_cast<int>(std::count(contents.begin(), contents.end(), '\n'));
+                contents += "\n... (truncated. This file is longer than shown; do "
+                            "not rewrite it whole from this. To see the rest, read "
+                            "it again with \"from\": " + std::to_string(shown) + ")";
             }
             result.ok = true;
             result.output = contents.empty() ? "(empty file)" : contents;
+            if (first_line > 1) {
+                result.output = "(from line " + std::to_string(first_line) + ")\n" +
+                                result.output;
+            }
+            return result;
+        }
+
+        case CoderTool::Replace: {
+            if (!std::filesystem::is_regular_file(*target, ec)) {
+                result.output = "no such file: " + call.path;
+                return result;
+            }
+            if (call.find.empty()) {
+                result.output = "replace needs the exact text to find";
+                return result;
+            }
+
+            const std::string contents = read_file(*target);
+            const auto at = contents.find(call.find);
+            if (at == std::string::npos) {
+                // Named precisely: "not found" sends a model looking for a
+                // different file, when the real answer is almost always that its
+                // copy of the text differs by whitespace.
+                result.output =
+                    "that exact text is not in " + call.path +
+                    ". It must match character for character, including indentation. "
+                    "Read the file again and copy the text from what you see.";
+                return result;
+            }
+
+            // AMBIGUITY IS REFUSED. If the text appears twice, replacing the first
+            // is a guess -- and a wrong guess edits a line the coder never looked
+            // at, in a file it cannot see all of. Refusing costs one turn; being
+            // wrong costs a silent corruption.
+            if (contents.find(call.find, at + 1) != std::string::npos) {
+                result.output =
+                    "that text appears more than once in " + call.path +
+                    ". Include enough surrounding lines to make it unique.";
+                return result;
+            }
+
+            if (call.find == call.replace_with) {
+                result.no_op = true;
+                result.ok = true;
+                result.output = "no change: the new text is the same as the old";
+                return result;
+            }
+
+            std::string updated = contents;
+            updated.replace(at, call.find.size(), call.replace_with);
+            {
+                std::ofstream out(*target, std::ios::binary | std::ios::trunc);
+                if (!out) {
+                    result.output = "could not write " + call.path;
+                    return result;
+                }
+                out << updated;
+                if (!out) {
+                    result.output = "could not write " + call.path;
+                    return result;
+                }
+            }
+
+            const int line =
+                1 + static_cast<int>(std::count(contents.begin(),
+                                                contents.begin() + static_cast<long>(at),
+                                                '\n'));
+            result.ok = true;
+            result.output = "replaced, at line " + std::to_string(line);
             return result;
         }
 
@@ -853,6 +1018,15 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const CoderLimits& limits, const std::string& model,
                        const std::filesystem::path& mailbox, const SkillSet& skills,
                        const McpAccess& mcp) {
+    // Where the names in this subtask are DEFINED, worked out ONCE.
+    //
+    // Parsing the project costs a few seconds and cannot change while this coder
+    // runs, so doing it per turn would be a tax on every call for an answer that
+    // is already known. It is the difference between a coder jumping to line 1165
+    // and one scanning 24KB at a time until its budget is gone.
+    const std::string where =
+        symbols_note(sandbox, subtask.title + " " + subtask.detail);
+
     CoderOutcome outcome;
 
     if (!std::filesystem::is_directory(sandbox)) {
@@ -882,7 +1056,7 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
         // than needing the coder to be interrupted mid-call.
         const std::string prompt =
             coder_prompt(subtask, files, outcome.steps, limits, take_steer(mailbox),
-                         skills, mcp);
+                         skills, mcp, where);
 
         const auto reply = ollama.generate(
             model.empty() ? config.ollama_model : model, prompt, options);

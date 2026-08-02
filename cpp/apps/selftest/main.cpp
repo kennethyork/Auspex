@@ -5305,7 +5305,13 @@ void test_coder() {
         // saves a turn spent correcting spelling.
         check(tool_from_name("read_file") == CoderTool::Read,  "read_file");
         check(tool_from_name("cat")       == CoderTool::Read,  "cat");
-        check(tool_from_name("edit")      == CoderTool::Write, "edit");
+        // "edit" means a PART of a file to most models, which is what `replace`
+        // is. Mapping it to `write` was how a one-line intention became a
+        // whole-file rewrite -- and on a file bigger than the read cap, a
+        // whole-file rewrite from a partial read destroys what was not seen.
+        check(tool_from_name("edit")      == CoderTool::Replace, "edit means replace");
+        check(tool_from_name("str_replace") == CoderTool::Replace, "and so does str_replace");
+        check(tool_from_name("write_file") == CoderTool::Write, "while write_file is a write");
         check(tool_from_name("done")      == CoderTool::Finish, "done");
 
         check(tool_from_name("run") == CoderTool::Run, "run is a verb now");
@@ -8853,6 +8859,146 @@ void test_eval() {
         check_eq(escaping.size(), std::size_t{1}, "the task still loads");
         check(escaping[0].files.empty(),
               "but a seed file that escapes the task directory is not written");
+    }
+
+    // ---- editing PART of a file ----
+    //
+    // Found by pointing the crew at this project. `write` replaces a whole file
+    // and a read is capped at 24KB, so on any bigger file a coder could not make
+    // a safe change at all: to alter one line it would have to rewrite the 90% it
+    // had never seen. Watched it happen -- the coder read the right place,
+    // understood the change, and correctly refused to write. Every eval task was
+    // a forty-byte file, so nothing showed it.
+    {
+        std::error_code ec;
+        const std::filesystem::path root = "/tmp/auspex-replace";
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+
+        const auto seed = [&](const std::string& text) {
+            std::ofstream out(root / "big.cpp", std::ios::trunc);
+            out << text;
+        };
+        const auto contents = [&] {
+            std::ifstream in(root / "big.cpp");
+            std::ostringstream buffer;
+            buffer << in.rdbuf();
+            return buffer.str();
+        };
+
+        CoderLimits limits;
+        ToolCall call;
+        call.tool = CoderTool::Replace;
+        call.path = "big.cpp";
+
+        // A change in the middle of a file, with the rest untouched.
+        seed("int a() { return 1; }\nint b() { return crew_state_path(); }\nint c() { return 3; }\n");
+        call.find = "crew_state_path()";
+        call.replace_with = "auspex_run_state_path()";
+        const ToolResult done = run_tool(call, root, limits);
+        check(done.ok, "an exact piece of text is replaced");
+        check(done.output.find("line 2") != std::string::npos,
+              "and the line is reported, so the coder knows where it landed");
+        check(contents().find("auspex_run_state_path()") != std::string::npos,
+              "the new text is there");
+        check(contents().find("int a()") != std::string::npos &&
+                  contents().find("int c()") != std::string::npos,
+              "and the REST OF THE FILE is untouched -- which is the whole point");
+
+        // Text that is not there.
+        call.find = "no_such_text_anywhere";
+        const ToolResult missing = run_tool(call, root, limits);
+        check(!missing.ok, "text that is not there fails");
+        check(missing.output.find("character for character") != std::string::npos,
+              "and says the likely cause -- whitespace -- rather than just 'not "
+              "found', which sends a model looking for the wrong file");
+
+        // AMBIGUITY IS REFUSED. This is the one that matters: replacing the first
+        // of two matches edits a line the coder never looked at, in a file it
+        // cannot see all of.
+        seed("x = 1;\ny = 2;\nx = 1;\n");
+        call.find = "x = 1;";
+        call.replace_with = "x = 9;";
+        const ToolResult ambiguous = run_tool(call, root, limits);
+        check(!ambiguous.ok, "text appearing twice is REFUSED, not guessed at");
+        check(ambiguous.output.find("more than once") != std::string::npos,
+              "and says why");
+        check(contents().find("x = 9;") == std::string::npos,
+              "and nothing was changed");
+
+        // Replacing text with itself is not progress, and the loop counts it so.
+        seed("keep = 1;\n");
+        call.find = "keep = 1;";
+        call.replace_with = "keep = 1;";
+        const ToolResult same = run_tool(call, root, limits);
+        check(same.no_op, "replacing text with itself is a no-op, not a change");
+
+        // A read-only role cannot use it either.
+        CoderLimits reader;
+        reader.read_only = true;
+        call.find = "keep = 1;";
+        call.replace_with = "changed";
+        check(!run_tool(call, root, reader).ok,
+              "and a read-only role is refused -- a new writing verb must be "
+              "covered by the same gate as the old ones");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- the transcript does not grow without bound ----
+    //
+    // Found by pointing the crew at THIS project. A read is capped at 24KB, and
+    // every read was replayed in full every turn: five of them meant 125KB per
+    // call, and one run spent 1.6 MILLION input tokens on a task whose answer was
+    // a single line. A 40-byte calc.py never showed it -- the cost is per turn,
+    // multiplied by the step budget, and invisible until the files are real.
+    {
+        PlannedSubtask subtask;
+        subtask.title = "something";
+        subtask.role = "coder";
+
+        const auto with_reads = [&](int how_many) {
+            std::vector<CoderStep> steps;
+            for (int i = 0; i < how_many; ++i) {
+                CoderStep read;
+                read.call.tool = CoderTool::Read;
+                read.call.path = "file" + std::to_string(i) + ".cpp";
+                read.result.ok = true;
+                read.result.output = std::string(20'000, 'x');
+                steps.push_back(std::move(read));
+            }
+            return coder_prompt(subtask, {}, steps, {}).size();
+        };
+
+        const std::size_t one = with_reads(1);
+        const std::size_t eight = with_reads(8);
+        check(eight < one * 2,
+              "eight reads do not cost eight times one -- the replay is bounded");
+        check(eight < 80'000,
+              "and the prompt stays a sane size: " + std::to_string(eight / 1000) +
+                  "KB");
+
+        // The newest read IS still there in full: it is what the coder is working
+        // from, and dropping it would make the loop blind.
+        std::vector<CoderStep> steps;
+        for (int i = 0; i < 5; ++i) {
+            CoderStep read;
+            read.call.tool = CoderTool::Read;
+            read.call.path = "f" + std::to_string(i) + ".cpp";
+            read.result.ok = true;
+            read.result.output = "CONTENTS-" + std::to_string(i) +
+                                 std::string(20'000, 'x');
+            steps.push_back(std::move(read));
+        }
+        const std::string prompt = coder_prompt(subtask, {}, steps, {});
+        check(prompt.find("CONTENTS-4") != std::string::npos,
+              "the newest read is replayed in full");
+        check(prompt.find("CONTENTS-0") == std::string::npos,
+              "and the oldest is not");
+        check(prompt.find("read it again if you still need it") != std::string::npos,
+              "but it is STATED, so a coder does not read silence as an empty file");
+        check(prompt.find("f0.cpp") != std::string::npos,
+              "and the file is still named, so it knows what it read");
     }
 
     // ---- the transcript tells the coder what it has already changed ----

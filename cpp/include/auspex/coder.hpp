@@ -60,6 +60,7 @@ enum class CoderTool {
     List,      // what files are here
     Read,      // the contents of one
     Write,     // replace one, or create it
+    Replace,   // swap one exact piece of text in a file for another
     Delete,    // remove one
     Run,       // run one of a fixed set of build/test programs, in the sandbox
     Skill,     // open a skill listed in the catalogue
@@ -80,6 +81,27 @@ struct ToolCall {
     // For Skill: which one. Reuses `path` would be confusing, so it is its own
     // field -- a skill name is a slug, not a filename.
     std::string skill;
+    // For Replace: the exact text to find, and what to put there.
+    //
+    // WHY THIS VERB EXISTS. `write` replaces a whole file, and a read is capped at
+    // 24KB. So on any file bigger than the cap a coder could not make a safe
+    // change AT ALL: to alter one line it would have to rewrite the 90% it had
+    // never seen. Watched on this project -- asked to change one line of a
+    // 2118-line file, the coder read the right place, understood the change, and
+    // correctly refused to write, because writing would have destroyed the rest.
+    // Every eval task was a forty-byte file, so nothing showed it.
+    std::string find;
+    std::string replace_with;
+
+    // For Read: the line to start at, 1-based. 0 means the beginning.
+    //
+    // Without this a file bigger than max_read_bytes was UNREACHABLE past the cap.
+    // The truncation was stated -- "this file is longer than shown" -- and there
+    // was no way to act on it, which is a warning with no remedy. Watched on this
+    // project: asked to change a function at line 1165 of a 2118-line file, the
+    // coder read the first 24KB, did not find it, and read the same 24KB again
+    // until its budget ran out.
+    int from_line = 0;
     // For Mcp: which tool ("server.tool") and its arguments as JSON text.
     std::string mcp_tool;
     std::string mcp_arguments;
@@ -163,7 +185,30 @@ struct CoderLimits {
     // A file read is truncated to this many bytes before going into the transcript.
     // Without it one large file fills the context window and every later turn is
     // answered with the subtask pushed out of view.
-    std::size_t max_read_bytes = 24'000;
+    // Smaller than it was, deliberately: a read is a WINDOW, and several small
+    // windows the coder can hold at once beat one large one it cannot.
+    std::size_t max_read_bytes = 12'000;
+
+    // How much of the transcript's READ output is replayed each turn, newest
+    // first. Older reads become a one-line note naming the file.
+    //
+    // This is a per-turn cost multiplied by the step budget, so getting it wrong
+    // is expensive in a way that is invisible on a small project. Measured on
+    // Auspex itself: a coder that had read five files was sending 125KB on every
+    // subsequent turn -- one run cost 1.6 MILLION input tokens across 33 calls,
+    // for a task whose answer was a one-line change. A 40-byte calc.py never
+    // showed it.
+    //
+    // The newest read is the one the coder is working from; an older one it still
+    // needs it can read again, and the repeat guard nudges rather than kills.
+    // Four windows, not one.
+    //
+    // This started equal to max_read_bytes, which meant exactly ONE read survived
+    // and every new one evicted the last -- so a coder could never hold the top of
+    // a file and the middle at the same time. Watched it thrash between line 1120
+    // and line 1 because of it: a fix for runaway cost that created a new failure,
+    // found only by tracing the loop again after making it.
+    std::size_t max_replayed_reads = 48'000;
 
     // Read-only: write, delete and run are refused whatever the model asks for.
     //
@@ -217,12 +262,20 @@ struct CoderLimits {
 // it is summarised rather than replayed verbatim, because the contents the coder
 // WROTE are already on disk and re-sending them would double the context for no
 // gain.
+// `hint` is what is known about the project before the coder starts -- chiefly
+// where the names in its subtask are DEFINED, from symbols.hpp.
+//
+// It is the difference between jumping to a line and scanning for it. Watched on
+// this project: asked to change a function at line 1165 of a 2118-line file, a
+// coder with no hint spent its whole budget reading 24KB windows and never
+// reached it.
 std::string coder_prompt(const PlannedSubtask& subtask,
                          const std::vector<std::string>& files,
                          const std::vector<CoderStep>& steps,
                          const CoderLimits& limits,
                          const std::string& steered = {},
-                         const SkillSet& skills = {}, const McpAccess& mcp = {});
+                         const SkillSet& skills = {}, const McpAccess& mcp = {},
+                         const std::string& hint = {});
 
 // Reads one reply into a call.
 //
