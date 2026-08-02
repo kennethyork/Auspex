@@ -236,6 +236,7 @@ add_library(auspex-core STATIC
     src/sysmon.cpp
     src/context_tuner.cpp
     src/websearch.cpp
+    src/watch.cpp
     src/agents.cpp
     src/commands.cpp
     src/crew.cpp

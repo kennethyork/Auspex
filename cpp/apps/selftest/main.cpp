@@ -47,6 +47,7 @@
 #include "auspex/usage.hpp"
 #include "auspex/symbols.hpp"
 #include "auspex/verify.hpp"
+#include "auspex/watch.hpp"
 #include "auspex/websearch.hpp"
 #include "auspex/panel_dock.hpp"
 #include "auspex/process.hpp"
@@ -7124,6 +7125,96 @@ void test_starter_skills() {
 }
 
 // ---------------------------------------------------------------------------
+// Watch
+//
+// The one part of Auspex that starts work without being asked, so the guards
+// matter more than the feature: debounce, a bound, and never running because of
+// its own output.
+// ---------------------------------------------------------------------------
+void test_watch() {
+    using namespace auspex;
+    std::cout << "\nwatch\n";
+
+    std::error_code ec;
+    const std::filesystem::path root = "/tmp/auspex-watch";
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+    { std::ofstream out(root / "a.py"); out << "a = 1\n"; }
+
+    // ---- noticing ----
+    {
+        const auto before = snapshot_tree(root);
+        check_eq(before.size(), std::size_t{1}, "one file seen");
+        check(changed_between(before, before).empty(), "nothing changed is nothing");
+
+        { std::ofstream out(root / "b.py"); out << "b = 2\n"; }
+        const auto after = snapshot_tree(root);
+        const auto added = changed_between(before, after);
+        check_eq(added.size(), std::size_t{1}, "an added file is a change");
+        if (!added.empty()) check_eq(added[0], std::string("b.py"), "and is named");
+
+        std::filesystem::remove(root / "b.py", ec);
+        const auto removed = changed_between(after, snapshot_tree(root));
+        check_eq(removed.size(), std::size_t{1}, "and so is a removed one");
+    }
+
+    // ---- edits are noticed ----
+    {
+        const auto before = snapshot_tree(root);
+        { std::ofstream out(root / "a.py", std::ios::trunc); out << "a = 22222\n"; }
+        check(!changed_between(before, snapshot_tree(root)).empty(),
+              "a file whose contents changed is a change");
+    }
+
+    // ---- build output is not the project changing ----
+    //
+    // Without this, a compiled project triggers a run every time you build --
+    // which is exactly when you least want a crew rewriting it.
+    {
+        std::filesystem::create_directories(root / "build" / "deep", ec);
+        const auto before = snapshot_tree(root);
+        { std::ofstream out(root / "build" / "deep" / "thing.o"); out << "binary\n"; }
+        check(changed_between(before, snapshot_tree(root)).empty(),
+              "a build directory moving is not the project moving");
+
+        std::filesystem::create_directories(root / ".git", ec);
+        { std::ofstream out(root / ".git" / "HEAD"); out << "ref: x\n"; }
+        check(changed_between(before, snapshot_tree(root)).empty(),
+              "and neither is git's own bookkeeping");
+    }
+
+    // ---- it refuses what a crew refuses ----
+    {
+        WatchOptions nowhere;
+        nowhere.task = "do something";
+        if (const char* home = std::getenv("HOME"); home && *home) {
+            nowhere.project = home;
+            check_eq(watch_project(Config{}, nowhere), 0,
+                     "watching $HOME is refused, like running there");
+        }
+
+        WatchOptions no_task;
+        no_task.project = root;
+        check_eq(watch_project(Config{}, no_task), 0,
+                 "and a watch with no task starts nothing");
+    }
+
+    // ---- stopping ----
+    {
+        WatchOptions options;
+        options.project = root;
+        options.task = "do something";
+        options.poll_seconds = 1;
+
+        std::atomic<bool> stop{true};   // already asked to stop
+        check_eq(watch_project(Config{}, options, {}, &stop), 0,
+                 "a watch told to stop before it starts runs nothing");
+    }
+
+    std::filesystem::remove_all(root, ec);
+}
+
+// ---------------------------------------------------------------------------
 // Web search
 //
 // Pinned against captured HTML, never the live internet: somebody else's markup
@@ -9475,6 +9566,23 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Stand a task up and run it whenever the tree settles.
+    //   --watch <project> "<task>" [max-runs]
+    if (args.size() >= 3 && args[0] == "--watch") {
+        auspex::WatchOptions options;
+        options.project = args[1];
+        options.task = args[2];
+        if (args.size() >= 4) options.max_runs = std::atoi(args[3].c_str());
+
+        auspex::WatchEvents events;
+        events.log = [](const std::string& line) {
+            std::cout << "  " << line << "\n" << std::flush;
+        };
+        const int runs = auspex::watch_project(auspex::Config::load(), options, events);
+        std::cout << runs << " run(s)\n";
+        return 0;
+    }
+
     if (!args.empty() && args[0] == "--hooks") {
         std::cout << "hooks from " << auspex::hooks_path().string() << "\n";
         std::cout << auspex::render_hooks(auspex::load_hooks());
@@ -9841,6 +9949,7 @@ int main(int argc, char** argv) {
     test_mcp();
     test_roles();
     test_starter_skills();
+    test_watch();
     test_websearch();
     test_context_tuner();
     test_crew_members();
