@@ -5615,6 +5615,173 @@ void test_crew_run() {
         check(parse_board(encode_board({})).empty(), "an empty board round-trips too");
     }
 
+    // ---- counting votes ----
+    //
+    // A TIE HOLDS, and that is the point of counting rather than a flaw in it: if
+    // the reviewers cannot agree, that is exactly the case a person should see.
+    {
+        const auto vote = [](bool accept, std::string why) {
+            Audit a;
+            a.verdict = accept ? Verdict::Accept : Verdict::Hold;
+            a.reason  = std::move(why);
+            return a;
+        };
+
+        check(!tally({vote(true, ""), vote(true, ""), vote(false, "x")}).held(),
+              "a majority to accept lands it");
+        check(tally({vote(true, ""), vote(false, "x"), vote(false, "y")}).held(),
+              "a majority to hold holds it");
+        check(tally({vote(true, ""), vote(false, "x")}).held(),
+              "and a TIE holds -- disagreement is the case a person should see");
+        check(tally({}).held(), "nobody reviewing holds it");
+        check(tally({vote(true, "")}).held() == false, "one accepting voice lands it");
+
+        // The holders' reasons survive, so a person is not told only a count.
+        const Audit held = tally({vote(false, "deletes the tests"), vote(false, "b")});
+        check(!held.notes.empty(), "the reasons for holding are kept");
+        check(held.reason.find("2 of 2") != std::string::npos, "with the tally");
+    }
+
+    // ---- the modal plan ----
+    //
+    // A single plan is one sample from a model guessing at structure. Comparing by
+    // SHAPE, not text: two plans that cut a job the same way but word the titles
+    // differently are the same plan.
+    {
+        const auto plan_of = [](std::vector<std::pair<std::string, std::string>> pieces) {
+            Plan p;
+            int n = 1;
+            for (auto& [role, title] : pieces) {
+                p.subtasks.push_back({n++, role, title, ""});
+            }
+            return p;
+        };
+
+        const Plan a = plan_of({{"coder", "write it"}, {"tester", "test it"}});
+        const Plan b = plan_of({{"coder", "implement"}, {"tester", "cover it"}});
+        const Plan c = plan_of({{"coder", "everything"}});
+
+        check_eq(plan_shape(a), plan_shape(b),
+                 "same pieces and roles is the same shape, whatever the wording");
+        check(plan_shape(a) != plan_shape(c), "a different cut is a different shape");
+
+        const Plan winner = modal_plan({a, c, b});
+        check(winner.ok(), "a modal plan is found");
+        check_eq(winner.subtasks.size(), std::size_t{2}, "the shape two of three agreed on");
+        // The EARLIEST of the winning shape: ties by first occurrence is the only
+        // answer that does not depend on iteration order.
+        if (!winner.subtasks.empty()) {
+            check_eq(winner.subtasks[0].title, std::string("write it"),
+                     "and it is the first plan of that shape");
+        }
+
+        Plan broken;
+        broken.error = "no";
+        check(!modal_plan({broken, broken}).ok(), "all-failed plans yield an error");
+        check(!modal_plan({}).ok(), "and so does none at all");
+        check(modal_plan({broken, c}).ok(), "one usable plan among failures still wins");
+    }
+
+    // ---- security findings ----
+    {
+        const auto found = parse_findings(R"({"findings":[
+            {"severity":"HIGH","detail":"shell built from user input on line 12"},
+            {"severity":"low","detail":"weak hash"},
+            {"detail":"no severity given"},
+            {"severity":"high"}
+        ]})", "a.py");
+        check_eq(found.size(), std::size_t{3},
+                 "a finding with no detail is not a finding");
+        if (found.size() == 3) {
+            check_eq(found[0].severity, std::string("high"), "severity is lower-cased");
+            check_eq(found[0].file, std::string("a.py"), "and the file is carried");
+            // Unknown severity becomes low rather than being dropped or promoted:
+            // calling it high because the model forgot would be crying wolf.
+            check_eq(found[2].severity, std::string("low"),
+                     "a missing severity becomes low, not high");
+        }
+
+        std::vector<Finding> mixed{{"a", "low", "x"}, {"b", "high", "y"},
+                                   {"c", "medium", "z"}, {"d", "high", "w"}};
+        sort_findings(mixed);
+        check_eq(mixed[0].severity, std::string("high"), "worst first");
+        check_eq(mixed[3].severity, std::string("low"), "least last");
+        // Stable within a severity, so the report is reproducible.
+        check_eq(mixed[0].file, std::string("b"), "and equal severities keep file order");
+
+        check(security_report({}).find("No exploitable problems") != std::string::npos,
+              "an empty scan says so plainly");
+        check(security_report(mixed).find("[high]") != std::string::npos,
+              "and a report names severities");
+
+        check(parse_findings("I could not analyse that", "a.py").empty(),
+              "prose yields no findings");
+        check(parse_findings("", "a.py").empty(), "and nothing yields none");
+    }
+
+    // ---- lessons ----
+    {
+        const auto root = std::filesystem::temp_directory_path() / "auspex-selftest-learn";
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+
+        check(read_lessons(root).empty(), "a new project has learned nothing");
+
+        check(write_lessons(root, {"do not delete the tests", "read the file first"}),
+              "lessons are written");
+        check_eq(read_lessons(root).size(), std::size_t{2}, "and read back");
+
+        // A lesson learned twice is not two lessons.
+        write_lessons(root, {"do not delete the tests"});
+        check_eq(read_lessons(root).size(), std::size_t{2}, "duplicates are dropped");
+
+        // Newest kept: an old lesson about code that no longer exists is
+        // confidently wrong, which is worse than no lesson.
+        std::vector<std::string> many;
+        for (int i = 0; i < 60; ++i) many.push_back("lesson " + std::to_string(i));
+        write_lessons(root, many, 10);
+        const auto capped = read_lessons(root);
+        check_eq(capped.size(), std::size_t{10}, "the list is capped");
+        check_eq(capped.back(), std::string("lesson 59"), "keeping the newest");
+
+        check(lessons_note(root).find("lesson 59") != std::string::npos,
+              "and they reach a prompt");
+        check(lessons_note("/nonexistent").empty(), "with nothing to say when there are none");
+
+        // The Auditor's reason IS the lesson; no model is asked, so this step
+        // cannot be wrong in a new way.
+        BoardItem held;
+        held.reason = "it deleted the tests";
+        const auto learned = lessons_from({held});
+        check_eq(learned.size(), std::size_t{1}, "a held change teaches something");
+        check(learned[0].find("deleted the tests") != std::string::npos,
+              "namely the reason it was held");
+        check(lessons_from({}).empty(), "and nothing held teaches nothing");
+
+        // Under .auspex, so a coder cannot rewrite what it is about to be told.
+        check(lessons_path(root).string().find(".auspex") != std::string::npos,
+              "lessons live where a coder cannot reach them");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- packs ----
+    {
+        check(!builtin_packs().empty(), "there are packs");
+        const auto careful = find_pack("careful");
+        check(careful.has_value(), "careful is a pack");
+        if (careful) {
+            check(careful->options.debate, "which turns on debate");
+            check(careful->options.amplify > 1, "and amplifies");
+        }
+        const auto tested = find_pack("tested");
+        check(tested && tested->options.coder.allow_run,
+              "tested lets coders run their tests");
+        check(!find_pack("nonsense").has_value(), "an unknown pack is not invented");
+        check(!find_pack("").has_value(), "and neither is no name");
+    }
+
     // ---- the faculty map ----
     //
     // The Brain window draws this. It must describe THIS engine: a faculty
@@ -5642,11 +5809,24 @@ void test_crew_run() {
         check(find("secret") && find("secret")->state == FacultyState::Always,
               "and neither is the secret gate");
 
-        // Honest about what is absent.
-        check(find("debate") && find("debate")->state == FacultyState::Missing,
-              "debate is marked missing, not drawn as working");
-        check(find("security") && find("security")->state == FacultyState::Missing,
-              "and so is the security scan");
+        // Debate and the security scan are real now, and the map must say so --
+        // it was drawing them as missing, which was true when it was written.
+        check(find("debate") && find("debate")->state == FacultyState::Optional,
+              "debate exists and is opt-in");
+        check(find("security") && find("security")->state == FacultyState::Optional,
+              "and so does the security scan");
+        check(find("amplify") && find("amplify")->state == FacultyState::Optional,
+              "and amplify");
+        check(find("learn") && find("learn")->state == FacultyState::Optional,
+              "and learning");
+
+        // Nothing claims to be missing any more. If something is added back to
+        // this list as Missing, that is a deliberate statement, not an oversight.
+        const bool none_missing =
+            std::none_of(parts.begin(), parts.end(), [](const Faculty& f) {
+                return f.state == FacultyState::Missing;
+            });
+        check(none_missing, "and nothing is drawn as missing");
 
         check(find("run") && find("run")->state == FacultyState::Optional,
               "test running is optional, because it is off by default");
@@ -6441,7 +6621,10 @@ int main(int argc, char** argv) {
         // "run" as a 6th argument turns on command execution for the coders.
         // Opt-in on the command line as well as in the struct, because this is the
         // switch that lets a model start a process.
-        if (args.size() >= 6 && args[5] == "run") options.coder.allow_run = true;
+        if (args.size() >= 6 && args[5] == "run")      options.coder.allow_run = true;
+        if (args.size() >= 6 && args[5] == "debate")   options.debate = true;
+        if (args.size() >= 6 && args[5] == "security") options.security = true;
+        if (args.size() >= 6 && args[5] == "learn")    options.learn = true;
 
         auspex::RunEvents events;
         events.log = [](const std::string& line) { std::cout << "  " << line << "\n"; };

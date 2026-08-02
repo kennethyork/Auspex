@@ -109,6 +109,63 @@ Audit parse_audit(const std::string& reply);
 // is right about the text and careless about the margin still counts.
 bool quote_is_real(const std::string& quote, const std::string& diff);
 
+// --- several opinions ---------------------------------------------------------
+//
+// One Auditor is one model's opinion, and a small model's opinion has been wrong
+// in both directions on this project -- holding correct code twice, and accepting
+// a call to a function that did not exist. These are the two ways ollamadev buys
+// confidence, ported: ask more than once, and make disagreement visible.
+
+// One voice in a debate.
+struct Opinion {
+    std::string role;      // "advocate", "skeptic", "judge"
+    bool        for_it = false;
+    std::string reason;
+};
+
+struct Debate {
+    Opinion advocate;
+    Opinion skeptic;
+    Opinion judge;
+    // The judge decides. It is given both arguments and rules on them, so a
+    // skeptic that invents an objection can be overruled rather than being
+    // silently decisive.
+    bool landed() const { return judge.for_it; }
+};
+
+std::string advocate_prompt(const PlannedSubtask& subtask, const Changeset& changeset,
+                            const AuditLimits& limits);
+std::string skeptic_prompt(const PlannedSubtask& subtask, const Changeset& changeset,
+                           const AuditLimits& limits);
+std::string judge_prompt(const PlannedSubtask& subtask, const std::string& advocate,
+                         const std::string& skeptic);
+
+// Reads one advocate/skeptic reply: {"argument": "..."} or plain prose.
+std::string parse_argument(const std::string& reply);
+
+// Reads the judge: {"verdict":"accept"|"hold","reason":"..."}. Same fail-closed
+// rule as parse_audit -- anything unclear holds.
+Audit parse_judgement(const std::string& reply);
+
+// advocate -> skeptic -> judge. Three model calls, so three times the cost of one
+// Auditor; that is the trade and it is why it is opt-in.
+Audit debate_changeset(const Config& config, const PlannedSubtask& subtask,
+                       const Changeset& changeset, const AuditLimits& limits = {},
+                       const std::string& model = {}, Debate* detail = nullptr);
+
+// `voters` independent Auditors, majority rules, TIES HOLD.
+//
+// A tie holding is the whole point of counting: if the reviewers cannot agree,
+// that is precisely the case a person should look at. An even number of voters is
+// therefore not a bug.
+Audit audit_panel(const Config& config, const PlannedSubtask& subtask,
+                  const Changeset& changeset, int voters,
+                  const AuditLimits& limits = {}, const std::string& model = {},
+                  std::vector<Audit>* votes = nullptr);
+
+// Which way a set of votes goes. Pure, so the tie rule is testable without models.
+Audit tally(const std::vector<Audit>& votes);
+
 // The whole pass: deterministic checks, then the model. Blocking.
 Audit audit_changeset(const Config& config, const PlannedSubtask& subtask,
                       const Changeset& changeset, const AuditLimits& limits = {},

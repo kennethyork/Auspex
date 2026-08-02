@@ -651,18 +651,20 @@ CrewWindow::CrewWindow() {
     route_.set_sensitive(false);
     route_.set_tooltip_text(
         "Set crew_auditor_model / crew_coder_model in config.json instead");
-    debate_.set_sensitive(false);
-    debate_.set_tooltip_text("Not available yet in Auspex's own engine");
+    debate_.set_tooltip_text(
+        "An advocate, a skeptic and a judge argue over every changeset. Three model "
+        "calls per piece instead of one.");
     // Dedupe is not a switch here: overlapping work is ALWAYS held, because
     // silently letting one coder overwrite another's approved change is not a mode
     // worth offering. Ticked and locked, so the behaviour is visible.
     dedupe_.set_active(true);
     dedupe_.set_sensitive(false);
     dedupe_.set_tooltip_text("Always on: overlapping work is held, never overwritten");
-    learn_.set_sensitive(false);
-    learn_.set_tooltip_text("Not available yet in Auspex's own engine");
-    security_.set_sensitive(false);
-    security_.set_tooltip_text("Not available yet in Auspex's own engine");
+    learn_.set_tooltip_text(
+        "Remember why work was held, and put it in front of the next run's coders");
+    security_.set_tooltip_text(
+        "A read-only vulnerability hunt instead of building anything. Nothing is "
+        "written; the result is a report.");
     options_.append(route_);
     options_.append(debate_);
     options_.append(dedupe_);
@@ -688,13 +690,16 @@ CrewWindow::CrewWindow() {
     amplify_.set_range(0, 7);
     amplify_.set_increments(1, 2);
     amplify_.set_value(0);
-    amplify_.set_sensitive(false);
-    amplify_.set_tooltip_text("Not available yet in Auspex's own engine");
+    amplify_.set_tooltip_text(
+        "N Director plans, keeping the shape most agree on, and N reviewers voting "
+        "on every changeset. The most expensive option here: it multiplies both "
+        "ends of the run. 0 is off.");
 
     pack_label_.set_text("Pack");
-    pack_.set_sensitive(false);
-    pack_.set_tooltip_text("Not available yet in Auspex's own engine");
-    packs_ = crew_packs(project_);
+    pack_.set_tooltip_text("Start from a saved set of options; the switches above "
+                           "still win");
+    packs_.clear();
+    for (const auto& pack : builtin_packs()) packs_.push_back(pack.name);
     {
         std::vector<Glib::ustring> labels;
         labels.emplace_back("None");
@@ -850,18 +855,6 @@ void CrewWindow::set_project(const std::filesystem::path& path) {
     remember_project(project_);
     show_project();
 
-    // The pack list is per-project: a saved team defined in one repo is not offered
-    // in another. Re-read rather than kept, or picking a folder would leave a menu
-    // describing the folder before it.
-    packs_ = crew_packs(project_);
-    {
-        std::vector<Glib::ustring> labels;
-        labels.emplace_back("None");
-        for (const auto& pack : packs_) labels.emplace_back(pack);
-        pack_.set_model(Gtk::StringList::create(labels));
-        pack_.set_selected(0);
-    }
-
     // Both watchers forced, so the run and the board are re-read against the folder
     // just chosen rather than left showing the previous one until a file happens to
     // change.
@@ -921,6 +914,24 @@ void CrewWindow::start() {
     // planned. Two numbers, as in the engine.
     options.parallel = swarm_.get_value_as_int() > 0 ? swarm_.get_value_as_int()
                                                      : options.max_subtasks;
+    // A pack first, so the switches below override it rather than the other way
+    // round -- a pack is a starting point, not a lock.
+    if (const auto index = pack_.get_selected();
+        index != GTK_INVALID_LIST_POSITION && index > 0 && index <= packs_.size()) {
+        if (const auto pack = find_pack(packs_[index - 1])) {
+            const auto project = options.project;
+            const auto task    = options.task;
+            options = pack->options;
+            options.project = project;
+            options.task    = task;
+        }
+    }
+
+    options.debate   = debate_.get_active();
+    options.learn    = learn_.get_active();
+    options.security = security_.get_active();
+    if (amplify_.get_value_as_int() > 0) options.amplify = amplify_.get_value_as_int();
+
     options.director_model = config.crew_director_model;
     options.coder_model    = config.crew_coder_model;
     options.auditor_model  = config.crew_auditor_model;

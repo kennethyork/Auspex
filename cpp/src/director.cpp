@@ -212,6 +212,69 @@ Plan parse_plan(const std::string& reply, int max_subtasks) {
     return plan;
 }
 
+std::string plan_shape(const Plan& plan) {
+    // The SHAPE is how many pieces there are and which roles do them, in order.
+    // Two plans that cut a job the same way but word the titles differently are
+    // the same plan; comparing text would call them different and then pick
+    // between them arbitrarily.
+    std::string shape = std::to_string(plan.subtasks.size());
+    for (const auto& subtask : plan.subtasks) {
+        shape += "|" + subtask.role;
+    }
+    return shape;
+}
+
+Plan modal_plan(const std::vector<Plan>& plans) {
+    Plan best;
+    best.error = "no plan was produced";
+
+    std::vector<std::pair<std::string, int>> counts;
+    for (const auto& plan : plans) {
+        if (!plan.ok() || plan.subtasks.empty()) continue;
+        const std::string shape = plan_shape(plan);
+        bool seen = false;
+        for (auto& [key, n] : counts) {
+            if (key != shape) continue;
+            ++n;
+            seen = true;
+            break;
+        }
+        if (!seen) counts.emplace_back(shape, 1);
+    }
+    if (counts.empty()) return best;
+
+    std::string winner = counts.front().first;
+    int         most   = counts.front().second;
+    for (const auto& [shape, n] : counts) {
+        if (n > most) {
+            most   = n;
+            winner = shape;
+        }
+    }
+
+    // The EARLIEST plan of the winning shape. Ties by first occurrence is the only
+    // answer that does not depend on iteration order.
+    for (const auto& plan : plans) {
+        if (plan.ok() && !plan.subtasks.empty() && plan_shape(plan) == winner) {
+            return plan;
+        }
+    }
+    return best;
+}
+
+Plan plan_amplified(const Config& config, const std::string& task,
+                    const std::vector<std::string>& files, int max_subtasks,
+                    int attempts, const std::string& model, const std::string& hint) {
+    if (attempts < 2) return plan_task(config, task, files, max_subtasks, model, hint);
+
+    std::vector<Plan> plans;
+    plans.reserve(static_cast<std::size_t>(attempts));
+    for (int i = 0; i < attempts; ++i) {
+        plans.push_back(plan_task(config, task, files, max_subtasks, model, hint));
+    }
+    return modal_plan(plans);
+}
+
 Plan plan_task(const Config& config, const std::string& task,
                const std::vector<std::string>& files, int max_subtasks,
                const std::string& model, const std::string& hint) {

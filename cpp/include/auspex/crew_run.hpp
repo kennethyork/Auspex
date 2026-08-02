@@ -21,6 +21,7 @@
 #pragma once
 
 #include <atomic>
+#include <optional>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -89,6 +90,28 @@ struct RunOptions {
     // The model a given role should use, after the fallbacks.
     std::string model_for(const std::string& role) const;
 
+    // --- the brain options, as ollamadev spells them ---------------------------
+    //
+    // All opt-in, and a plain run is unchanged by every one of them. Each buys
+    // something at a cost in time and tokens, which is why they are switches
+    // rather than a mode and why the honest default is none of them.
+
+    // Advocate / skeptic / judge on every changeset instead of one Auditor.
+    // Three model calls per piece rather than one.
+    bool debate = false;
+
+    // N Director plans, keep the shape most of them agree on, and N reviewers
+    // voting on every changeset. The most expensive option here by a distance:
+    // it multiplies BOTH ends of the run. 0 is off.
+    int amplify = 0;
+
+    // A read-only vulnerability hunt instead of building anything. No coder runs
+    // and nothing is ever written -- the result is a report.
+    bool security = false;
+
+    // Remember what this run teaches, for the next one.
+    bool learn = false;
+
     CoderLimits coder;
     AuditLimits audit;
 
@@ -152,6 +175,76 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
 
 // Runs with sandboxes still on disk, newest first. What resume could act on.
 std::vector<std::string> resumable_runs();
+
+// --- the security scan --------------------------------------------------------
+//
+// A run mode, not a coder role. Nothing is sandboxed, nothing is written, and no
+// changeset is produced -- it reads the project and returns a report. That is the
+// whole safety argument: a vulnerability hunt that could also edit files is a
+// vulnerability hunt you have to review as carefully as any other change.
+
+struct Finding {
+    std::string file;
+    std::string severity;   // "high" | "medium" | "low"
+    std::string detail;
+
+    bool operator==(const Finding&) const = default;
+};
+
+std::string security_prompt(const std::string& file, const std::string& contents);
+
+// Reads one file's findings. Anything unparseable yields none rather than a
+// guess -- an invented vulnerability wastes more time than a missed one.
+std::vector<Finding> parse_findings(const std::string& reply, const std::string& file);
+
+// Highest severity first, so the report opens with what matters.
+void sort_findings(std::vector<Finding>& findings);
+
+// The report, as text.
+std::string security_report(const std::vector<Finding>& findings);
+
+// Scans the project. Blocking, and one model call per file.
+RunResult scan_security(const Config& config, const RunOptions& options,
+                        const RunEvents& events = {},
+                        const std::atomic<bool>* cancel = nullptr,
+                        std::vector<Finding>* findings = nullptr);
+
+// --- lessons ------------------------------------------------------------------
+//
+// `learn` writes what a run discovered to a file, and every later run puts it in
+// front of its coders. Small and blunt on purpose: a line per lesson, capped, and
+// injected verbatim. Anything cleverer would be a memory system, and a memory
+// system that is wrong is worse than none -- it teaches the same mistake forever.
+
+std::filesystem::path lessons_path(const std::filesystem::path& project);
+
+std::vector<std::string> read_lessons(const std::filesystem::path& project);
+
+// Appends, keeping the newest `limit`. Duplicates are dropped: a lesson learned
+// twice is not two lessons, and a file of repeats crowds out the rest.
+bool write_lessons(const std::filesystem::path& project,
+                   const std::vector<std::string>& lessons, std::size_t limit = 40);
+
+// What the run taught, from what was held and why. No model call: the Auditor
+// already said why it held each piece, and that sentence IS the lesson.
+std::vector<std::string> lessons_from(const std::vector<BoardItem>& held);
+
+// The lessons, as a block for a coder prompt. Empty when there are none.
+std::string lessons_note(const std::filesystem::path& project);
+
+// --- packs --------------------------------------------------------------------
+//
+// A saved set of options under a name. ollamadev keeps these as files; here they
+// are entries in Auspex's own config, because there are a handful of switches
+// rather than a whole team definition.
+
+struct CrewPack {
+    std::string name;
+    RunOptions  options;   // project and task are ignored; only the switches
+};
+
+std::vector<CrewPack> builtin_packs();
+std::optional<CrewPack> find_pack(const std::string& name);
 
 // --- what the crew is made of -------------------------------------------------
 //

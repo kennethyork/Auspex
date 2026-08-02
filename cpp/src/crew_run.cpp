@@ -14,6 +14,7 @@
 #include "auspex/process.hpp"
 #include "auspex/code_index.hpp"
 #include "auspex/mcp.hpp"
+#include "auspex/ollama_client.hpp"
 #include "auspex/skills.hpp"
 #include "auspex/projects.hpp"
 
@@ -258,6 +259,286 @@ std::vector<std::string> resumable_runs() {
     return runs;
 }
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+std::string security_prompt(const std::string& file, const std::string& contents) {
+    std::ostringstream out;
+    out << "You are a security reviewer. Read the file below and report only real, "
+           "exploitable problems.\n\n"
+           "Report:\n"
+           "- injection: a shell, SQL or path built from input that is not checked\n"
+           "- a credential, key or password written into the source\n"
+           "- authentication or authorisation that can be skipped\n"
+           "- unsafe deserialisation, or a path that escapes its directory\n\n"
+           "Do NOT report: style, missing tests, missing comments, or "
+           "\"could be improved\". If the file is fine, say so with an empty list. "
+           "An invented finding wastes more of a person's time than a missed one.\n\n";
+    out << "File: " << file << "\n```\n" << contents << "\n```\n\n";
+    out << "Answer with JSON only:\n"
+           "{\"findings\": [{\"severity\": \"high\"|\"medium\"|\"low\", "
+           "\"detail\": \"one sentence, naming the line\"}]}\n";
+    return out.str();
+}
+
+std::vector<Finding> parse_findings(const std::string& reply, const std::string& file) {
+    std::vector<Finding> findings;
+
+    const std::string body = extract_json(reply);
+    if (body.empty()) return findings;
+
+    const auto document = json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (document.is_discarded()) return findings;
+
+    const json* list = nullptr;
+    if (document.is_array()) list = &document;
+    else if (document.is_object() && document.contains("findings") &&
+             document["findings"].is_array()) {
+        list = &document["findings"];
+    }
+    if (!list) return findings;
+
+    for (const auto& entry : *list) {
+        if (!entry.is_object()) continue;
+
+        Finding finding;
+        finding.file = file;
+        if (entry.contains("detail") && entry["detail"].is_string()) {
+            finding.detail = trim(entry["detail"].get<std::string>());
+        }
+        if (finding.detail.empty() && entry.contains("description") &&
+            entry["description"].is_string()) {
+            finding.detail = trim(entry["description"].get<std::string>());
+        }
+        if (entry.contains("severity") && entry["severity"].is_string()) {
+            finding.severity = trim(entry["severity"].get<std::string>());
+        }
+
+        // Unknown severity becomes "low" rather than being dropped or promoted.
+        // A finding with no severity is still a finding; calling it high because
+        // the model forgot to say would be the report crying wolf.
+        std::string level = finding.severity;
+        std::transform(level.begin(), level.end(), level.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        finding.severity = (level == "high" || level == "medium" || level == "low")
+                               ? level
+                               : "low";
+
+        if (finding.detail.empty()) continue;   // nothing to report is not a report
+        findings.push_back(std::move(finding));
+    }
+    return findings;
+}
+
+void sort_findings(std::vector<Finding>& findings) {
+    const auto rank = [](const std::string& severity) {
+        if (severity == "high")   return 0;
+        if (severity == "medium") return 1;
+        return 2;
+    };
+    // Stable, so two findings of one severity keep the order they were found in --
+    // which is file order, and therefore reproducible.
+    std::stable_sort(findings.begin(), findings.end(),
+                     [&rank](const Finding& a, const Finding& b) {
+                         return rank(a.severity) < rank(b.severity);
+                     });
+}
+
+std::string security_report(const std::vector<Finding>& findings) {
+    if (findings.empty()) return "No exploitable problems found.\n";
+
+    std::ostringstream out;
+    out << findings.size() << (findings.size() == 1 ? " finding\n\n" : " findings\n\n");
+    for (const auto& finding : findings) {
+        out << "[" << finding.severity << "] " << finding.file << "\n    "
+            << finding.detail << "\n";
+    }
+    return out.str();
+}
+
+RunResult scan_security(const Config& config, const RunOptions& options,
+                        const RunEvents& events, const std::atomic<bool>* cancel,
+                        std::vector<Finding>* out_findings) {
+    RunResult result;
+    result.run_id = "scan_" + now_stamp();
+
+    const auto note = [&events](const std::string& text) {
+        if (events.log) events.log(text);
+    };
+    const auto stopped = [cancel] { return cancel && cancel->load(); };
+
+    if (!is_project_dir(options.project)) {
+        result.error = "no such project";
+        return result;
+    }
+
+    // NO SANDBOX, and no coder. Nothing here can write: the scan reads the project
+    // and produces text. A vulnerability hunt that could also edit files would need
+    // reviewing as carefully as any other change, which defeats the point.
+    const auto files = list_files(options.project);
+    note("security: reading " + std::to_string(files.size()) + " files");
+
+    OllamaClient ollama(config);
+    GenerateOptions generate;
+    generate.json = true;
+    generate.disable_thinking = true;
+    generate.temperature = 0.1;
+
+    const std::string model = options.model_for("auditor");
+    std::vector<Finding> findings;
+    int done = 0;
+
+    for (const auto& [path, contents] : files) {
+        if (stopped()) {
+            result.error = "cancelled";
+            break;
+        }
+        ++done;
+        if (done % 10 == 0) {
+            note("security: " + std::to_string(done) + "/" +
+                 std::to_string(files.size()));
+        }
+
+        // A file too large to send whole is skipped rather than truncated: half a
+        // file reviewed is a review that can miss the half it did not see and say
+        // nothing about it.
+        if (contents.size() > options.audit.max_diff_bytes) continue;
+
+        const auto reply = ollama.generate(
+            model.empty() ? config.ollama_model : model,
+            security_prompt(path, contents), generate);
+        if (!reply) continue;
+
+        for (auto& finding : parse_findings(
+                 reply->response.empty() ? reply->thinking : reply->response, path)) {
+            findings.push_back(std::move(finding));
+        }
+    }
+
+    sort_findings(findings);
+    if (out_findings) *out_findings = findings;
+
+    result.held = static_cast<int>(findings.size());
+    note(security_report(findings));
+    return result;
+}
+
+std::filesystem::path lessons_path(const std::filesystem::path& project) {
+    if (project.empty()) return {};
+    // Under .auspex, so a coder can never read its own lessons file and rewrite
+    // what it is about to be told.
+    return project / ".auspex" / "lessons.txt";
+}
+
+std::vector<std::string> read_lessons(const std::filesystem::path& project) {
+    std::vector<std::string> lessons;
+    std::ifstream in(lessons_path(project));
+    if (!in) return lessons;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (const std::string trimmed = trim(line); !trimmed.empty()) {
+            lessons.push_back(trimmed);
+        }
+    }
+    return lessons;
+}
+
+bool write_lessons(const std::filesystem::path& project,
+                   const std::vector<std::string>& lessons, std::size_t limit) {
+    const auto path = lessons_path(project);
+    if (path.empty()) return false;
+
+    auto merged = read_lessons(project);
+    for (const auto& lesson : lessons) {
+        const std::string text = trim(lesson);
+        if (text.empty()) continue;
+        // A lesson learned twice is not two lessons, and a file of repeats crowds
+        // out everything else.
+        if (std::find(merged.begin(), merged.end(), text) != merged.end()) continue;
+        merged.push_back(text);
+    }
+
+    // Newest kept. An old lesson about code that no longer exists is worse than
+    // no lesson: it is confidently wrong.
+    if (merged.size() > limit) {
+        merged.erase(merged.begin(),
+                     merged.begin() + static_cast<long>(merged.size() - limit));
+    }
+
+    std::ostringstream out;
+    for (const auto& lesson : merged) out << lesson << "\n";
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    return write_atomically(path, out.str());
+}
+
+std::vector<std::string> lessons_from(const std::vector<BoardItem>& held) {
+    std::vector<std::string> lessons;
+    for (const auto& item : held) {
+        if (item.reason.empty()) continue;
+        // No model call. The Auditor already said why it held this, and that
+        // sentence IS the lesson -- asking a model to summarise it would add a
+        // failure mode to a step that has none.
+        lessons.push_back("A previous change was held: " + item.reason);
+    }
+    return lessons;
+}
+
+std::string lessons_note(const std::filesystem::path& project) {
+    const auto lessons = read_lessons(project);
+    if (lessons.empty()) return {};
+
+    std::ostringstream out;
+    out << "What previous runs on this project got wrong:\n";
+    for (const auto& lesson : lessons) out << "  - " << lesson << "\n";
+    out << "\n";
+    return out.str();
+}
+
+// ---------------------------------------------------------------------------
+std::vector<CrewPack> builtin_packs() {
+    std::vector<CrewPack> packs;
+
+    CrewPack careful;
+    careful.name = "careful";
+    careful.options.debate  = true;
+    careful.options.amplify = 3;
+    packs.push_back(careful);
+
+    CrewPack quick;
+    quick.name = "quick";
+    quick.options.max_subtasks = 1;
+    quick.options.parallel     = 1;
+    packs.push_back(quick);
+
+    CrewPack tested;
+    tested.name = "tested";
+    tested.options.coder.allow_run = true;
+    packs.push_back(tested);
+
+    CrewPack audit;
+    audit.name = "security";
+    audit.options.security = true;
+    packs.push_back(audit);
+
+    CrewPack learning;
+    learning.name = "learning";
+    learning.options.learn = true;
+    packs.push_back(learning);
+
+    return packs;
+}
+
+std::optional<CrewPack> find_pack(const std::string& name) {
+    if (name.empty()) return std::nullopt;
+    for (const auto& pack : builtin_packs()) {
+        if (pack.name == name) return pack;
+    }
+    return std::nullopt;
+}
+
 const std::vector<Faculty>& crew_faculties() {
     // Honest about what this engine has. Debate and the security scan exist in
     // ollamadev and not here; drawing them as faculties would be describing a
@@ -287,9 +568,14 @@ const std::vector<Faculty>& crew_faculties() {
          FacultyState::Always},
         {"landing", "Landing", "applies what passed, holds the rest",
          FacultyState::Always},
-        {"debate", "Debate", "advocate vs skeptic vs judge", FacultyState::Missing},
-        {"security", "Security scan", "read-only vulnerability hunt",
-         FacultyState::Missing},
+        {"debate", "Debate", "advocate vs skeptic vs judge, on every changeset",
+         FacultyState::Optional},
+        {"amplify", "Amplify", "N plans kept by agreement, N reviewers voting",
+         FacultyState::Optional},
+        {"learn", "Learn", "remembers why work was held, for the next run",
+         FacultyState::Optional},
+        {"security", "Security scan", "read-only vulnerability hunt; builds nothing",
+         FacultyState::Optional},
     };
     return kParts;
 }
@@ -609,6 +895,12 @@ RunResult run_crew(const Config& config, const RunOptions& options,
         result.error = "no such project";
         return result;
     }
+
+    // A different run entirely: it reads and reports, and never builds. Routed
+    // here rather than being a flag inside the build path, so there is no way for
+    // a scan to reach the code that writes files.
+    if (options.security) return scan_security(config, options, events, cancel);
+
     if (trim(options.task).empty()) {
         result.error = "there is no task";
         return result;
@@ -680,6 +972,12 @@ RunResult run_crew(const Config& config, const RunOptions& options,
         }
     }
 
+    // What earlier runs got wrong, put in front of every coder. Read whether or
+    // not `learn` is on: learning is about WRITING them, and refusing to read
+    // what is already there would make the switch retroactive.
+    const std::string lessons = lessons_note(options.project);
+    if (!lessons.empty()) note("research: applying lessons from earlier runs");
+
     // Discovered once for the run, not per coder: the set does not change while a
     // crew works, and re-walking two directories on every turn would be waste.
     SkillSet skills;
@@ -693,9 +991,16 @@ RunResult run_crew(const Config& config, const RunOptions& options,
         relevant_files_note(config, options.project, options.task);
     if (!hint.empty()) note("research: the index suggests where to look");
 
+    if (options.amplify > 1) {
+        note("plan: " + std::to_string(options.amplify) +
+             " plans, keeping the shape most of them agree on");
+    }
     const Plan plan =
-        plan_task(config, options.task, files, options.max_subtasks,
-                  options.model_for("director"), hint);
+        options.amplify > 1
+            ? plan_amplified(config, options.task, files, options.max_subtasks,
+                             options.amplify, options.model_for("director"), hint)
+            : plan_task(config, options.task, files, options.max_subtasks,
+                        options.model_for("director"), hint);
     if (!plan.ok()) {
         result.error = plan.error;
         publish(/*active=*/false);
@@ -703,7 +1008,15 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     }
 
     for (const auto& subtask : plan.subtasks) {
-        attempts.push_back({subtask, {}, {}, {}, "todo"});
+        PlannedSubtask piece = subtask;
+        // Carried in the detail rather than as another prompt argument. The coder
+        // prompt already renders detail prominently, and threading a fifth string
+        // through every signature to say the same thing would be worse.
+        if (!lessons.empty()) {
+            piece.detail = piece.detail.empty() ? lessons
+                                                : piece.detail + "\n\n" + lessons;
+        }
+        attempts.push_back({piece, {}, {}, {}, "todo"});
     }
     publish(/*active=*/true);
     note("build: " + std::to_string(attempts.size()) + " coders");
@@ -755,8 +1068,21 @@ RunResult run_crew(const Config& config, const RunOptions& options,
             // Audited on the worker thread. It is another model call, and doing it
             // here means a slow audit of one piece does not hold up the coder on
             // the next.
-            attempt.audit = audit_changeset(config, attempt.subtask, attempt.changeset,
-                                            options.audit, options.model_for("auditor"));
+            // Which review, in order of cost. Debate is three calls; a panel is
+            // `amplify` calls; the plain Auditor is one.
+            if (options.debate) {
+                attempt.audit = debate_changeset(config, attempt.subtask,
+                                                 attempt.changeset, options.audit,
+                                                 options.model_for("auditor"));
+            } else if (options.amplify > 1) {
+                attempt.audit = audit_panel(config, attempt.subtask, attempt.changeset,
+                                            options.amplify, options.audit,
+                                            options.model_for("auditor"));
+            } else {
+                attempt.audit = audit_changeset(config, attempt.subtask,
+                                                attempt.changeset, options.audit,
+                                                options.model_for("auditor"));
+            }
 
             {
                 std::lock_guard lock(state_mutex);
@@ -800,6 +1126,20 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     }
 
     write_board(board);
+
+    if (options.learn) {
+        // Only what THIS run held. The Auditor's reason is the lesson; nothing is
+        // asked of a model, so this step cannot itself be wrong in a new way.
+        std::vector<BoardItem> mine;
+        for (const auto& item : board) {
+            if (item.id.rfind(result.run_id, 0) == 0) mine.push_back(item);
+        }
+        if (const auto learned = lessons_from(mine); !learned.empty()) {
+            write_lessons(options.project, learned);
+            note("learn: remembered " + std::to_string(learned.size()) + " lesson(s)");
+        }
+    }
+
     publish(/*active=*/false);
 
     note("done: " + std::to_string(result.applied) + " applied · " +

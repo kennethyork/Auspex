@@ -99,4 +99,25 @@ Plan plan_task(const Config& config, const std::string& task,
                const std::vector<std::string>& files, int max_subtasks,
                const std::string& model = {}, const std::string& hint = {});
 
+// N plans, and the one most of them agree on.
+//
+// A single plan is one sample from a model that is guessing at structure. Asking
+// three times and keeping the shape that recurs costs three times as much and
+// removes the worst outcome -- a run built on a plan the model would not have
+// produced twice.
+//
+// "Modal" is by SHAPE, not by text: two plans that cut the job the same way but
+// word the titles differently are the same plan, and comparing strings would call
+// them different and pick arbitrarily.
+std::string plan_shape(const Plan& plan);
+
+// The plan whose shape occurs most often; ties go to the earliest, which is the
+// only stable answer. Empty input yields a plan with an error.
+Plan modal_plan(const std::vector<Plan>& plans);
+
+Plan plan_amplified(const Config& config, const std::string& task,
+                    const std::vector<std::string>& files, int max_subtasks,
+                    int attempts, const std::string& model = {},
+                    const std::string& hint = {});
+
 }  // namespace auspex
