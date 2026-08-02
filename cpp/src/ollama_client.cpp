@@ -7,6 +7,7 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
+#include "auspex/context_tuner.hpp"
 #include "auspex/usage.hpp"
 #include "auspex/json_util.hpp"
 
@@ -192,7 +193,17 @@ std::optional<GenerateResult> OllamaClient::generate(const std::string& model,
     json options = json::object();
     if (opts.num_predict >= 0)  options["num_predict"] = opts.num_predict;
     if (opts.temperature >= 0)  options["temperature"] = opts.temperature;
-    if (!options.empty())       req["options"] = std::move(options);
+
+    // The context window, sized against this machine when the config does not say.
+    //
+    // Measured once per process, not per call: reading /proc/meminfo and NVML on
+    // every model call would be a probe per turn for a number that cannot change.
+    static const int kContext = [this] {
+        return context_for(config_.num_ctx, machine_memory());
+    }();
+    options["num_ctx"] = kContext;
+
+    req["options"] = std::move(options);
 
     last_error_.clear();
 

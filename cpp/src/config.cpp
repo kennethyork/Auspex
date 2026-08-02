@@ -88,6 +88,8 @@ Config Config::load(const fs::path& path) {
     }
 
     assign_if(j, "panel_height",      cfg.panel_height);
+    assign_if(j, "num_ctx",           cfg.num_ctx);
+    assign_if(j, "search_endpoint",   cfg.search_endpoint);
     assign_if(j, "workspace_count",   cfg.workspace_count);
     assign_if(j, "enable_effects",    cfg.enable_effects);
     assign_if(j, "enable_ai",         cfg.enable_ai);

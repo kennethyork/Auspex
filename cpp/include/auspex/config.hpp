@@ -67,6 +67,24 @@ struct Config {
     // codex is running whatever frontier model its owner configured, while a role
     // on ollama is capped at what Ollama serves.
 
+    // Ollama's context window, in tokens. 0 sizes it against this machine --
+    // see context_tuner.hpp.
+    //
+    // It matters more than it looks: run past the window and the model does not
+    // fail, it FORGETS, and a coder whose subtask has scrolled out of view looks
+    // exactly like a stupid model.
+    int         num_ctx = 0;
+
+    // Where web_search() sends its query. %q is replaced with the encoded query.
+    //
+    // Configurable because the keyless default does not work everywhere:
+    // DuckDuckGo's HTML endpoint answers 202 with a challenge page from this
+    // machine, and a feature whose only provider is blocked is a feature that
+    // does not work. Point this at a SearXNG instance you trust, or anything else
+    // that returns HTML with links in it.
+    std::string search_endpoint =
+        "https://html.duckduckgo.com/html/?q=%q";
+
     std::string ollama_endpoint  = "http://127.0.0.1:11434";
     std::string whisper_endpoint = "http://127.0.0.1:5000/transcribe";
     int         sample_rate      = 16000;

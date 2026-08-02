@@ -38,6 +38,7 @@
 #include "auspex/cli_coder.hpp"
 #include "auspex/coder.hpp"
 #include "auspex/director.hpp"
+#include "auspex/context_tuner.hpp"
 #include "auspex/eval.hpp"
 #include "auspex/hooks.hpp"
 #include "auspex/json_util.hpp"
@@ -46,6 +47,7 @@
 #include "auspex/usage.hpp"
 #include "auspex/symbols.hpp"
 #include "auspex/verify.hpp"
+#include "auspex/websearch.hpp"
 #include "auspex/panel_dock.hpp"
 #include "auspex/process.hpp"
 #include "auspex/projects.hpp"
@@ -7122,6 +7124,207 @@ void test_starter_skills() {
 }
 
 // ---------------------------------------------------------------------------
+// Web search
+//
+// Pinned against captured HTML, never the live internet: somebody else's markup
+// is exactly the thing that changes without warning, and a test that needs the
+// network is a test that fails for reasons that have nothing to do with the code.
+// ---------------------------------------------------------------------------
+void test_websearch() {
+    using namespace auspex;
+    std::cout << "\nweb search\n";
+
+    // ---- entities ----
+    {
+        check_eq(decode_entities("a &amp; b"), std::string("a & b"), "&amp;");
+        check_eq(decode_entities("&lt;tag&gt;"), std::string("<tag>"), "&lt; and &gt;");
+        check_eq(decode_entities("it&#39;s"), std::string("it's"), "a numeric escape");
+        check_eq(decode_entities("plain"), std::string("plain"), "and text without any");
+        check_eq(decode_entities("&notreal;"), std::string("&notreal;"),
+                 "an entity we do not know is left alone rather than eaten");
+    }
+
+    // ---- stripping ----
+    {
+        check_eq(strip_html("<p>hello <b>world</b></p>"), std::string("hello world"),
+                 "tags go, text stays");
+        check_eq(strip_html("<script>var x = 1;</script>keep"), std::string("keep"),
+                 "a script's CONTENTS go too -- dropping only the tag would leave "
+                 "the JavaScript in the prompt");
+        check_eq(strip_html("<style>.a{color:red}</style>keep"), std::string("keep"),
+                 "and a stylesheet's");
+        check_eq(strip_html("a\n\n\n   b"), std::string("a b"),
+                 "and the layout's blank lines collapse");
+    }
+
+    // ---- DuckDuckGo's shape ----
+    {
+        const std::string captured =
+            "<div class=\"result\">"
+            "<a class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2F"
+            "docs.pytest.org%2Fen%2Fstable%2F&amp;rut=x\">pytest documentation</a>"
+            "<a class=\"result__snippet\">The pytest framework makes it easy</a>"
+            "</div>";
+        const auto hits = parse_duckduckgo(captured);
+        check_eq(hits.size(), std::size_t{1}, "one result parsed");
+        if (!hits.empty()) {
+            check_eq(hits[0].url, std::string("https://docs.pytest.org/en/stable/"),
+                     "with the redirect unwrapped to the real URL");
+            check_eq(hits[0].title, std::string("pytest documentation"), "and the title");
+            check(hits[0].snippet.find("pytest framework") != std::string::npos,
+                  "and the snippet");
+        }
+    }
+
+    // ---- a challenge page is not a result ----
+    //
+    // The case that actually happens. DuckDuckGo answers automated requests with
+    // 202 and a page that has no results in it, which parses to nothing -- and
+    // "nothing found" and "we were blocked" look identical unless one says so.
+    {
+        const std::string challenge =
+            "<html><head><title>DuckDuckGo</title></head><body>"
+            "<p>Please enable JavaScript</p></body></html>";
+        check(parse_duckduckgo(challenge).empty(), "a challenge page yields no hits");
+        check(parse_links(challenge).empty(), "by either parser");
+    }
+
+    // ---- the generic parser, for another endpoint ----
+    {
+        const std::string generic =
+            "<a href=\"https://example.com/nav\">Home</a>"
+            "<a href=\"https://docs.python.org/3/library/json.html\">json — JSON "
+            "encoder and decoder</a>"
+            "<a href=\"https://duckduckgo.com/settings\">Search settings here</a>";
+        const auto hits = parse_links(generic);
+        check(!hits.empty(), "links are found on a page with no known classes");
+        for (const auto& hit : hits) {
+            check(hit.url.find("duckduckgo.com") == std::string::npos,
+                  "and the engine's own links are not results");
+            check(hit.title.size() >= 8,
+                  "nor is a one-word navigation link: " + hit.title);
+        }
+    }
+
+    // ---- what a model is told ----
+    {
+        SearchResult result;
+        result.ok = true;
+        result.hits.push_back({"A title", "https://example.com", "a snippet"});
+
+        const std::string note = search_note("some query", result);
+        check(note.find("some query") != std::string::npos, "the query is named");
+        check(note.find("https://example.com") != std::string::npos, "and the URL");
+        check(note.find("not instructions") != std::string::npos,
+              "and it is labelled as somebody else's words -- this text came off "
+              "the internet and is about to go into a prompt");
+        check(note.find("may be wrong") != std::string::npos,
+              "and as possibly wrong, which a search result is");
+
+        check(search_note("q", {}).empty(),
+              "and a failed search adds nothing rather than an empty heading");
+    }
+
+    // ---- fetching is http only ----
+    //
+    // A search result is text somebody else wrote. Without this, following one
+    // could turn into a read of the local disk.
+    {
+        for (const char* url : {"file:///etc/passwd", "gopher://x", "ftp://x/y",
+                                "/etc/passwd", ""}) {
+            const auto page = fetch_page(url);
+            check(!page.ok, std::string("refused: ") + url);
+            check(page.text.empty(), "and nothing came back");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Context sizing
+//
+// Run past the window and a model does not fail, it FORGETS -- the subtask
+// scrolls out of view and the coder answers a question nobody asked. Ollama's
+// default is 4096, which a coder loop exhausts on a file listing and a transcript.
+// ---------------------------------------------------------------------------
+void test_context_tuner() {
+    using namespace auspex;
+    std::cout << "\ncontext sizing\n";
+
+    // ---- an explicit setting always wins ----
+    //
+    // ollamadev shipped lowResource as a hardcoded true, so a 24GB card was
+    // throttled exactly as hard as a laptop with no GPU -- safe for the wrong
+    // machine, and silent about it. A measured guess must never do that to a
+    // number somebody wrote down.
+    {
+        MachineMemory tiny{2ULL << 30, 0};
+        check_eq(context_for(65536, tiny), 65536,
+                 "a configured window is used whatever the machine looks like");
+
+        MachineMemory big{64ULL << 30, 24ULL << 30};
+        check_eq(context_for(4096, big), 4096,
+                 "and a small configured window is not raised either -- the person "
+                 "knows something the heuristic does not");
+    }
+
+    // ---- sized against the machine when nothing is set ----
+    {
+        MachineMemory nothing;
+        check(!nothing.known(), "a machine we cannot read");
+        check_eq(suggested_context(nothing), 8192,
+                 "takes the safe end rather than guessing high");
+        check_eq(context_for(0, nothing), 8192, "and that is what gets used");
+
+        MachineMemory laptop{8ULL << 30, 0};
+        MachineMemory workstation{64ULL << 30, 24ULL << 30};
+        check(suggested_context(workstation) > suggested_context(laptop),
+              "a workstation is given more than a laptop");
+    }
+
+    // ---- VRAM decides when there is a GPU ----
+    //
+    // The KV cache lives on the card. Sizing against RAM on a GPU machine would
+    // promise a window the card cannot hold, and Ollama answers that by spilling
+    // to system memory and crawling.
+    {
+        MachineMemory lots_of_ram_small_gpu{128ULL << 30, 6ULL << 30};
+        MachineMemory less_ram_big_gpu{16ULL << 30, 24ULL << 30};
+        check(suggested_context(less_ram_big_gpu) >
+                  suggested_context(lots_of_ram_small_gpu),
+              "a big GPU beats a big pile of RAM, because the cache lives on the card");
+    }
+
+    // ---- bounded at both ends ----
+    {
+        MachineMemory absurd{4096ULL << 30, 4096ULL << 30};
+        check(suggested_context(absurd) <= 131072,
+              "there is a ceiling -- past it the cache costs more than the answer");
+
+        MachineMemory scrap{1ULL << 30, 0};
+        check_eq(suggested_context(scrap), 8192,
+                 "and a floor: a context too small to hold a listing and a "
+                 "transcript is worse than a slow one");
+    }
+
+    // ---- powers of two ----
+    {
+        for (const auto& memory : std::vector<MachineMemory>{
+                 {8ULL << 30, 0}, {32ULL << 30, 0}, {16ULL << 30, 12ULL << 30}}) {
+            const int size = suggested_context(memory);
+            check((size & (size - 1)) == 0,
+                  "a suggested window is a power of two: " + std::to_string(size));
+        }
+    }
+
+    // ---- what it says about this machine ----
+    {
+        const std::string report = context_report(machine_memory());
+        check(!report.empty(), "the report says something");
+        check(report.find("tokens") != std::string::npos, "and names the unit");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The crew has more than coders in it
 //
 // The run view could only ever show coders, because coders were the only thing in
@@ -9247,6 +9450,31 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Look something up on the web. NOT --search, which is the semantic index over
+    // this project: two different questions that would otherwise share a name.
+    if (args.size() >= 2 && args[0] == "--web") {
+        std::string query;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            query += (query.empty() ? "" : " ") + args[i];
+        }
+        const auto found = auspex::web_search(query);
+        if (!found.ok) {
+            std::cout << "search failed: " << found.error << "\n";
+            return 1;
+        }
+        std::cout << auspex::search_note(query, found);
+        return 0;
+    }
+    if (args.size() >= 2 && args[0] == "--fetch") {
+        const auto page = auspex::fetch_page(args[1]);
+        if (!page.ok) {
+            std::cout << "fetch failed: " << page.error << "\n";
+            return 1;
+        }
+        std::cout << page.text.substr(0, 1200) << "\n";
+        return 0;
+    }
+
     if (!args.empty() && args[0] == "--hooks") {
         std::cout << "hooks from " << auspex::hooks_path().string() << "\n";
         std::cout << auspex::render_hooks(auspex::load_hooks());
@@ -9613,6 +9841,8 @@ int main(int argc, char** argv) {
     test_mcp();
     test_roles();
     test_starter_skills();
+    test_websearch();
+    test_context_tuner();
     test_crew_members();
     test_project_guard();
     test_symbols();
