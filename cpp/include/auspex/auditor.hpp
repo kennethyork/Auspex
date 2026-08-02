@@ -89,6 +89,25 @@ std::vector<std::string> scan_secrets(const std::string& diff);
 // own, only permission to go on and ask the model.
 Audit deterministic_audit(const Changeset& changeset, const AuditLimits& limits);
 
+// Does the changed code parse?
+//
+// Kept out of deterministic_audit() on purpose. That function is pure -- two
+// strings in, a verdict out -- and this one stages files and spawns parsers, so
+// folding it in would put a temp directory and four subprocesses inside something
+// every test calls a hundred times. They run one after the other in
+// audit_changeset(); the separation is for the caller's sake, not the code's.
+//
+// A hold from here is the strongest kind the crew produces. Every other hold is
+// somebody's opinion, checkable at best against quote_is_real(); this one is a
+// parser refusing the file, and its quoted evidence is a line number that either
+// exists or does not. It also runs BEFORE any model call, so a coder that emitted
+// broken syntax costs one parse rather than three debate turns.
+//
+// It says nothing about languages it has no parser for -- see linters.hpp. Silence
+// here means "not checked" at least as often as it means "fine", which is why it
+// can only ever hold and never accept on its own.
+Audit syntax_audit(const Changeset& changeset);
+
 // --- the model's opinion ------------------------------------------------------
 
 std::string auditor_prompt(const PlannedSubtask& subtask, const Changeset& changeset,

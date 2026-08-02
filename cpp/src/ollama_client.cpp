@@ -6,6 +6,8 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
+#include "auspex/usage.hpp"
+
 using json = nlohmann::json;
 
 namespace auspex {
@@ -162,6 +164,13 @@ std::optional<GenerateResult> OllamaClient::generate(const std::string& model,
     out.thinking = j.value("thinking", std::string{});
     out.done     = j.value("done", false);
     out.done_reason = j.value("done_reason", std::string{});
+    out.prompt_tokens = j.value("prompt_eval_count", 0);
+    out.eval_tokens   = j.value("eval_count", 0);
+
+    // Metered here, at the one place every model call in Auspex's own loop passes
+    // through. Threading a counter out to each of the eight roles instead would
+    // mean a new role silently costs nothing until somebody remembers to add it.
+    record_usage(model, out.prompt_tokens, out.eval_tokens);
     return out;
 }
 

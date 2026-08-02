@@ -59,6 +59,12 @@ struct GenerateResult {
     bool        done = false;
     std::string done_reason;   // "stop", "length", ...
 
+    // What the server says the call cost. Zero means it did not say -- Ollama
+    // omits these on some paths -- which is why usage.hpp counts a call with no
+    // numbers as unmeasured rather than as free.
+    int         prompt_tokens = 0;   // prompt_eval_count
+    int         eval_tokens   = 0;   // eval_count
+
     // True when the server completed the request, regardless of which field the
     // tokens landed in. This is the correct readiness signal.
     bool completed() const { return done; }

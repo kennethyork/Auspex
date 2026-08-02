@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include "auspex/crew.hpp"
+#include "auspex/linters.hpp"
 #include "auspex/ollama_client.hpp"
 #include "auspex/process.hpp"
 
@@ -150,6 +151,30 @@ Audit deterministic_audit(const Changeset& changeset, const AuditLimits& limits)
     // Nothing decidably wrong. NOT a verdict -- only permission to ask the model.
     audit.verdict = Verdict::Accept;
     audit.reason.clear();
+    return audit;
+}
+
+Audit syntax_audit(const Changeset& changeset) {
+    Audit audit;
+    audit.certain = true;
+
+    const auto diagnostics = lint_changeset(changeset);
+    if (diagnostics.empty()) {
+        // Either every checkable file parsed, or none of them was checkable. Both
+        // are "nothing to hold for" and neither is "this code is good" -- which is
+        // why this returns permission to continue rather than a verdict.
+        audit.verdict = Verdict::Accept;
+        return audit;
+    }
+
+    const Diagnostic& first = diagnostics[0];
+    audit.reason = "this does not parse: " + first.path +
+                   (first.line > 0 ? ":" + std::to_string(first.line) : "") + " " +
+                   first.message;
+    // The evidence, in the same field a model's objection would use -- so anything
+    // reading an Audit gets the citation the same way whoever wrote it.
+    audit.quote = first.format();
+    for (const auto& d : diagnostics) audit.notes.push_back(d.format());
     return audit;
 }
 
@@ -386,6 +411,10 @@ Audit debate_changeset(const Config& config, const PlannedSubtask& subtask,
     if (Audit certain = deterministic_audit(changeset, limits); certain.held()) {
         return certain;
     }
+    // Nor is there a debate to be had about code that does not compile. This is
+    // the largest saving of the three call sites: a debate is three model calls,
+    // and a parser answers in milliseconds.
+    if (Audit syntax = syntax_audit(changeset); syntax.held()) return syntax;
 
     OllamaClient ollama(config);
 
@@ -484,6 +513,9 @@ Audit audit_panel(const Config& config, const PlannedSubtask& subtask,
     if (Audit certain = deterministic_audit(changeset, limits); certain.held()) {
         return certain;
     }
+    // Five voters would otherwise each be asked to notice, independently, that the
+    // file has an unclosed bracket -- and a majority of them would have to.
+    if (Audit syntax = syntax_audit(changeset); syntax.held()) return syntax;
 
     std::vector<Audit> collected;
     collected.reserve(static_cast<std::size_t>(voters));
@@ -501,6 +533,10 @@ Audit audit_changeset(const Config& config, const PlannedSubtask& subtask,
     // nothing a model could say that would make a leaked key acceptable.
     Audit certain = deterministic_audit(changeset, limits);
     if (certain.held()) return certain;
+
+    // Then the parsers. Also before any model call, and for the same reason: there
+    // is nothing a model could say that makes a file with a syntax error land.
+    if (Audit syntax = syntax_audit(changeset); syntax.held()) return syntax;
 
     OllamaClient ollama(config);
 

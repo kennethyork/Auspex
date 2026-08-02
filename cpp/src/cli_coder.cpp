@@ -5,6 +5,7 @@
 
 #include "auspex/agents.hpp"
 #include "auspex/process.hpp"
+#include "auspex/usage.hpp"
 
 namespace auspex {
 
@@ -163,6 +164,10 @@ std::string ask_cli(const std::string& backend, const std::string& model,
     const LimitedResult ran = run_limited(argv, cwd.string(), timeout_seconds,
                                           /*max_output=*/32'000, stdin_text);
 
+    // Counted, but not in tokens: a child process reports us nothing. Recording it
+    // as unmeasured is the honest entry -- see usage.hpp on why this is not zero.
+    record_opaque_usage(model.empty() ? backend : backend + ":" + model);
+
     // Output whether or not it exited zero. These tools return non-zero for
     // reasons that have nothing to do with whether they answered -- a warning, a
     // rate-limit note -- and throwing away a good reply over an exit code would
@@ -206,6 +211,7 @@ CoderOutcome run_cli_coder(const Config& config, const PlannedSubtask& subtask,
     // the life of the process.
     const LimitedResult ran = run_limited(argv, sandbox.string(), timeout_seconds,
                                           /*max_output=*/24'000, stdin_text);
+    record_opaque_usage(outcome.model);
 
     outcome.finished = ran.ok;
     if (ran.timed_out) {

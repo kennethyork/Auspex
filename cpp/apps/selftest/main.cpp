@@ -38,6 +38,10 @@
 #include "auspex/cli_coder.hpp"
 #include "auspex/coder.hpp"
 #include "auspex/director.hpp"
+#include "auspex/eval.hpp"
+#include "auspex/hooks.hpp"
+#include "auspex/linters.hpp"
+#include "auspex/usage.hpp"
 #include "auspex/panel_dock.hpp"
 #include "auspex/process.hpp"
 #include "auspex/projects.hpp"
@@ -6399,6 +6403,701 @@ void test_code_index() {
 }
 
 // ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
+void test_usage() {
+    using namespace auspex;
+    std::cout << "\nusage\n";
+
+    reset_usage();
+
+    // ---- what counts as metered ----
+    //
+    // Wrong in the safe direction: calling a local model metered overstates a bill
+    // by zero, and calling a metered one local understates it by the whole thing.
+    {
+        check(is_metered_model("gpt-oss:20b-cloud"), "an ollama cloud model is metered");
+        check(is_metered_model("claude"), "and so is an agent CLI");
+        check(is_metered_model("claude:opus-5"), "with or without a model after it");
+        check(!is_metered_model("qwen3.5:9b"), "a local model is not");
+        check(!is_metered_model("moondream:latest"), "nor is a small local one");
+        check(!is_metered_model(""), "and nothing is not a metered model");
+    }
+
+    // ---- the tally ----
+    {
+        reset_usage();
+        record_usage("qwen3.5:9b", 100, 40);
+        record_usage("qwen3.5:9b", 200, 60);
+
+        const auto snapshot = usage_snapshot();
+        check_eq(snapshot.at("qwen3.5:9b").prompt, std::int64_t{300}, "prompts add up");
+        check_eq(snapshot.at("qwen3.5:9b").eval, std::int64_t{100}, "and so do evals");
+        check_eq(snapshot.at("qwen3.5:9b").total(), std::int64_t{400}, "total is both");
+        check_eq(snapshot.at("qwen3.5:9b").calls, std::int64_t{2}, "two calls");
+    }
+
+    // ---- an unmeasured call is not a free one ----
+    //
+    // The whole reason opaque_calls exists. An agent CLI reports nothing, and
+    // recording that as 0 tokens would put "claude: 0 tokens" in a cost report,
+    // which is the most expensive line in it.
+    {
+        reset_usage();
+        record_opaque_usage("claude");
+        record_usage("claude", 0, 0);   // a generate() that answered without counts
+
+        const auto snapshot = usage_snapshot();
+        check_eq(snapshot.at("claude").opaque_calls, std::int64_t{2},
+                 "a call with no token counts is recorded as unmeasured");
+        check_eq(snapshot.at("claude").calls, std::int64_t{0},
+                 "and not as a measured call");
+        check_eq(snapshot.at("claude").total(), std::int64_t{0},
+                 "it contributes no tokens, because we do not know any");
+
+        const std::string report = usage_report(snapshot, "run");
+        check(report.find("not reported") != std::string::npos,
+              "and the report says so rather than printing a zero");
+        check(report.find("0 tokens") == std::string::npos,
+              "which is the point -- unmeasured must never read as free");
+    }
+
+    // ---- the delta across a run ----
+    {
+        reset_usage();
+        record_usage("qwen3.5:9b", 50, 10);
+        const auto before = usage_snapshot();
+
+        record_usage("qwen3.5:9b", 100, 20);
+        record_usage("gpt-oss:20b-cloud", 500, 200);
+
+        const auto delta = usage_since(before);
+        check_eq(delta.at("qwen3.5:9b").total(), std::int64_t{120},
+                 "the delta counts only what happened inside the window");
+        check(delta.count("gpt-oss:20b-cloud") == 1, "including a model new to it");
+
+        const Tally metered = usage_metered_total(delta);
+        check_eq(metered.total(), std::int64_t{700},
+                 "and the metered total is the cloud model alone");
+
+        // A model that did nothing in the window is not in the window's report.
+        record_usage("idle-model", 1, 1);
+        const auto second = usage_snapshot();
+        const auto empty_delta = usage_since(second);
+        check(empty_delta.empty(), "a window in which nothing happened reports nothing");
+    }
+
+    // ---- a run reports its own cost ----
+    //
+    // Cheap to check without a model: a run that fails before planning still
+    // passes through the meter, so `usage` being present at all proves the wiring.
+    {
+        reset_usage();
+        RunOptions nowhere;
+        nowhere.project = "/nonexistent-project-for-a-usage-check";
+        const RunResult failed = run_crew(Config{}, nowhere);
+        check(!failed.error.empty(), "a run with no project fails");
+        check(failed.usage.empty(),
+              "and reports no cost, because it spent nothing getting there");
+
+        record_usage("qwen3.5:9b", 10, 5);
+        const RunResult after = run_crew(Config{}, nowhere);
+        check(after.usage.empty(),
+              "a run's meter measures only its own window, not what came before it");
+    }
+
+    // ---- the report ----
+    {
+        reset_usage();
+        record_usage("qwen3.5:9b", 1000, 500);
+        record_usage("gpt-oss:20b-cloud", 10, 5);
+        const std::string report = usage_report(usage_snapshot(), "totals");
+
+        const auto cloud_at = report.find("gpt-oss:20b-cloud");
+        const auto local_at = report.find("qwen3.5:9b");
+        check(cloud_at != std::string::npos && local_at != std::string::npos,
+              "both models are listed");
+        check(cloud_at < local_at,
+              "the metered one first, even though it spent fewer tokens");
+        check(report.find("totals") != std::string::npos, "under the title given");
+    }
+
+    reset_usage();
+}
+
+// ---------------------------------------------------------------------------
+// Linters
+//
+// The parsers are pinned against REAL captured output from each tool, not against
+// a format I remembered. That is the whole risk in this file: a tool changes how
+// it prints an error, this quietly stops finding any, and the Auditor goes back to
+// guessing without anything failing.
+// ---------------------------------------------------------------------------
+void test_linters() {
+    using namespace auspex;
+    std::cout << "\nlinters\n";
+
+    // ---- which tool for which file ----
+    {
+        check(can_lint("calc.py") == in_path("python3"), "python files if python3 is here");
+        check(can_lint("app.js") == in_path("node"), "js files if node is");
+        check(can_lint("data.json"), "json always -- it is parsed in-process");
+        check(!can_lint("main.cpp"),
+              "but never C++: a one-file syntax check of a project file fails on its "
+              "own #includes, and a false hold is worse than no check");
+        check(!can_lint("main.rs"), "nor Rust, for the same reason");
+        check(!can_lint("notes.txt"), "and nothing at all for a file with no parser");
+        check(!can_lint("README"), "or with no extension");
+
+        check(linter_for("data.json").empty(),
+              "json has no argv, which is not the same as being unlintable");
+        check(can_lint("data.json"), "-- can_lint knows the difference");
+    }
+
+    // ---- python: real py_compile output ----
+    {
+        const std::string real =
+            "  File \"bad.py\", line 1\n"
+            "    def f(:\n"
+            "          ^\n"
+            "SyntaxError: invalid syntax\n";
+        const auto found = parse_diagnostics("python3", "bad.py", real);
+        check_eq(found.size(), std::size_t{1}, "one diagnostic from a python syntax error");
+        check_eq(found[0].line, 1, "on the line python named");
+        check(found[0].message.find("SyntaxError") != std::string::npos,
+              "carrying the message");
+        check_eq(found[0].path, std::string("bad.py"), "and the path we asked about");
+    }
+
+    // ---- node: real --check output, stack and all ----
+    {
+        const std::string real =
+            "/tmp/lint/bad.js:2\n"
+            "  return 1\n"
+            "         ^\n"
+            "\n"
+            "SyntaxError: Unexpected number\n"
+            "    at internalCompileFunction (node:internal/vm:73:18)\n"
+            "    at wrapSafe (node:internal/modules/cjs/loader:1274:20)\n"
+            "\n"
+            "Node.js v18.19.1\n";
+        const auto found = parse_diagnostics("node", "bad.js", real);
+        check_eq(found.size(), std::size_t{1}, "one diagnostic from node");
+        check_eq(found[0].line, 2, "on the line node named");
+        check(found[0].message.find("Unexpected number") != std::string::npos,
+              "with node's message");
+        check(found[0].message.find("internalCompileFunction") == std::string::npos,
+              "and not node's own stack, which is not evidence about the user's file");
+    }
+
+    // ---- php: the message and the line are on one line ----
+    {
+        const std::string real =
+            "PHP Parse error:  syntax error, unexpected token \"{\", expecting "
+            "variable in bad.php on line 2\n"
+            "Errors parsing bad.php\n";
+        const auto found = parse_diagnostics("php", "bad.php", real);
+        check_eq(found.size(), std::size_t{1},
+                 "one diagnostic -- the 'Errors parsing' summary is not a second");
+        check_eq(found[0].line, 2, "on the line php named");
+    }
+
+    // ---- gofmt: file:line:col: message ----
+    {
+        const std::string real =
+            "bad.go:2:9: expected ')', found '{'\n"
+            "bad.go:2:11: expected ';', found 'EOF'\n";
+        const auto found = parse_diagnostics("gofmt", "bad.go", real);
+        check_eq(found.size(), std::size_t{2}, "gofmt reports each error");
+        check_eq(found[0].line, 2, "with a line");
+        check_eq(found[0].column, 9, "and a column");
+        check(found[0].message.find("expected ')'") != std::string::npos, "and a message");
+    }
+
+    // ---- a clean run says nothing ----
+    {
+        check(parse_diagnostics("python3", "ok.py", "").empty(), "no output, no diagnostics");
+        check(parse_diagnostics("gofmt", "ok.go", "").empty(), "for every tool");
+        check(parse_diagnostics("unknown-tool", "x.py", "some noise").empty(),
+              "and a tool we do not parse yields nothing rather than a guess");
+    }
+
+    // ---- json, in-process ----
+    {
+        Changeset broken;
+        broken.files.push_back({"config.json", "{\"a\": 1,}", false});
+        const auto found = lint_changeset(broken);
+        check_eq(found.size(), std::size_t{1}, "a trailing comma is caught");
+        check(found[0].line > 0, "with a line number, converted from the byte offset");
+
+        Changeset fine;
+        fine.files.push_back({"config.json", "{\"a\": 1}", false});
+        check(lint_changeset(fine).empty(), "and valid JSON passes");
+    }
+
+    // ---- end to end, on a real changeset, through the real python ----
+    if (in_path("python3")) {
+        Changeset broken;
+        broken.files.push_back({"calc.py", "def add(a, b:\n    return a + b\n", false});
+        const auto found = lint_changeset(broken);
+        check(!found.empty(), "a real python syntax error is found by the real python");
+        if (!found.empty()) {
+            check_eq(found[0].path, std::string("calc.py"), "named by its project path");
+        }
+
+        Changeset good;
+        good.files.push_back({"calc.py", "def add(a, b):\n    return a + b\n", false});
+        check(lint_changeset(good).empty(), "and correct python is not held");
+    }
+
+    // ---- a .js file that is really an ES module ----
+    //
+    // Found by pointing --lint at this repository: node judges module-or-script
+    // from the extension and the nearest package.json, so a valid module named
+    // .js comes back as "Cannot use import statement outside a module". That is
+    // not a syntax error, and holding a changeset over it would be precisely the
+    // false positive that makes a check worth ignoring.
+    if (in_path("node")) {
+        Changeset module_js;
+        module_js.files.push_back(
+            {"lib.js", "import x from \"y\";\nexport const a = 1;\n", false});
+        check(lint_changeset(module_js).empty(),
+              "a valid ES module named .js is not reported as broken");
+
+        Changeset really_broken;
+        really_broken.files.push_back(
+            {"lib.js", "import x from \"y\";\nconst a = ;\n", false});
+        check(!lint_changeset(really_broken).empty(),
+              "while a module with a real syntax error still is");
+
+        Changeset plain;
+        plain.files.push_back({"lib.js", "function f( {\n", false});
+        const auto found = lint_changeset(plain);
+        check(!found.empty(), "and an ordinary script error is unaffected");
+        if (!found.empty()) {
+            check_eq(found[0].path, std::string("lib.js"),
+                     "reported against the file asked about, not a temp copy");
+        }
+    }
+
+    // ---- what is NOT checked is not reported as fine ----
+    {
+        Changeset cpp;
+        cpp.files.push_back({"main.cpp", "int main( { return 0; }", false});
+        check_eq(lintable_count(cpp), 0, "a C++ file is not counted as checkable");
+        check(lint_changeset(cpp).empty(),
+              "so nothing is reported -- silence here means unchecked, not correct");
+
+        Changeset deleted;
+        deleted.files.push_back({"gone.py", "", true});
+        check_eq(lintable_count(deleted), 0, "a deletion has nothing to parse");
+    }
+
+    // ---- the block handed to the Auditor ----
+    {
+        check(diagnostics_block({}).empty(), "nothing to say adds nothing to the prompt");
+
+        std::vector<Diagnostic> many;
+        for (int i = 1; i <= 20; ++i) {
+            many.push_back({"a.py", i, 0, "boom", "python3"});
+        }
+        const std::string block = diagnostics_block(many);
+        check(block.find("and 8 more") != std::string::npos,
+              "a cascade is capped -- the first errors are the only real ones");
+        check(block.find("facts from a compiler") != std::string::npos,
+              "and it is labelled as fact, not opinion");
+    }
+
+    // ---- the Auditor's gate ----
+    {
+        if (in_path("python3")) {
+            Changeset broken;
+            broken.files.push_back({"calc.py", "def add(a, b:\n    return a + b\n", false});
+            const Audit held = syntax_audit(broken);
+            check(held.held(), "a changeset that does not parse is held");
+            check(held.certain, "and it is a certainty, not an opinion");
+            check(!held.quote.empty(), "with evidence that points at a real line");
+            check(quote_is_real("return a + b", broken.diff) || broken.diff.empty(),
+                  "-- the quote convention is unchanged");
+        }
+
+        Changeset unparseable_language;
+        unparseable_language.files.push_back({"main.cpp", "int main( {", false});
+        check(!syntax_audit(unparseable_language).held(),
+              "a language with no parser is not held on suspicion");
+
+        check(!syntax_audit({}).held(),
+              "and an empty changeset is deterministic_audit's business, not this one");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hooks
+//
+// The gate is the user's, and the only property that really matters is that it
+// fails CLOSED. Most of these check the ways it could quietly fail open.
+// ---------------------------------------------------------------------------
+void test_hooks() {
+    using namespace auspex;
+    std::cout << "\nhooks\n";
+
+    // ---- parsing, and what is refused ----
+    {
+        const auto good = parse_hooks(R"([
+            {"event": "pre_tool", "command": ["/bin/true"], "match": "write"}
+        ])");
+        check_eq(good.size(), std::size_t{1}, "a well-formed hook loads");
+        check(good[0].event == HookEvent::PreTool, "with its event");
+        check_eq(good[0].matcher, std::string("write"), "and its matcher");
+
+        const auto wrapped = parse_hooks(R"({"hooks": [
+            {"event": "run_end", "command": ["/bin/true"]}
+        ]})");
+        check_eq(wrapped.size(), std::size_t{1}, "either spelling of the file works");
+
+        // A command as a STRING is refused rather than split on spaces. Splitting
+        // is what a shell does, and guessing where the arguments are in
+        // `rm -rf "my files"` is how a gate becomes the hazard.
+        check(parse_hooks(R"([{"event":"pre_tool","command":"rm -rf /"}])").empty(),
+              "a command that is not an array is refused, never word-split");
+        check(parse_hooks(R"([{"event":"pre_tool","command":[]}])").empty(),
+              "an empty command is not a hook");
+        check(parse_hooks(R"([{"event":"nonsense","command":["/bin/true"]}])").empty(),
+              "an unknown event is dropped rather than guessed at");
+        check(parse_hooks("not json at all").empty(), "and unreadable JSON yields none");
+        check(parse_hooks(R"([{"event":"pre_tool","command":["/bin/true",7]}])").empty(),
+              "a non-string argument invalidates the whole command");
+    }
+
+    // ---- matching ----
+    {
+        Hook hook;
+        hook.event = HookEvent::PreTool;
+        hook.command = {"/bin/true"};
+
+        hook.matcher = "";
+        check(hook_matches(hook, "write"), "an empty matcher fires on everything");
+        hook.matcher = "write";
+        check(hook_matches(hook, "write"), "a matching subject fires");
+        check(hook_matches(hook, "WRITE"), "case-insensitively");
+        check(!hook_matches(hook, "read"), "and a different one does not");
+    }
+
+    // ---- nothing configured allows ----
+    //
+    // The one case that must NOT fail closed. An absent gate is not a shut gate,
+    // or nobody could run a coder at all.
+    {
+        const HookOutcome none = run_pre_tool_hooks("write", "calc.py", {});
+        check(!none.blocked, "no hooks means nothing is blocked");
+        check(!none.ran, "and nothing ran");
+    }
+
+    // ---- a hook that says yes ----
+    {
+        Hook allow;
+        allow.event = HookEvent::PreTool;
+        allow.command = {"/bin/true"};
+        const HookOutcome outcome = run_pre_tool_hooks("write", "calc.py", {allow});
+        check(!outcome.blocked, "a hook exiting zero allows the tool");
+        check(outcome.ran, "and it did run");
+    }
+
+    // ---- a hook that says no ----
+    {
+        Hook deny;
+        deny.event = HookEvent::PreTool;
+        deny.command = {"/bin/false"};
+        const HookOutcome outcome = run_pre_tool_hooks("write", "calc.py", {deny});
+        check(outcome.blocked, "a hook exiting non-zero blocks the tool");
+        check(!outcome.reason.empty(), "with a reason the model can read");
+    }
+
+    // ---- a hook that is not there ----
+    //
+    // THE case this design exists for. A typo'd path looks exactly like no hook,
+    // and treating it as one silently removes a gate the user asked for.
+    {
+        Hook missing;
+        missing.event = HookEvent::PreTool;
+        missing.command = {"/nonexistent/definitely-not-a-program"};
+        const HookOutcome outcome = run_pre_tool_hooks("write", "calc.py", {missing});
+        check(outcome.blocked, "a hook that cannot be run BLOCKS");
+        check(outcome.reason.find("could not be run") != std::string::npos,
+              "and says which way it failed");
+    }
+
+    // ---- a hook that never answers ----
+    {
+        // NOT `sleep 30`. The subject and detail are appended to every hook's argv,
+        // so `sleep` would be handed "write" and "calc.py" as further intervals and
+        // exit immediately complaining -- which blocks, but for the wrong reason,
+        // and would have tested nothing. python ignores what follows -c.
+        if (in_path("python3")) {
+            Hook hangs;
+            hangs.event = HookEvent::PreTool;
+            hangs.command = {"python3", "-c", "import time; time.sleep(30)"};
+            const HookOutcome outcome =
+                run_pre_tool_hooks("write", "calc.py", {hangs}, /*timeout_seconds=*/1);
+            check(outcome.blocked, "a hook that hangs past its deadline BLOCKS");
+            check(outcome.reason.find("did not answer") != std::string::npos,
+                  "and says so");
+        }
+    }
+
+    // ---- only pre_tool can block ----
+    {
+        Hook after;
+        after.event = HookEvent::PostTool;
+        after.command = {"/bin/false"};
+        const HookOutcome outcome = run_pre_tool_hooks("write", "calc.py", {after});
+        check(!outcome.blocked,
+              "a post_tool hook cannot block, whatever it exits -- it runs after");
+        check(!outcome.ran, "and is not even consulted here");
+    }
+
+    // ---- a non-matching hook is not consulted ----
+    {
+        Hook deny_runs;
+        deny_runs.event = HookEvent::PreTool;
+        deny_runs.command = {"/bin/false"};
+        deny_runs.matcher = "run";
+        const HookOutcome writing = run_pre_tool_hooks("write", "calc.py", {deny_runs});
+        check(!writing.blocked, "a matcher for `run` does not block a `write`");
+        const HookOutcome running = run_pre_tool_hooks("run", "pytest", {deny_runs});
+        check(running.blocked, "but it does block a `run`");
+    }
+
+    // ---- the gate in the coder loop ----
+    {
+        std::error_code ec;
+        const std::filesystem::path root = "/tmp/auspex-hook-coder";
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+
+        ToolCall write;
+        write.tool = CoderTool::Write;
+        write.path = "notes.txt";
+        write.contents = "hello";
+
+        CoderLimits open;
+        const ToolResult allowed = run_tool(write, root, open);
+        check(allowed.ok, "with no hooks the write lands");
+
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+
+        CoderLimits gated;
+        Hook deny;
+        deny.event = HookEvent::PreTool;
+        deny.command = {"/bin/false"};
+        deny.matcher = "write";
+        gated.hooks = {deny};
+
+        const ToolResult blocked = run_tool(write, root, gated);
+        check(!blocked.ok, "with a denying hook it does not");
+        check(!std::filesystem::exists(root / "notes.txt"),
+              "and the file is genuinely not written -- the gate is before the write");
+
+        // A read is not a write, so the same hook must let it through.
+        ToolCall list;
+        list.tool = CoderTool::List;
+        check(run_tool(list, root, gated).ok,
+              "while a verb the matcher does not name still works");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- the payload other people's programs read ----
+    {
+        const std::string payload = hook_payload(HookEvent::PreTool, "write", "calc.py");
+        check(payload.find("\"event\":\"pre_tool\"") != std::string::npos,
+              "the event is in the JSON on stdin");
+        check(payload.find("\"subject\":\"write\"") != std::string::npos, "and the verb");
+        check(payload.find("\"detail\":\"calc.py\"") != std::string::npos, "and the target");
+    }
+
+    // ---- where config may come from ----
+    {
+        const auto path = hooks_path();
+        check(path.string().find(".config") != std::string::npos ||
+                  path.string().find("auspex") != std::string::npos,
+              "hooks live in the home config");
+        check(path.string().find("/.auspex/") == std::string::npos,
+              "never in a project directory -- a clone must not be able to run code");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Eval
+//
+// The harness that answers "does the crew produce good code". Everything here is
+// about the harness itself; the number it produces needs a model and lives behind
+// --eval.
+// ---------------------------------------------------------------------------
+void test_eval() {
+    using namespace auspex;
+    std::cout << "\neval\n";
+
+    // ---- the built-in suite ----
+    {
+        const auto& suite = builtin_evals();
+        check(suite.size() >= 5, "there is a suite");
+        for (const auto& task : suite) {
+            check(!task.name.empty(), "every task is named: " + task.name);
+            check(!task.prompt.empty(), "and asks for something: " + task.name);
+            check(!task.checks.empty(), "and can be scored: " + task.name);
+        }
+
+        // The regression that was actually observed on this project.
+        const auto in_place =
+            std::find_if(suite.begin(), suite.end(),
+                         [](const EvalTask& t) { return t.name == "edit-in-place"; });
+        check(in_place != suite.end(),
+              "including the failure that was observed: editing the named file "
+              "instead of creating a new one");
+    }
+
+    // ---- scoring ----
+    {
+        std::error_code ec;
+        const std::filesystem::path root = "/tmp/auspex-eval-check";
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+        {
+            std::ofstream out(root / "calc.py");
+            out << "def add(a, b):\n    return a + b\n";
+        }
+
+        std::string why;
+        check(apply_check({"calc.py", "return a + b", {}, {}, {}}, root, &why),
+              "a file check passes when the text is there");
+        check(apply_check({"calc.py", "return   a  +  b", {}, {}, {}}, root, &why),
+              "a run of whitespace collapses, so odd spacing in a check still matches");
+        check(!apply_check({"calc.py", "returna+b", {}, {}, {}}, root, &why),
+              "but whitespace is collapsed, never deleted -- that text would not "
+              "compile, and a check that accepted it would pass on broken code");
+        check(!apply_check({"calc.py", "return a+b", {}, {}, {}}, root, &why),
+              "which does mean a check must spell the spacing it expects; the "
+              "builtin tasks lean on running the code, not on matching its text");
+
+        check(!apply_check({"missing.py", "anything", {}, {}, {}}, root, &why),
+              "a file that was never written fails");
+        check(why.find("not written") != std::string::npos, "and says so");
+
+        check(apply_check({"calc.py", {}, "TODO", {}, {}}, root, &why),
+              "an absent-check passes when the text is absent");
+        check(!apply_check({"calc.py", {}, "return", {}, {}}, root, &why),
+              "and fails when it is present");
+
+        check(!apply_check({"../escape.py", "x", {}, {}, {}}, root, &why),
+              "a check cannot reach outside the task directory either");
+
+        std::filesystem::remove_all(root, ec);
+    }
+
+    // ---- a missing interpreter skips, it does not fail ----
+    {
+        EvalCheck impossible;
+        impossible.command = {"definitely-not-installed-anywhere"};
+        check(!check_runnable(impossible),
+              "a check needing an absent program is not runnable");
+
+        EvalCheck file_only;
+        file_only.file = "x.py";
+        file_only.contains = "y";
+        check(check_runnable(file_only), "while a file check needs nothing installed");
+
+        EvalTask unscoreable;
+        unscoreable.name = "needs-a-missing-tool";
+        unscoreable.prompt = "do something";
+        unscoreable.checks = {impossible};
+
+        const EvalResult result = run_eval(Config{}, unscoreable);
+        check(result.skipped, "and the task is SKIPPED");
+        check(!result.passed, "not passed");
+        // The important half: it skipped without calling a model. A task that
+        // cannot be scored must not cost anything.
+        check(result.milliseconds < 1000, "without spending a model call on it");
+    }
+
+    // ---- skipped tasks are out of the denominator ----
+    //
+    // Counting them would make the pass rate a measure of which interpreters this
+    // box has, which is not something anyone can act on.
+    {
+        std::vector<EvalResult> results;
+        results.push_back({"a", "m", true, false, {}, 0, 0, 0});
+        results.push_back({"b", "m", false, false, {}, 0, 0, 0});
+        results.push_back({"c", "m", false, true, {}, 0, 0, 0});
+        results.push_back({"d", "m", false, true, {}, 0, 0, 0});
+
+        const EvalSummary summary = summarize_evals(results);
+        check_eq(summary.passed, 1, "one passed");
+        check_eq(summary.failed, 1, "one failed");
+        check_eq(summary.skipped, 2, "two skipped");
+        check_eq(summary.scored(), 2, "and the denominator is the two that were scored");
+        check(summary.rate() > 49.0 && summary.rate() < 51.0, "so the rate is 50%");
+    }
+
+    // ---- a machine that can score nothing ----
+    //
+    // Not 0%, and not 100%. Neither is true, and printing either would be a lie
+    // about the model rather than about the box.
+    {
+        std::vector<EvalResult> all_skipped;
+        all_skipped.push_back({"a", "m", false, true, {}, 0, 0, 0});
+        const EvalSummary summary = summarize_evals(all_skipped);
+        check_eq(summary.scored(), 0, "nothing was scored");
+        check(render_evals(all_skipped).find("no tasks could be scored") !=
+                  std::string::npos,
+              "and the report says exactly that rather than a percentage");
+    }
+
+    // ---- user-authored tasks ----
+    {
+        const auto parsed = parse_evals(R"([{
+            "name": "mine",
+            "prompt": "do the thing",
+            "files": {"a.py": "x = 1\n"},
+            "checks": [{"file": "a.py", "contains": "x = 2"}]
+        }])");
+        check_eq(parsed.size(), std::size_t{1}, "a user task loads");
+        check_eq(parsed[0].files.size(), std::size_t{1}, "with its seed files");
+
+        const auto single = parse_evals(R"({"name":"solo","prompt":"p",
+            "checks":[{"file":"a","contains":"b"}]})");
+        check_eq(single.size(), std::size_t{1}, "and one task alone in a file works");
+
+        check(parse_evals(R"([{"name":"x","prompt":"p"}])").empty(),
+              "a task with no checks is not a task -- it could never be scored");
+        check(parse_evals(R"([{"name":"x","prompt":"p","checks":[
+                  {"command":["sudo","rm","-rf","/"]}]}])").empty(),
+              "and a check naming a program off the allowlist is dropped");
+
+        const auto escaping = parse_evals(R"([{
+            "name": "x", "prompt": "p",
+            "files": {"../outside.py": "boom"},
+            "checks": [{"file": "a.py", "contains": "b"}]
+        }])");
+        check_eq(escaping.size(), std::size_t{1}, "the task still loads");
+        check(escaping[0].files.empty(),
+              "but a seed file that escapes the task directory is not written");
+    }
+
+    // ---- the suite is stable ----
+    {
+        const auto first = eval_suite({});
+        const auto second = eval_suite({});
+        check_eq(first.size(), second.size(), "the suite is the same twice");
+
+        const auto filtered = eval_suite({}, "edit-in-place");
+        check_eq(filtered.size(), std::size_t{1}, "and can be filtered to one task");
+        check(eval_suite({}, "no-such-task").empty(), "an unknown name yields none");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Skills
 // ---------------------------------------------------------------------------
 void test_skills() {
@@ -6773,6 +7472,95 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    // The eval suite, against a real model. THE number.
+    //
+    //   auspex-selftest --eval                 the configured model
+    //   auspex-selftest --eval qwen3.5:9b      one model
+    //   auspex-selftest --eval claude claude    a CLI backend, and its model
+    //   auspex-selftest --eval --keep …        leave failed task dirs behind
+    //
+    // Not part of the check suite, and it must not become part of it: it needs a
+    // model answering and takes minutes. The 1950 checks say the machinery is
+    // right; this is the only thing in the repository that says the OUTPUT is.
+    if (!args.empty() && args[0] == "--eval") {
+        auspex::EvalOptions options;
+        std::string only;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (args[i] == "--keep") {
+                options.keep_failures = true;
+            } else if (args[i] == "--only" && i + 1 < args.size()) {
+                only = args[++i];
+            } else if (auspex::is_cli_backend(args[i])) {
+                options.backend = args[i];
+            } else {
+                options.model = args[i];
+            }
+        }
+
+        const auto config = auspex::Config::load();
+        const auto tasks = auspex::eval_suite(std::filesystem::current_path(), only);
+        if (tasks.empty()) {
+            std::cout << "no such task\n";
+            return 1;
+        }
+
+        std::cout << "eval: " << tasks.size() << " task"
+                  << (tasks.size() == 1 ? "" : "s") << " against "
+                  << (options.backend.empty()
+                          ? (options.model.empty() ? config.ollama_model : options.model)
+                          : options.backend)
+                  << "\n\n";
+
+        const auto before = auspex::usage_snapshot();
+        const auto results = auspex::run_evals(
+            config, tasks, options, [](const auspex::EvalResult& result) {
+                // Streamed as they finish. A suite takes minutes and watching it
+                // sit silent tells you nothing about whether it is stuck.
+                std::cout << "  [" << (result.skipped ? "skip"
+                                                      : (result.passed ? " ok " : "FAIL"))
+                          << "] " << result.task;
+                if (!result.skipped) {
+                    std::cout << "  (" << (result.milliseconds / 1000) << "s)";
+                }
+                std::cout << "\n" << std::flush;
+            });
+
+        std::cout << "\n" << auspex::render_evals(results);
+        std::cout << "\n"
+                  << auspex::usage_report(auspex::usage_since(before), "what it cost");
+        return auspex::summarize_evals(results).failed == 0 ? 0 : 1;
+    }
+
+    // What the configured hooks are, and where they are read from.
+    if (!args.empty() && args[0] == "--hooks") {
+        std::cout << "hooks from " << auspex::hooks_path().string() << "\n";
+        std::cout << auspex::render_hooks(auspex::load_hooks());
+        return 0;
+    }
+
+    // Which files in a directory could be syntax-checked, and whether they parse.
+    if (!args.empty() && args[0] == "--lint") {
+        const std::filesystem::path root =
+            args.size() >= 2 ? std::filesystem::path(args[1])
+                             : std::filesystem::current_path();
+
+        auspex::Changeset everything;
+        for (const auto& [path, contents] : auspex::list_files(root)) {
+            if (!auspex::can_lint(path)) continue;
+            everything.files.push_back({path, contents, false});
+        }
+        std::cout << root.string() << " — " << everything.files.size()
+                  << " file(s) a parser can check\n";
+
+        const auto diagnostics = auspex::lint_changeset(everything, root);
+        if (diagnostics.empty()) {
+            std::cout << "  all of them parse\n";
+        } else {
+            for (const auto& d : diagnostics) std::cout << "  " << d.format() << "\n";
+        }
+        return diagnostics.empty() ? 0 : 1;
+    }
+
     // A live Director run, against the configured model and a real project.
     //
     // Not part of the check suite: it costs tokens and needs a model answering, so
@@ -6975,6 +7763,7 @@ int main(int argc, char** argv) {
                       << "      " << item.files << " files, lands in "
                       << item.repo_root << "\n";
         }
+        std::cout << "\n" << auspex::usage_report(result.usage, "what it cost");
         return 0;
     }
 
@@ -7088,6 +7877,10 @@ int main(int argc, char** argv) {
     test_code_index();
     test_skills();
     test_mcp();
+    test_usage();
+    test_linters();
+    test_hooks();
+    test_eval();
     test_sysmon();
 
     std::cout << "\n" << (checks - failures) << "/" << checks << " checks passed\n";

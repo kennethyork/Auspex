@@ -50,6 +50,7 @@
 #include <functional>
 #include <utility>
 
+#include "auspex/hooks.hpp"
 #include "auspex/mcp.hpp"
 #include "auspex/skills.hpp"
 
@@ -193,6 +194,17 @@ struct CoderLimits {
     // writing one file repeatedly, and every repetition costs a full turn of
     // context as well as the tokens.
     int max_repeats = 3;
+
+    // The user's own gates, loaded from the home config by run_coder().
+    //
+    // Carried here rather than looked up inside run_tool() so the loop stays a
+    // function of its arguments -- and so a test can hand it a hook without
+    // creating a file in the tester's home directory.
+    //
+    // Empty means no gates, which ALLOWS. That is not the same as a hook failing
+    // closed: see hooks.hpp. Nobody configuring nothing must not mean nobody can
+    // run a coder.
+    std::vector<Hook> hooks;
 
     bool operator==(const CoderLimits&) const = default;
 };

@@ -430,6 +430,14 @@ RunResult scan_security(const Config& config, const RunOptions& options,
     RunResult result;
     result.run_id = "scan_" + now_stamp();
 
+    // Metered here rather than by run_crew, which returns this call's result
+    // directly and so never reaches its own meter.
+    const auto usage_before = usage_snapshot();
+    const auto finish = [&usage_before](RunResult r) {
+        r.usage = usage_since(usage_before);
+        return r;
+    };
+
     const auto note = [&events](const std::string& text) {
         if (events.log) events.log(text);
     };
@@ -437,7 +445,7 @@ RunResult scan_security(const Config& config, const RunOptions& options,
 
     if (!is_project_dir(options.project)) {
         result.error = "no such project";
-        return result;
+        return finish(result);
     }
 
     // NO SANDBOX, and no coder. Nothing here can write: the scan reads the project
@@ -488,7 +496,7 @@ RunResult scan_security(const Config& config, const RunOptions& options,
 
     result.held = static_cast<int>(findings.size());
     note(security_report(findings));
-    return result;
+    return finish(result);
 }
 
 std::filesystem::path lessons_path(const std::filesystem::path& project) {
@@ -862,13 +870,22 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
                       const std::string& run_id, const RunEvents& events) {
     RunResult result;
 
+    // Resuming is cheap but not free: no coder is restarted, and every recovered
+    // sandbox is still audited. That is a model call each, so it is metered like
+    // any other.
+    const auto usage_before = usage_snapshot();
+    const auto finish = [&usage_before](RunResult r) {
+        r.usage = usage_since(usage_before);
+        return r;
+    };
+
     const auto note = [&events](const std::string& text) {
         if (events.log) events.log(text);
     };
 
     if (!is_project_dir(project)) {
         result.error = "no such project";
-        return result;
+        return finish(result);
     }
 
     result.run_id = run_id;
@@ -876,7 +893,7 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
         const auto runs = resumable_runs();
         if (runs.empty()) {
             result.error = "there is no interrupted run to resume";
-            return result;
+            return finish(result);
         }
         result.run_id = runs.front();
     }
@@ -885,7 +902,7 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
     std::error_code ec;
     if (!std::filesystem::is_directory(run_dir, ec)) {
         result.error = "no such run: " + result.run_id;
-        return result;
+        return finish(result);
     }
 
     // The plan, from the state file, so the pieces keep their titles and roles --
@@ -904,7 +921,7 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
 
     if (sandboxes.empty()) {
         result.error = "that run left nothing to recover";
-        return result;
+        return finish(result);
     }
     note("resume: recovering " + std::to_string(sandboxes.size()) +
          " interrupted coder(s)");
@@ -958,13 +975,22 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
     write_board(board);
     note("done: " + std::to_string(result.applied) + " applied · " +
          std::to_string(result.held) + " held");
-    return result;
+    return finish(result);
 }
 
 RunResult run_crew(const Config& config, const RunOptions& options,
                    const RunEvents& events, const std::atomic<bool>* cancel) {
     RunResult result;
     result.run_id = "crew_" + now_stamp();
+
+    // The meter reading before anything is spent. Every exit below runs through
+    // `finish`, so a run that fails early still reports what it cost getting
+    // there -- which is usually a Director call, and is not nothing.
+    const auto usage_before = usage_snapshot();
+    const auto finish = [&usage_before](RunResult r) {
+        r.usage = usage_since(usage_before);
+        return r;
+    };
 
     const auto note = [&events](const std::string& text) {
         if (events.log) events.log(text);
@@ -975,7 +1001,7 @@ RunResult run_crew(const Config& config, const RunOptions& options,
 
     if (!is_project_dir(options.project)) {
         result.error = "no such project";
-        return result;
+        return finish(result);
     }
 
     // A different run entirely: it reads and reports, and never builds. Routed
@@ -985,7 +1011,7 @@ RunResult run_crew(const Config& config, const RunOptions& options,
 
     if (trim(options.task).empty()) {
         result.error = "there is no task";
-        return result;
+        return finish(result);
     }
 
     std::vector<Attempt> attempts;
@@ -1134,7 +1160,7 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     if (!plan.ok()) {
         result.error = plan.error;
         publish(/*active=*/false);
-        return result;
+        return finish(result);
     }
 
     for (const auto& subtask : plan.subtasks) {
@@ -1156,7 +1182,7 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     if (stopped()) {
         result.error = "cancelled";
         publish(false);
-        return result;
+        return finish(result);
     }
 
     // ---- code, in parallel ----
@@ -1229,6 +1255,9 @@ RunResult run_crew(const Config& config, const RunOptions& options,
                 // could say that makes a leaked credential acceptable.
                 attempt.audit = deterministic_audit(attempt.changeset, options.audit);
                 if (!attempt.audit.held()) {
+                    attempt.audit = syntax_audit(attempt.changeset);
+                }
+                if (!attempt.audit.held()) {
                     const std::string reply = ask_cli(
                         options.auditor_backend, options.model_for("auditor"),
                         auditor_prompt(attempt.subtask, attempt.changeset,
@@ -1283,7 +1312,7 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     if (stopped()) {
         result.error = "cancelled";
         publish(false);
-        return result;
+        return finish(result);
     }
 
     // ---- land ----
@@ -1323,7 +1352,7 @@ RunResult run_crew(const Config& config, const RunOptions& options,
 
     note("done: " + std::to_string(result.applied) + " applied · " +
          std::to_string(result.held) + " held");
-    return result;
+    return finish(result);
 }
 
 }  // namespace auspex

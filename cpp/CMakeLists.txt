@@ -248,6 +248,10 @@ add_library(auspex-core STATIC
     src/mcp.cpp
     src/cli_coder.cpp
     src/router.cpp
+    src/usage.cpp
+    src/linters.cpp
+    src/hooks.cpp
+    src/eval.cpp
     src/vad.cpp
     src/voice_gate.cpp
     src/desktop_entries.cpp

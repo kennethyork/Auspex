@@ -31,6 +31,7 @@
 #include "auspex/auditor.hpp"
 #include "auspex/coder.hpp"
 #include "auspex/config.hpp"
+#include "auspex/usage.hpp"
 #include "auspex/crew.hpp"
 #include "auspex/director.hpp"
 #include "auspex/sandbox.hpp"
@@ -186,6 +187,14 @@ struct RunResult {
     // Set when the run could not proceed at all -- no plan, no project. A run that
     // planned and then held everything is not an error.
     std::string error;
+
+    // What this run spent, per model, measured across it rather than accumulated
+    // globally. A debate is three model calls and a panel is five; those are
+    // deliberate trades, and this is the first thing that shows their price.
+    //
+    // Models handed to an agent CLI appear here with calls and no tokens -- see
+    // usage.hpp, where "unmeasured" is deliberately not spelled zero.
+    std::map<std::string, Tally> usage;
 
     bool operator==(const RunResult&) const = default;
 };

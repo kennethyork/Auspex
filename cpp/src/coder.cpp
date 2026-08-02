@@ -541,6 +541,27 @@ ToolResult run_tool(const ToolCall& call, const std::filesystem::path& sandbox,
         return result;
     }
 
+    // The user's gate, after the built-in refusals and before anything happens.
+    //
+    // After, because a hook should not be woken up to re-refuse what read_only has
+    // already refused. Before, because a hook that ran after the write would be a
+    // log entry rather than a gate.
+    if (!limits.hooks.empty()) {
+        const std::string detail =
+            call.tool == CoderTool::Run
+                ? (call.command.empty() ? std::string{} : call.command[0])
+                : call.path;
+        const HookOutcome gate = run_pre_tool_hooks(std::string(tool_name(call.tool)),
+                                                    detail, limits.hooks);
+        if (gate.blocked) {
+            // Handed back as an ordinary tool failure, so the model reads the
+            // reason and can try something else -- which is what a person setting
+            // a gate usually wants, rather than the run dying.
+            result.output = gate.reason;
+            return result;
+        }
+    }
+
     if (call.tool == CoderTool::Run) {
         if (!limits.allow_run) {
             result.output = "running commands is turned off for this crew";
