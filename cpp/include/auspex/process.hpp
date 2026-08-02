@@ -53,10 +53,14 @@ struct LimitedResult {
                                    // would show them
 };
 
+// `stdin_text` is fed to the child and the pipe then closed. Empty means stdin is
+// /dev/null, which is what stops a command that stops to ask a question from
+// waiting out the whole timeout for an answer that cannot come.
 LimitedResult run_limited(const std::vector<std::string>& argv,
                           const std::string& cwd,
                           int timeout_seconds = 60,
-                          std::size_t max_output = 16'000);
+                          std::size_t max_output = 16'000,
+                          const std::string& stdin_text = {});
 
 // Splits on '\n', dropping empty lines.
 std::vector<std::string> split_lines(const std::string& text);

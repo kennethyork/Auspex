@@ -89,17 +89,26 @@ ProcessResult run(const std::vector<std::string>& argv, bool capture,
 }
 
 LimitedResult run_limited(const std::vector<std::string>& argv, const std::string& cwd,
-                          int timeout_seconds, std::size_t max_output) {
+                          int timeout_seconds, std::size_t max_output,
+                          const std::string& stdin_text) {
     LimitedResult result;
     if (argv.empty()) return result;
 
     int fds[2] = {-1, -1};
     if (::pipe(fds) != 0) return result;
 
+    int in_fds[2] = {-1, -1};
+    if (!stdin_text.empty() && ::pipe(in_fds) != 0) {
+        ::close(fds[0]);
+        ::close(fds[1]);
+        return result;
+    }
+
     const pid_t pid = ::fork();
     if (pid < 0) {
         ::close(fds[0]);
         ::close(fds[1]);
+        if (in_fds[0] >= 0) { ::close(in_fds[0]); ::close(in_fds[1]); }
         return result;
     }
 
@@ -116,9 +125,13 @@ LimitedResult run_limited(const std::vector<std::string>& argv, const std::strin
         ::dup2(fds[1], STDERR_FILENO);   // interleaved, as a terminal shows them
         ::close(fds[1]);
 
-        // stdin from /dev/null: a command that stops to ask a question would
-        // otherwise wait out the whole timeout for an answer that cannot come.
-        if (const int devnull = ::open("/dev/null", O_RDONLY); devnull >= 0) {
+        if (in_fds[0] >= 0) {
+            ::dup2(in_fds[0], STDIN_FILENO);
+            ::close(in_fds[0]);
+            ::close(in_fds[1]);
+        } else if (const int devnull = ::open("/dev/null", O_RDONLY); devnull >= 0) {
+            // A command that stops to ask a question would otherwise wait out the
+            // whole timeout for an answer that cannot come.
             ::dup2(devnull, STDIN_FILENO);
             ::close(devnull);
         }
@@ -134,6 +147,26 @@ LimitedResult run_limited(const std::vector<std::string>& argv, const std::strin
 
     ::close(fds[1]);
     ::setpgid(pid, pid);   // also in the parent; whichever wins, the race is benign
+
+    if (in_fds[0] >= 0) {
+        ::close(in_fds[0]);
+        // Written before the read loop starts. The prompts here are kilobytes and
+        // a pipe buffer is 64K, so this does not block in practice -- and if it
+        // ever did, SIGPIPE is ignored below so a child that died early gives a
+        // short write rather than killing us.
+        ::signal(SIGPIPE, SIG_IGN);
+        std::size_t sent = 0;
+        while (sent < stdin_text.size()) {
+            const ssize_t n = ::write(in_fds[1], stdin_text.data() + sent,
+                                      stdin_text.size() - sent);
+            if (n > 0) { sent += static_cast<std::size_t>(n); continue; }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        // CLOSED, which is how the child knows the prompt has ended. Leaving it
+        // open makes every one of these tools wait for more input forever.
+        ::close(in_fds[1]);
+    }
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);

@@ -246,6 +246,7 @@ add_library(auspex-core STATIC
     src/code_index.cpp
     src/skills.cpp
     src/mcp.cpp
+    src/cli_coder.cpp
     src/vad.cpp
     src/voice_gate.cpp
     src/desktop_entries.cpp

@@ -96,6 +96,15 @@ struct RunOptions {
     // something at a cost in time and tokens, which is why they are switches
     // rather than a mode and why the honest default is none of them.
 
+    // Which agent does the coding. "ollama" (default) is Auspex's own loop; any
+    // other id hands the subtask to that CLI, which runs its own loop with its own
+    // model in the sandbox.
+    //
+    // This is the single biggest lever on quality. Auspex's own loop is capped at
+    // what Ollama serves; a CLI backend is capped at whatever its owner configured,
+    // which is usually a frontier model.
+    std::string coder_backend = "ollama";
+
     // Advocate / skeptic / judge on every changeset instead of one Auditor.
     // Three model calls per piece rather than one.
     bool debate = false;

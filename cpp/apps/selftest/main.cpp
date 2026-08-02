@@ -27,6 +27,7 @@
 #include "auspex/mcp.hpp"
 #include "auspex/notifications.hpp"
 #include "auspex/canvas.hpp"
+#include "auspex/cli_coder.hpp"
 #include "auspex/commands.hpp"
 #include "auspex/crew.hpp"
 #include "auspex/crew_run.hpp"
@@ -34,6 +35,7 @@
 #include "auspex/display.hpp"
 #include "auspex/desktop_entries.hpp"
 #include "auspex/code_index.hpp"
+#include "auspex/cli_coder.hpp"
 #include "auspex/coder.hpp"
 #include "auspex/director.hpp"
 #include "auspex/panel_dock.hpp"
@@ -5615,6 +5617,94 @@ void test_crew_run() {
         check(parse_board(encode_board({})).empty(), "an empty board round-trips too");
     }
 
+    // ---- coders that are somebody else's agent ----
+    //
+    // Every one of these tools defaults to asking a human for approval, and a
+    // headless run has nobody to answer. The flags below are not decoration: get
+    // one wrong and the coder hangs until the timeout rather than failing.
+    {
+        check(is_cli_backend("claude"), "claude is a coder backend");
+        check(is_cli_backend("codex"), "and codex");
+        check(!is_cli_backend("ollama"),
+              "ollama is NOT a CLI backend -- it is our own loop");
+        check(!is_cli_backend(""), "and nothing is not a backend");
+        check(!is_cli_backend("bash"), "nor an arbitrary program");
+
+        // The prompt goes on stdin for these two, which matters beyond tidiness:
+        // a subtask runs to kilobytes and argv has a length limit.
+        check(prompt_on_stdin("claude"), "claude reads the prompt from stdin");
+        check(prompt_on_stdin("codex"), "and so does codex exec");
+        check(!prompt_on_stdin("gemini"), "gemini takes it in argv");
+
+        const auto has = [](const std::vector<std::string>& argv, const std::string& s) {
+            return std::find(argv.begin(), argv.end(), s) != argv.end();
+        };
+
+        // Only test what is installed: the argv is built from a resolved absolute
+        // path, so an absent tool correctly yields nothing.
+        if (!resolve_agent_binary("claude").empty()) {
+            const auto argv = cli_coder_argv("claude", "", "do the thing");
+            check(!argv.empty(), "claude builds a command");
+            check(has(argv, "-p"), "in print mode");
+            // The crew expects edits to land and there is nobody to approve them.
+            check(has(argv, "acceptEdits"),
+                  "with edits accepted, because a headless run has nobody to ask");
+            check(!has(argv, "do the thing"),
+                  "and the prompt is NOT in argv -- it goes on stdin");
+        }
+
+        if (!resolve_agent_binary("codex").empty()) {
+            const auto argv = cli_coder_argv("codex", "", "do the thing");
+            check(has(argv, "exec"), "codex runs exec, which never prompts");
+            check(has(argv, "workspace-write"),
+                  "with workspace-write, or it cannot edit what it was pointed at");
+            check(!argv.empty() && argv.back() == "-",
+                  "and a trailing dash, meaning read the prompt from stdin");
+        }
+
+        if (!resolve_agent_binary("gemini").empty()) {
+            const auto argv = cli_coder_argv("gemini", "", "do the thing");
+            check(has(argv, "yolo"), "gemini needs an approval mode");
+            // Without this it downgrades yolo back to default for an untrusted
+            // folder and then blocks on a prompt nothing can answer.
+            check(has(argv, "--skip-trust"),
+                  "and --skip-trust, or yolo is silently downgraded and it hangs");
+            check(has(argv, "do the thing"), "its prompt is in argv");
+        }
+
+        // A model is passed only when named: these tools are configured by their
+        // owner, and second-guessing that runs a model nobody chose.
+        if (!resolve_agent_binary("claude").empty()) {
+            check(!has(cli_coder_argv("claude", "", "x"), "--model"),
+                  "no model named, no model flag");
+            check(has(cli_coder_argv("claude", "opus", "x"), "opus"),
+                  "and a named one is passed through");
+        }
+
+        check(cli_coder_argv("ollama", "", "x").empty(),
+              "our own loop has no command line");
+        check(cli_coder_argv("nonsense", "", "x").empty(),
+              "and an unknown backend builds nothing");
+
+        // The prompt carries no verb table: the agent has its own tools, and
+        // describing ours would be describing a machine it is not running on.
+        PlannedSubtask subtask{1, "coder", "add a test", "cover greet()"};
+        const std::string prompt = cli_coder_prompt(subtask);
+        check(prompt.find("add a test") != std::string::npos, "the piece is named");
+        check(prompt.find("cover greet()") != std::string::npos, "with its detail");
+        check(prompt.find("\"tool\"") == std::string::npos,
+              "and no verb table -- it runs its own loop");
+        check(prompt.find("private copy") != std::string::npos,
+              "it is told it is in a sandbox");
+        check(prompt.find("do not commit") != std::string::npos,
+              "and told not to commit, because a reviewer reads it first");
+
+        // A missing sandbox fails rather than running somewhere else.
+        const auto nowhere = run_cli_coder({}, subtask, "/no/such/dir", "claude");
+        check(!nowhere.finished, "a missing sandbox fails");
+        check(!nowhere.error.empty(), "with a reason");
+    }
+
     // ---- counting votes ----
     //
     // A TIE HOLDS, and that is the point of counting rather than a flaw in it: if
@@ -6625,6 +6715,10 @@ int main(int argc, char** argv) {
         if (args.size() >= 6 && args[5] == "debate")   options.debate = true;
         if (args.size() >= 6 && args[5] == "security") options.security = true;
         if (args.size() >= 6 && args[5] == "learn")    options.learn = true;
+        // Anything else in that slot naming a backend hands the coding to it.
+        if (args.size() >= 6 && auspex::is_cli_backend(args[5])) {
+            options.coder_backend = args[5];
+        }
 
         auspex::RunEvents events;
         events.log = [](const std::string& line) { std::cout << "  " << line << "\n"; };

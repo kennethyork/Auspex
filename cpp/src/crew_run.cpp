@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include "auspex/process.hpp"
+#include "auspex/cli_coder.hpp"
 #include "auspex/code_index.hpp"
 #include "auspex/mcp.hpp"
 #include "auspex/ollama_client.hpp"
@@ -710,7 +711,8 @@ std::string encode_state(const std::string& run_id, const std::string& task,
         entry["title"] = attempt.subtask.title;
         entry["state"] = attempt.state;
         entry["model"] = attempt.outcome.model;
-        entry["backend"] = "ollama";
+        entry["backend"] = attempt.outcome.model.empty() ? "ollama"
+                                                       : attempt.outcome.model;
         entry["route"] = "";
         subtasks.push_back(std::move(entry));
     }
@@ -1059,10 +1061,22 @@ RunResult run_crew(const Config& config, const RunOptions& options,
                 continue;
             }
 
-            attempt.outcome = run_coder(config, attempt.subtask, sandbox,
-                                        options.coder, options.model_for("coder"),
-                                        steer_mailbox(result.run_id, attempt.subtask.n),
-                                        skills, mcp);
+            // Somebody else's agent, or ours. Everything AFTER this line is the
+            // same either way -- the changeset is captured from the sandbox, the
+            // Auditor reviews it, the overlap guard and secret gate apply. Handing
+            // the work to a stronger agent does not hand it the project.
+            if (is_cli_backend(options.coder_backend)) {
+                attempt.outcome = run_cli_coder(config, attempt.subtask, sandbox,
+                                                options.coder_backend,
+                                                options.model_for("coder"),
+                                                /*timeout_seconds=*/900, lessons);
+            } else {
+                attempt.outcome = run_coder(config, attempt.subtask, sandbox,
+                                            options.coder, options.model_for("coder"),
+                                            steer_mailbox(result.run_id,
+                                                          attempt.subtask.n),
+                                            skills, mcp);
+            }
             attempt.changeset = capture_changeset(options.project, sandbox);
 
             // Audited on the worker thread. It is another model call, and doing it
