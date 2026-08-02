@@ -1564,6 +1564,9 @@ Panel::Panel(const Config& config, PanelPosition position, VoiceController& voic
     if (position_ == PanelPosition::Top) build_top();
     else build_bottom();
 
+    // After the row exists, so it catches every button however it was added.
+    drop_focus(box_);
+
     // The X window does not exist until realize, and wmctrl cannot see it until it
     // is mapped, so docking is retried from a timer rather than done inline.
     signal_realize().connect([this] {
@@ -1918,6 +1921,28 @@ void Panel::confirm_quit() {
         // the desktop window and the voice worker running.
         if (auto app = get_application()) app->quit();
     });
+}
+
+void Panel::drop_focus(Gtk::Widget& root) {
+    for (Gtk::Widget* child = root.get_first_child(); child;
+         child = child->get_next_sibling()) {
+        // A popover is a menu in its own window. Recursing into one would make its
+        // rows unreachable by keyboard, which is a real loss -- unlike a panel
+        // button, which nobody has ever tabbed to on purpose.
+        if (dynamic_cast<Gtk::Popover*>(child)) continue;
+
+        if (auto* button = dynamic_cast<Gtk::Button*>(child)) {
+            button->set_can_focus(false);
+            // Both are needed. can_focus stops it being reachable at all;
+            // focus_on_click stops the click itself moving focus off whatever the
+            // person was typing into.
+            button->set_focus_on_click(false);
+        } else if (auto* toggle = dynamic_cast<Gtk::ToggleButton*>(child)) {
+            toggle->set_can_focus(false);
+            toggle->set_focus_on_click(false);
+        }
+        drop_focus(*child);
+    }
 }
 
 void Panel::show_crew() { show_crew_in({}); }

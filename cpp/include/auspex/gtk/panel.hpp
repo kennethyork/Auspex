@@ -455,6 +455,19 @@ private:
     void show_settings();
     void show_chat();
     void show_calendar();
+    // Stops every button on the panel from taking keyboard focus.
+    //
+    // Two problems, one cause. GTK paints a focus visual on a button that has
+    // been clicked, and on a dock that reads as a control LATCHED ON -- a pan
+    // arrow you pressed once keeps a filled box around it as though the canvas
+    // were still moving. And a docked panel that holds keyboard focus is a panel
+    // that swallows keystrokes meant for the window you are actually working in.
+    //
+    // You do not tab through a dock, so nothing is lost. Popover contents are
+    // skipped deliberately: those are menus, and a menu you cannot reach with the
+    // keyboard is a real regression.
+    static void drop_focus(Gtk::Widget& root);
+
     void show_crew();
     // `project` points the crew window at a folder as it opens, so choosing one in
     // the picker and starting a crew is one gesture rather than the same answer

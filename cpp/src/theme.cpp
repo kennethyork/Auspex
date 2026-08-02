@@ -523,6 +523,26 @@ window.auspex-panel menubutton > button:hover {
     background-image: none;
 }
 
+/* No focus visual on the panel, ever.
+ *
+ * GTK paints one on a button that has been clicked, and on a dock it is
+ * indistinguishable from "this control is on" -- a pan arrow pressed once kept a
+ * box around it as though the canvas were still moving. The buttons also have
+ * can_focus false (see Panel::drop_focus); this is here so one added later
+ * without that flag cannot bring the problem back.
+ *
+ * Deliberately narrow: :hover and :active below still paint, because those are
+ * real feedback. Only the FOCUS ring goes. */
+window.auspex-panel button:focus,
+window.auspex-panel button:focus-visible,
+window.auspex-panel togglebutton:focus,
+window.auspex-panel togglebutton:focus-visible,
+window.auspex-panel menubutton > button:focus,
+window.auspex-panel menubutton > button:focus-visible {
+    outline: none;
+    box-shadow: none;
+}
+
 /* A latched control -- the tray while open, Auto while listening -- keeps its
  * fill, because "this is currently on" is exactly what the fill is for. */
 window.auspex-panel togglebutton:checked,
