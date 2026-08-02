@@ -188,6 +188,13 @@ struct RunEvents {
     std::function<void(const std::string&)> log;
 };
 
+// The config's per-role models and backends folded into a caller's options.
+//
+// Exposed so the rule can be tested: a per-role setting that only works when the
+// caller remembers to copy it is a setting that silently does nothing, which this
+// project has now shipped twice.
+RunOptions with_config_roles(const Config& config, RunOptions options);
+
 struct RunResult {
     std::string run_id;
     int         applied = 0;

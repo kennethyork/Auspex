@@ -127,10 +127,15 @@ std::vector<Op> diff_ops(const std::vector<int>& a, const std::vector<int>& b) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
+const char* const kBaselineFile = ".auspex-baseline";
+
 const std::vector<std::string>& sandbox_excludes() {
     static const std::vector<std::string> kExcludes{
         // Version control and our own state.
         ".git", ".hg", ".svn", ".ollamadev", ".auspex", "auspex-crew",
+        // The sandbox's own baseline manifest -- our bookkeeping, never a file the
+        // coder wrote, so it must not be copied onward or captured back.
+        kBaselineFile,
         // Dependencies somebody else installed.
         "node_modules", "vendor", "third_party", "Pods", ".bundle",
         // BUILD OUTPUT. Measured on a real Qt project: build 47M, .build 146M,
@@ -417,12 +422,28 @@ bool create_sandbox(const std::filesystem::path& project,
     // Copied file by file through list_files() rather than with copy(), so the
     // excludes and the binary rule are applied ONCE, here and in capture. Two
     // copies of that logic is how a cache directory ends up in a changeset.
+    // What the sandbox started with, recorded as it is copied.
+    //
+    // This is what makes "what did THIS coder change" answerable later. Without
+    // it, capture can only ask "how do the sandbox and the project differ now",
+    // which counts everything that happened to the project meanwhile as this
+    // coder's work -- see capture_changeset().
+    std::ostringstream manifest;
     for (const auto& [relative, contents] : list_files(project)) {
         const auto target = safe_join(dest, relative);
         if (!target) continue;
         if (!write_file(*target, contents)) {
             return fail("could not write " + relative + " into the sandbox");
         }
+        // One line per file: fingerprint, a space, then the path. The path is last
+        // because it is the field that can contain a space.
+        manifest << fingerprint(contents) << ' ' << relative << '\n';
+    }
+
+    // On disk rather than in memory: the process that captures may not be the one
+    // that created this -- a resume after a restart is exactly that case.
+    if (!write_file(dest / kBaselineFile, manifest.str())) {
+        return fail("could not record what the sandbox started with");
     }
     return true;
 }
@@ -438,21 +459,78 @@ bool destroy_sandbox(const std::filesystem::path& dest) {
 }
 
 // ---------------------------------------------------------------------------
+std::uint64_t fingerprint(const std::string& text) {
+    // FNV-1a, 64-bit. Spelled out rather than taken from std::hash because the
+    // two ends of this comparison are always two different processes -- the run
+    // that captured the change and the one that lands it, often after a restart --
+    // and std::hash is not required to agree between them.
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char c : text) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    // 0 means "no baseline recorded", so a real hash must never be 0. One input in
+    // 2^64 would collide with the sentinel; this costs nothing and removes it.
+    return hash == 0 ? 1 : hash;
+}
+
+std::map<std::string, std::uint64_t> sandbox_baseline(
+    const std::filesystem::path& sandbox) {
+    std::map<std::string, std::uint64_t> baseline;
+    std::ifstream in(sandbox / kBaselineFile, std::ios::binary);
+    if (!in) return baseline;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto space = line.find(' ');
+        if (space == std::string::npos || space + 1 >= line.size()) continue;
+        try {
+            baseline[line.substr(space + 1)] =
+                std::stoull(line.substr(0, space));
+        } catch (const std::exception&) {
+            // A corrupt line is skipped, not fatal. The consequence is that one
+            // file falls back to the project comparison, which is the old
+            // behaviour rather than a wrong answer.
+        }
+    }
+    return baseline;
+}
+
 Changeset capture_changeset(const std::filesystem::path& project,
                             const std::filesystem::path& sandbox) {
     Changeset changeset;
 
     const auto before = list_files(project);
     const auto after  = list_files(sandbox);
+    const auto baseline = sandbox_baseline(sandbox);
 
     // std::map iterates in key order, so the result is stable across runs. A
     // changeset is read by a person and by an Auditor, and neither should see the
     // files shuffle between two captures of the same work.
     for (const auto& [path, contents] : after) {
         const auto found = before.find(path);
+
+        if (!baseline.empty()) {
+            // Did the CODER change this file? Only the sandbox's own starting
+            // state can answer that. A file it never opened still matches its
+            // baseline no matter how far the project has moved on, and reporting
+            // it would be reporting somebody else's work as this coder's -- as a
+            // revert of it.
+            const auto was = baseline.find(path);
+            if (was != baseline.end() && was->second == fingerprint(contents)) {
+                continue;
+            }
+        } else if (found != before.end() && found->second == contents) {
+            continue;   // no manifest: the old project-relative comparison
+        }
+
         if (found != before.end() && found->second == contents) continue;
 
-        changeset.files.push_back({path, contents, /*deleted=*/false});
+        // What the PROJECT held when this coder started -- empty for a file the
+        // coder created. Checked again before the change is ever written back.
+        const std::string base = found == before.end() ? std::string{} : found->second;
+        changeset.files.push_back(
+            {path, contents, /*deleted=*/false, fingerprint(base)});
         changeset.diff +=
             unified_diff(path, found == before.end() ? std::string{} : found->second,
                          contents);
@@ -460,7 +538,11 @@ Changeset capture_changeset(const std::filesystem::path& project,
 
     for (const auto& [path, contents] : before) {
         if (after.find(path) != after.end()) continue;
-        changeset.files.push_back({path, {}, /*deleted=*/true});
+        // A file the coder never had cannot have been deleted by it. Without this,
+        // a file the PROJECT gained after the sandbox was made looks like a
+        // deletion by every coder still running.
+        if (!baseline.empty() && baseline.find(path) == baseline.end()) continue;
+        changeset.files.push_back({path, {}, /*deleted=*/true, fingerprint(contents)});
         changeset.diff += unified_diff(path, contents, {});
     }
 
@@ -486,6 +568,34 @@ bool apply_changeset(const Changeset& changeset, const std::filesystem::path& pr
         const auto target = safe_join(project, file.path);
         if (!target) return fail("refusing to write outside the project: " + file.path);
         targets.emplace_back(*target, &file);
+    }
+
+    // AND every baseline is checked before ANY file is touched, for the same
+    // reason the paths are: refuse the whole thing or none of it.
+    //
+    // A changeset holds whole file contents, so landing one is an overwrite. A
+    // change that has sat on the board while you kept working would otherwise
+    // replace your edits with no conflict and no warning -- and holding a change
+    // is precisely what makes time pass before it lands, so this is the normal
+    // case rather than an exotic one.
+    for (const auto& [target, file] : targets) {
+        if (file->base_fingerprint == 0) continue;   // captured before this existed
+
+        std::string now;
+        if (std::filesystem::is_regular_file(target, ec)) {
+            std::ifstream in(target, std::ios::binary);
+            std::ostringstream buffer;
+            buffer << in.rdbuf();
+            now = buffer.str();
+        }
+        // An absent file hashes as empty, which is exactly right: a coder that
+        // created a file expects it not to be there, and finding one means
+        // somebody else got there first.
+        if (fingerprint(now) != file->base_fingerprint) {
+            return fail(file->path +
+                        " has changed since this work was done, so landing it would "
+                        "overwrite those edits. Nothing was written.");
+        }
     }
 
     for (const auto& [target, file] : targets) {

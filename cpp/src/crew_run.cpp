@@ -125,6 +125,9 @@ bool save_changeset(const std::filesystem::path& dir, const Changeset& changeset
         entry["path"]    = file.path;
         entry["deleted"] = file.deleted;
         entry["blob"]    = index;
+        // Persisted, or a held change reloaded after a restart would land with no
+        // baseline to check and silently overwrite whatever had happened since.
+        entry["base"]    = file.base_fingerprint;
         manifest["files"].push_back(entry);
 
         if (!file.deleted) {
@@ -171,6 +174,12 @@ Changeset load_changeset(const std::filesystem::path& dir) {
             file.contents =
                 read_whole(dir / ("blob-" + std::to_string(entry["blob"].get<int>())));
         }
+        if (entry.contains("base") && entry["base"].is_number_unsigned()) {
+            file.base_fingerprint = entry["base"].get<std::uint64_t>();
+        }
+        // A manifest written before "base" existed leaves it 0, which
+        // apply_changeset reads as "no baseline" and lets through -- an upgrade
+        // must not make work already on the board unlandable.
         changeset.files.push_back(std::move(file));
     }
     return changeset;
@@ -225,6 +234,34 @@ std::string RunOptions::backend_for_coder(int n) const {
         static_cast<std::size_t>(n > 0 ? n - 1 : 0) % coder_backends.size();
     const std::string picked = coder_backends[index];
     return picked.empty() ? coder_backend : picked;
+}
+
+// The config's per-role models and backends, folded into whatever the caller
+// asked for.
+//
+// ONE PLACE, on the way in, rather than at each call site. The GUI copied
+// config.crew_role_models into RunOptions and every other caller did not, so a
+// crew started any other way silently ignored the per-role models the user had
+// set -- measured on a live run pinned to a different Auditor that never ran.
+// resume_crew had grown its own inline lookup for the Auditor alone, which is the
+// same knowledge in a second place and already disagreeing with the first.
+//
+// What the caller passed WINS. This fills gaps; it does not overrule an explicit
+// choice, for the same reason the Router does not.
+RunOptions with_config_roles(const Config& config, RunOptions options) {
+    for (const auto& [role, model] : config.crew_role_models) {
+        if (model.empty()) continue;
+        if (options.role_models.find(role) == options.role_models.end()) {
+            options.role_models[role] = model;
+        }
+    }
+    for (const auto& [role, backend] : config.crew_role_backends) {
+        if (backend.empty()) continue;
+        if (options.role_backends.find(role) == options.role_backends.end()) {
+            options.role_backends[role] = backend;
+        }
+    }
+    return options;
 }
 
 std::string RunOptions::model_for(const std::string& role) const {
@@ -425,9 +462,11 @@ std::string security_report(const std::vector<Finding>& findings) {
     return out.str();
 }
 
-RunResult scan_security(const Config& config, const RunOptions& options,
+RunResult scan_security(const Config& config, const RunOptions& requested,
                         const RunEvents& events, const std::atomic<bool>* cancel,
                         std::vector<Finding>* out_findings) {
+    const RunOptions options = with_config_roles(config, requested);
+
     RunResult result;
     result.run_id = "scan_" + now_stamp();
 
@@ -959,14 +998,8 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
         // half-finished, not less, so skipping the review here would be exactly
         // backwards.
         attempt.audit = audit_changeset(config, attempt.subtask, attempt.changeset,
-                                        AuditLimits{}, [&config] {
-                                            const auto found =
-                                                config.crew_role_models.find("auditor");
-                                            return found ==
-                                                           config.crew_role_models.end()
-                                                       ? std::string{}
-                                                       : found->second;
-                                        }());
+                                        AuditLimits{},
+                                        with_config_roles(config, {}).model_for("auditor"));
 
         land_or_hold(result.run_id, project, attempt, landed, board, next_number,
                      result, note);
@@ -979,8 +1012,11 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
     return finish(result);
 }
 
-RunResult run_crew(const Config& config, const RunOptions& options,
+RunResult run_crew(const Config& config, const RunOptions& requested,
                    const RunEvents& events, const std::atomic<bool>* cancel) {
+    // The user's per-role settings apply however this run was started.
+    const RunOptions options = with_config_roles(config, requested);
+
     RunResult result;
     result.run_id = "crew_" + now_stamp();
 

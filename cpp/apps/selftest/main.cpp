@@ -4876,6 +4876,248 @@ void test_sandbox() {
 // Reading the reply is the part that decides how many coders really run, so it is
 // tested against the shapes models actually produce rather than only the one asked
 // for. A mis-parse here does not throw -- it silently plans the wrong job.
+// A held change lands only into the project it came from.
+//
+// Found by leaving a change on the board, deleting the project, and looking at
+// what accepting it would do. A changeset carries whole file contents, so landing
+// one is an OVERWRITE -- and holding a change is exactly what makes time pass
+// before it lands, so "the file moved on since" is the normal case here, not an
+// exotic one.
+void test_changeset_conflicts() {
+    using namespace auspex;
+    std::cout << "\nchangeset conflicts\n";
+
+    std::error_code ec;
+    const std::filesystem::path project = "/tmp/auspex-conflict-project";
+    const std::filesystem::path sandbox = "/tmp/auspex-conflict-sandbox";
+
+    const auto seed = [&](const std::filesystem::path& root, const std::string& text) {
+        std::filesystem::remove_all(root, ec);
+        std::filesystem::create_directories(root, ec);
+        std::ofstream out(root / "calc.py");
+        out << text;
+    };
+
+    // ---- a coder's changeset is what IT changed ----
+    //
+    // Reproduces work that was actually lost. Three coders, a run interrupted and
+    // resumed: coder 2's docstring landed, then coder 3 -- whose sandbox predated
+    // that -- reported "f2.py loses its docstring" as its own work, and accepting
+    // it undid coder 2. The Auditor caught it and said so; the changeset was wrong
+    // underneath the Auditor, which is not a place review can save you.
+    {
+        std::filesystem::remove_all(project, ec);
+        std::filesystem::create_directories(project, ec);
+        {
+            std::ofstream a(project / "f2.py"); a << "def f2():\n    return 2\n";
+            std::ofstream b(project / "f3.py"); b << "def f3():\n    return 3\n";
+        }
+
+        // A coder takes its copy...
+        std::filesystem::remove_all(sandbox, ec);
+        std::string why;
+        check(create_sandbox(project, sandbox, &why), "a sandbox is made");
+        check(!sandbox_baseline(sandbox).empty(),
+              "and records what it started with");
+
+        // ... somebody else lands a change to a file this coder never opens ...
+        {
+            std::ofstream a(project / "f2.py");
+            a << "def f2():\n    \"\"\"Return two.\"\"\"\n    return 2\n";
+        }
+
+        // ... and this coder edits only its own file.
+        {
+            std::ofstream b(sandbox / "f3.py");
+            b << "def f3():\n    \"\"\"Return three.\"\"\"\n    return 3\n";
+        }
+
+        const Changeset changeset = capture_changeset(project, sandbox);
+        check_eq(changeset.files.size(), std::size_t{1},
+                 "the changeset holds ONE file -- the one this coder touched");
+        if (!changeset.files.empty()) {
+            check_eq(changeset.files[0].path, std::string("f3.py"),
+                     "and it is f3.py, not the file somebody else changed");
+        }
+        check(changeset.diff.find("f2.py") == std::string::npos,
+              "f2.py is absent entirely -- a coder cannot revert work it never saw");
+
+        // And landing it leaves the other coder's work alone.
+        check(apply_changeset(changeset, project, nullptr, &why), "it lands");
+        std::ifstream landed(project / "f2.py");
+        std::ostringstream now;
+        now << landed.rdbuf();
+        check(now.str().find("Return two") != std::string::npos,
+              "with the other coder's docstring still there");
+    }
+
+    // ---- a file the project GAINED is not a deletion ----
+    {
+        std::filesystem::remove_all(project, ec);
+        std::filesystem::create_directories(project, ec);
+        { std::ofstream a(project / "a.py"); a << "a = 1\n"; }
+
+        std::filesystem::remove_all(sandbox, ec);
+        std::string why;
+        create_sandbox(project, sandbox, &why);
+
+        // Somebody adds a file after this coder took its copy.
+        { std::ofstream b(project / "new.py"); b << "new = 1\n"; }
+        // This coder does something unrelated.
+        { std::ofstream a(sandbox / "a.py"); a << "a = 2\n"; }
+
+        const Changeset changeset = capture_changeset(project, sandbox);
+        for (const auto& file : changeset.files) {
+            check(file.path != "new.py",
+                  "a file the project gained is not reported as this coder deleting it");
+        }
+        check_eq(changeset.files.size(), std::size_t{1}, "only the real change");
+    }
+
+    // ---- a sandbox with no manifest still works ----
+    //
+    // Work already on disk from before this existed must stay resumable.
+    {
+        std::filesystem::remove_all(project, ec);
+        std::filesystem::create_directories(project, ec);
+        { std::ofstream a(project / "old.py"); a << "old = 1\n"; }
+
+        std::filesystem::remove_all(sandbox, ec);
+        std::string why;
+        create_sandbox(project, sandbox, &why);
+        std::filesystem::remove(sandbox / kBaselineFile, ec);   // an older sandbox
+        { std::ofstream a(sandbox / "old.py"); a << "old = 2\n"; }
+
+        const Changeset changeset = capture_changeset(project, sandbox);
+        check_eq(changeset.files.size(), std::size_t{1},
+                 "a sandbox with no baseline falls back to comparing with the project");
+    }
+
+    // ---- the manifest is never itself a change ----
+    {
+        std::filesystem::remove_all(project, ec);
+        std::filesystem::create_directories(project, ec);
+        { std::ofstream a(project / "a.py"); a << "a = 1\n"; }
+        std::filesystem::remove_all(sandbox, ec);
+        std::string why;
+        create_sandbox(project, sandbox, &why);
+
+        check(std::filesystem::exists(sandbox / kBaselineFile), "the manifest is written");
+        check(capture_changeset(project, sandbox).empty(),
+              "and an untouched sandbox still captures nothing -- the manifest is "
+              "excluded, or every coder would land our own bookkeeping");
+    }
+
+    // ---- the fingerprint itself ----
+    {
+        check(fingerprint("a") == fingerprint("a"), "the same text hashes the same");
+        check(fingerprint("a") != fingerprint("b"), "different text does not");
+        check(fingerprint("") != 0,
+              "and nothing still hashes to something -- 0 is reserved for 'no "
+              "baseline', so a real hash must never collide with it");
+    }
+
+    // ---- landing on an unchanged project ----
+    {
+        seed(project, "def add(a, b):\n    return a - b\n");
+        seed(sandbox, "def add(a, b):\n    return a + b\n");
+
+        const Changeset changeset = capture_changeset(project, sandbox);
+        check_eq(changeset.files.size(), std::size_t{1}, "one file changed");
+        check(changeset.files[0].base_fingerprint != 0,
+              "and the baseline it started from was recorded");
+
+        std::string error;
+        check(apply_changeset(changeset, project, nullptr, &error),
+              "it lands on the project it came from");
+    }
+
+    // ---- landing on a project that moved on ----
+    //
+    // THE case this exists for: hold a change, keep working, accept it later.
+    {
+        seed(project, "def add(a, b):\n    return a - b\n");
+        seed(sandbox, "def add(a, b):\n    return a + b\n");
+        const Changeset changeset = capture_changeset(project, sandbox);
+
+        // You edit the file while the change sits on the board.
+        {
+            std::ofstream out(project / "calc.py");
+            out << "def add(a, b):\n    # my own work\n    return a - b\n";
+        }
+
+        std::string error;
+        check(!apply_changeset(changeset, project, nullptr, &error),
+              "landing it is REFUSED once the file has moved on");
+        check(error.find("has changed since") != std::string::npos,
+              "and says why");
+
+        std::ifstream in(project / "calc.py");
+        std::ostringstream now;
+        now << in.rdbuf();
+        check(now.str().find("my own work") != std::string::npos,
+              "and the edits are still there -- nothing was written");
+    }
+
+    // ---- a file somebody else created first ----
+    {
+        seed(project, "x = 1\n");
+        seed(sandbox, "x = 1\n");
+        {
+            std::ofstream out(sandbox / "new.py");
+            out << "def f():\n    return 1\n";
+        }
+        const Changeset changeset = capture_changeset(project, sandbox);
+
+        {   // ... and it exists in the project by the time this lands
+            std::ofstream out(project / "new.py");
+            out << "def f():\n    return 2\n";
+        }
+        std::string error;
+        check(!apply_changeset(changeset, project, nullptr, &error),
+              "a file the coder meant to CREATE is refused if it now exists");
+    }
+
+    // ---- refused whole, never in part ----
+    //
+    // Same rule as the path check: a half-applied changeset is a state nobody
+    // asked for and nothing can undo.
+    {
+        seed(project, "a = 1\n");
+        seed(sandbox, "a = 1\n");
+        {
+            std::ofstream b(sandbox / "b.py"); b << "b = 2\n";
+            std::ofstream c(sandbox / "c.py"); c << "c = 3\n";
+        }
+        const Changeset changeset = capture_changeset(project, sandbox);
+        check_eq(changeset.files.size(), std::size_t{2}, "two new files");
+
+        {   // only ONE of them conflicts
+            std::ofstream b(project / "b.py"); b << "something else\n";
+        }
+        std::string error;
+        check(!apply_changeset(changeset, project, nullptr, &error), "the change is refused");
+        check(!std::filesystem::exists(project / "c.py"),
+              "and the file that did NOT conflict was not written either");
+    }
+
+    // ---- a changeset from before this existed still lands ----
+    //
+    // An upgrade must not make work already sitting on somebody's board
+    // unlandable. A zero baseline means "not recorded", never "mismatch".
+    {
+        seed(project, "old = 1\n");
+        Changeset legacy;
+        legacy.files.push_back({"old.py", "old = 2\n", false, /*base=*/0});
+        std::string error;
+        check(apply_changeset(legacy, project, nullptr, &error),
+              "a changeset with no recorded baseline still lands");
+    }
+
+    std::filesystem::remove_all(project, ec);
+    std::filesystem::remove_all(sandbox, ec);
+}
+
 void test_director() {
     using namespace auspex;
     std::cout << "\ndirector\n";
@@ -7471,6 +7713,43 @@ void test_eval() {
         }
     }
 
+    // ---- a per-role setting applies however the run was started ----
+    //
+    // The GUI copied config.crew_role_models into RunOptions and nothing else did,
+    // so a crew started any other way silently ignored it. Caught on a live run
+    // pinned to a different Auditor which never ran: the cost report named only
+    // one model.
+    {
+        Config config;
+        config.ollama_model = "base-model";
+        config.crew_role_models["auditor"] = "from-config";
+        config.crew_role_backends["auditor"] = "claude";
+
+        const RunOptions filled = with_config_roles(config, {});
+        check_eq(filled.model_for("auditor"), std::string("from-config"),
+                 "a per-role model in config.json reaches the run on its own");
+        check_eq(filled.backend_for("auditor"), std::string("claude"),
+                 "and so does the backend");
+
+        // The debate voices fall back to the Auditor, so pinning one pins all four.
+        check_eq(filled.model_for("judge"), std::string("from-config"),
+                 "and the roles that fall back to it follow");
+
+        // What the caller asked for still wins. This fills gaps; it does not
+        // overrule a choice, for the same reason the Router does not.
+        RunOptions explicit_choice;
+        explicit_choice.role_models["auditor"] = "chosen-by-caller";
+        check_eq(with_config_roles(config, explicit_choice).model_for("auditor"),
+                 std::string("chosen-by-caller"),
+                 "but an explicit choice is not overruled by the config");
+
+        // An empty value in config is not a choice.
+        Config blank;
+        blank.crew_role_models["auditor"] = "";
+        check(with_config_roles(blank, {}).model_for("auditor").empty(),
+              "and an empty setting does not shadow the fallback");
+    }
+
     // ---- the two errors are counted apart ----
     //
     // The whole point of this measurement. Averaging them hides the difference
@@ -8043,6 +8322,69 @@ int main(int argc, char** argv) {
                    : 1;
     }
 
+    // The board, and acting on it.
+    //
+    //   --board            what is held, and whether it can still land
+    //   --accept N         land change N
+    //   --discard N        throw it away
+    //
+    // The hold-then-land workflow had no way to be exercised outside the GUI,
+    // which is also why the conflict guard below it went unnoticed for so long.
+    if (!args.empty() && args[0] == "--board") {
+        const auto items = auspex::read_board();
+        if (items.empty()) {
+            std::cout << "the board is empty\n";
+            return 0;
+        }
+        for (const auto& item : items) {
+            std::cout << "  #" << item.n << "  " << item.summary << "\n"
+                      << "      " << item.reason << "\n"
+                      << "      " << item.files << " file(s), lands in "
+                      << item.repo_root << "\n";
+            // Whether it COULD land, checked without writing anything. A change
+            // whose project is gone, or whose files have moved on, is dead weight
+            // and should say so rather than waiting to fail on a button press.
+            std::error_code ec;
+            if (!std::filesystem::is_directory(item.repo_root, ec)) {
+                std::cout << "      DEAD: that project no longer exists\n";
+                continue;
+            }
+            const auto changeset = auspex::load_changeset(item.store);
+            if (changeset.empty()) {
+                std::cout << "      DEAD: the saved work is missing\n";
+                continue;
+            }
+            bool conflicted = false;
+            for (const auto& file : changeset.files) {
+                if (file.base_fingerprint == 0) continue;
+                const auto target = auspex::safe_join(item.repo_root, file.path);
+                std::string now;
+                if (target && std::filesystem::is_regular_file(*target, ec)) {
+                    std::ifstream in(*target, std::ios::binary);
+                    std::ostringstream buffer;
+                    buffer << in.rdbuf();
+                    now = buffer.str();
+                }
+                if (auspex::fingerprint(now) != file.base_fingerprint) {
+                    std::cout << "      STALE: " << file.path
+                              << " has changed since this work was done\n";
+                    conflicted = true;
+                    break;
+                }
+            }
+            if (!conflicted) std::cout << "      ready to land\n";
+        }
+        return 0;
+    }
+    if (args.size() >= 2 && (args[0] == "--accept" || args[0] == "--discard")) {
+        const int n = std::atoi(args[1].c_str());
+        std::string error;
+        const bool ok = args[0] == "--accept" ? auspex::accept_held(n, &error)
+                                              : auspex::discard_held(n, &error);
+        std::cout << (ok ? "done" : ("refused: " + error)) << "\n";
+        return ok ? 0 : 1;
+    }
+
     // What the configured hooks are, and where they are read from.
     if (!args.empty() && args[0] == "--hooks") {
         std::cout << "hooks from " << auspex::hooks_path().string() << "\n";
@@ -8382,6 +8724,7 @@ int main(int argc, char** argv) {
     test_agents();
     test_projects();
     test_sandbox();
+    test_changeset_conflicts();
     test_director();
     test_coder();
     test_auditor();

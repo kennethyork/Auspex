@@ -18,6 +18,7 @@
 // filename. See safe_join().
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -97,8 +98,29 @@ struct ChangedFile {
     std::string contents;   // the new text; empty for a deletion
     bool        deleted = false;
 
+    // A fingerprint of what this file held in the PROJECT when the coder started.
+    //
+    // A changeset carries whole file contents, not a patch, so applying one is an
+    // overwrite. Without this there is nothing to notice that the file has moved
+    // on since -- and a held change accepted an hour later would silently overwrite
+    // an hour of your own edits, with no conflict and no warning. That is the
+    // failure a held change is most likely to meet, because holding one is exactly
+    // what makes time pass before it lands.
+    //
+    // 0 means "no baseline recorded" -- a changeset from before this existed --
+    // and is deliberately NOT treated as a mismatch, or every stored change would
+    // become unlandable on upgrade. See apply_changeset().
+    std::uint64_t base_fingerprint = 0;
+
     bool operator==(const ChangedFile&) const = default;
 };
+
+// FNV-1a over the file's bytes. Not a security hash and not trying to be: this
+// catches "somebody edited this while the change sat on the board", which is an
+// accident, never an attack. Chosen over std::hash because that is not required
+// to give the same answer in two different processes, and the two ends of this
+// check are always two different processes.
+std::uint64_t fingerprint(const std::string& text);
 
 struct Changeset {
     std::vector<ChangedFile> files;
@@ -109,13 +131,39 @@ struct Changeset {
     bool operator==(const Changeset&) const = default;
 };
 
-// What `sandbox` changed relative to `project`.
+// The name of the baseline manifest written into a sandbox at creation.
 //
-// Ordered by path so two captures of the same work produce the same diff -- a
-// changeset is read by a person and by an Auditor, and neither should see the
-// files shuffle between runs.
+// In sandbox_excludes(), so it is never copied into a nested sandbox and never
+// captured out of one.
+extern const char* const kBaselineFile;
+
+// What THIS CODER changed -- not what the sandbox and the project now differ by.
+//
+// Those are different questions and the difference cost real work. capture used
+// to diff the sandbox against the project as it stands at capture time, so any
+// file the PROJECT changed after the sandbox was made showed up as a change by
+// this coder -- specifically, as a revert of it.
+//
+// Watched end to end: three coders, a run interrupted, then resumed. Coder 2's
+// docstring landed. Coder 3's sandbox predated that, so its capture reported
+// "f2.py loses its docstring" as coder 3's work, and accepting it silently undid
+// coder 2. The Auditor actually caught it and said so; the changeset was wrong
+// underneath the Auditor, which is not somewhere a review can save you.
+//
+// So a file is the coder's change only when it differs from what the SANDBOX
+// started with, recorded at creation. A file the coder never opened is identical
+// to its baseline and is not reported, however far the project has moved.
+//
+// Without a baseline manifest -- a sandbox from before this existed -- it falls
+// back to the old project-relative comparison, because a resume of work already
+// on disk must keep working.
 Changeset capture_changeset(const std::filesystem::path& project,
                             const std::filesystem::path& sandbox);
+
+// path -> fingerprint of every file the sandbox was created with. Empty when the
+// sandbox has no manifest.
+std::map<std::string, std::uint64_t> sandbox_baseline(
+    const std::filesystem::path& sandbox);
 
 // Writes a changeset into `project`. Reports which paths were written.
 //
