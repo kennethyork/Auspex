@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <cstdint>
 #include <unordered_map>
 
 namespace auspex {
@@ -32,6 +33,14 @@ bool write_file(const std::filesystem::path& path, const std::string& text) {
 bool looks_binary(const std::string& contents) {
     return contents.find('\0') != std::string::npos;
 }
+
+// Files past this are not read at all.
+//
+// Not a judgement about what matters -- a judgement about what a coder can DO. A
+// write replaces a whole file, so anything a coder could usefully change has to
+// fit in a prompt, and nothing that fits in a prompt is a megabyte. Without this,
+// one checked-in dump or minified bundle is read in full on every single turn.
+constexpr std::uintmax_t kMaxFileBytes = 1024 * 1024;
 
 // --- the diff ---------------------------------------------------------------
 //
@@ -120,10 +129,22 @@ std::vector<Op> diff_ops(const std::vector<int>& a, const std::vector<int>& b) {
 // ---------------------------------------------------------------------------
 const std::vector<std::string>& sandbox_excludes() {
     static const std::vector<std::string> kExcludes{
-        ".git",        ".hg",           ".svn",        ".ollamadev",
-        "node_modules", ".DS_Store",    "auspex-crew", "__pycache__",
-        ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle",
-        ".venv",       "venv",          "target",      ".cache",
+        // Version control and our own state.
+        ".git", ".hg", ".svn", ".ollamadev", ".auspex", "auspex-crew",
+        // Dependencies somebody else installed.
+        "node_modules", "vendor", "third_party", "Pods", ".bundle",
+        // BUILD OUTPUT. Measured on a real Qt project: build 47M, .build 146M,
+        // dist 106M -- three hundred megabytes that would be copied into every
+        // coder's sandbox and re-read on every turn, to find nothing a coder
+        // should ever edit. Their absence made this module unusable on any
+        // compiled project.
+        "build", ".build", "cmake-build-debug", "cmake-build-release",
+        "dist", "out", "target", "bin-int", "obj", ".gradle", ".dart_tool",
+        ".next", ".nuxt", ".svelte-kit", ".parcel-cache", ".turbo",
+        // Caches a coder that runs its own work leaves behind.
+        "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+        ".eggs", ".cache", ".ccache", "coverage", ".nyc_output", ".venv", "venv",
+        ".DS_Store",
     };
     return kExcludes;
 }
@@ -201,6 +222,10 @@ std::map<std::string, std::string> list_files(const std::filesystem::path& root)
         if (!entry.is_regular_file(ec)) continue;   // symlinks, sockets, devices
         if (is_excluded(name)) continue;
 
+        // Size BEFORE contents. A stat is free; reading a 200MB artefact to
+        // discover it is binary is what made this unusable on a compiled project.
+        if (const auto size = entry.file_size(ec); ec || size > kMaxFileBytes) continue;
+
         const std::string contents = read_file(entry.path());
         if (looks_binary(contents)) continue;
 
@@ -213,6 +238,40 @@ std::map<std::string, std::string> list_files(const std::filesystem::path& root)
 }
 
 // ---------------------------------------------------------------------------
+std::vector<std::string> list_file_names(const std::filesystem::path& root) {
+    std::vector<std::string> names;
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) return names;
+
+    auto it = std::filesystem::recursive_directory_iterator(
+        root, std::filesystem::directory_options::skip_permission_denied, ec);
+    if (ec) return names;
+
+    for (auto end = std::filesystem::recursive_directory_iterator(); it != end;
+         it.increment(ec)) {
+        if (ec) break;
+        const auto& entry = *it;
+        const std::string name = entry.path().filename().string();
+
+        if (entry.is_directory(ec)) {
+            if (is_excluded(name)) it.disable_recursion_pending();
+            continue;
+        }
+        if (!entry.is_regular_file(ec) || is_excluded(name)) continue;
+        if (const auto size = entry.file_size(ec); ec || size > kMaxFileBytes) continue;
+
+        // Deliberately does NOT read the file. A listing needs names, and reading
+        // every file to produce one is the difference between a prompt that costs
+        // milliseconds and one that costs a second of disk on every turn.
+        names.push_back(
+            std::filesystem::relative(entry.path(), root, ec).generic_string());
+    }
+
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
 std::vector<std::string> diff_lines(const std::string& text, bool* no_final_newline) {
     std::vector<std::string> lines;
     if (no_final_newline) *no_final_newline = false;

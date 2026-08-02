@@ -535,8 +535,7 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
     int repeats = 0;
 
     for (int step = 0; step < limits.max_steps; ++step) {
-        std::vector<std::string> files;
-        for (const auto& [path, _] : list_files(sandbox)) files.push_back(path);
+        const std::vector<std::string> files = list_file_names(sandbox);
 
         // Checked between turns, so a message lands at the next decision rather
         // than needing the coder to be interrupted mid-call.

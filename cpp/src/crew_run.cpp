@@ -566,8 +566,7 @@ RunResult run_crew(const Config& config, const RunOptions& options,
 
     // ---- plan ----
     note("research: reading the project");
-    std::vector<std::string> files;
-    for (const auto& [path, _] : list_files(options.project)) files.push_back(path);
+    const std::vector<std::string> files = list_file_names(options.project);
 
     publish(/*active=*/true);
     note("plan: the Director is deciding what the pieces are");

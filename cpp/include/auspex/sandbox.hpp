@@ -46,6 +46,14 @@ bool is_excluded(const std::string& name);
 // binary produces a corrupt file rather than a bad patch.
 std::map<std::string, std::string> list_files(const std::filesystem::path& root);
 
+// Just the names, without reading a byte of any file.
+//
+// For the listings in prompts, which is most of what asks. list_files() reads
+// every file to compare contents, and the coder loop rebuilds its listing on
+// every turn -- doing that by reading a whole project each time is what made a
+// compiled repository unusable.
+std::vector<std::string> list_file_names(const std::filesystem::path& root);
+
 // `base / relative`, but only when the result stays inside `base`.
 //
 // nullopt for anything that escapes -- an absolute path, a leading "..", or a
