@@ -169,6 +169,14 @@ Changeset load_changeset(const std::filesystem::path& dir) {
 }
 
 // ---------------------------------------------------------------------------
+std::string RunOptions::model_for(const std::string& role) const {
+    // Role first, then the run-wide model, then (by returning empty) the config's.
+    if (role == "director" && !director_model.empty()) return director_model;
+    if (role == "auditor"  && !auditor_model.empty())  return auditor_model;
+    if (role == "coder"    && !coder_model.empty())    return coder_model;
+    return model;
+}
+
 std::vector<std::string> overlapping_files(const Changeset& a, const Changeset& b) {
     std::vector<std::string> shared;
     for (const auto& left : a.files) {
@@ -345,7 +353,8 @@ RunResult run_crew(const Config& config, const RunOptions& options,
     note("plan: the Director is deciding what the pieces are");
 
     const Plan plan =
-        plan_task(config, options.task, files, options.max_subtasks, options.model);
+        plan_task(config, options.task, files, options.max_subtasks,
+                  options.model_for("director"));
     if (!plan.ok()) {
         result.error = plan.error;
         publish(/*active=*/false);
@@ -397,14 +406,14 @@ RunResult run_crew(const Config& config, const RunOptions& options,
             }
 
             attempt.outcome = run_coder(config, attempt.subtask, sandbox,
-                                        options.coder, options.model);
+                                        options.coder, options.model_for("coder"));
             attempt.changeset = capture_changeset(options.project, sandbox);
 
             // Audited on the worker thread. It is another model call, and doing it
             // here means a slow audit of one piece does not hold up the coder on
             // the next.
             attempt.audit = audit_changeset(config, attempt.subtask, attempt.changeset,
-                                            options.audit, options.model);
+                                            options.audit, options.model_for("auditor"));
 
             {
                 std::lock_guard lock(state_mutex);

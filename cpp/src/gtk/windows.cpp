@@ -26,6 +26,7 @@
 #include "auspex/audio.hpp"
 #include "auspex/autostart.hpp"
 #include "auspex/crew.hpp"
+#include "auspex/crew_run.hpp"
 #include "auspex/gtk/voice.hpp"
 #include "auspex/ollama_client.hpp"
 #include "auspex/process.hpp"
@@ -558,8 +559,12 @@ CrewWindow::CrewWindow() {
     start_.add_css_class("suggested-action");
     start_.signal_clicked().connect([this] { start(); });
 
+    // Not in Auspex's own engine yet. Left visible but insensitive with the reason
+    // on it: a control that looks live and silently does nothing is worse than one
+    // that plainly says it is not ready.
+    resume_.set_sensitive(false);
     resume_.set_tooltip_text(
-        "Finish an interrupted run: keep what is done, re-plan what is left");
+        "Not available yet: Auspex's own engine cannot resume an interrupted run");
     resume_.signal_clicked().connect([this] {
         if (!is_project_dir(project_)) {
             status_.set_text("Choose a folder for the crew to work in first");
@@ -572,16 +577,51 @@ CrewWindow::CrewWindow() {
         status_.set_text("Resuming the most recent run…");
     });
 
+    stop_.set_sensitive(false);
+    stop_.set_tooltip_text("Stop after the current step, keeping what is done");
+    stop_.signal_clicked().connect([this] { stop(); });
+
     start_row_.append(start_);
+    start_row_.append(stop_);
     start_row_.append(resume_);
 
+    // The runner signals; the UI re-reads. Both watchers are forced because the
+    // state file changed for a reason we already know about, so waiting on a
+    // modification time would only add latency.
+    run_changed_.connect([this] {
+        {
+            std::lock_guard lock(log_mutex_);
+            if (!last_log_.empty()) status_.set_text(last_log_);
+        }
+        if (!running_.load()) {
+            start_.set_sensitive(true);
+            stop_.set_sensitive(false);
+        }
+        have_run_mtime_   = false;
+        have_board_mtime_ = false;
+        refresh_run();
+        refresh_board();
+    });
+
     // ---- the options ----
-    route_.set_tooltip_text("Pick each role's model by how hard its subtask is");
-    debate_.set_tooltip_text("An advocate, a skeptic and a judge vote on every changeset");
-    dedupe_.set_tooltip_text("Hold a coder whose work duplicates another's");
-    learn_.set_tooltip_text("Remember what this run teaches, for the next one");
-    security_.set_tooltip_text(
-        "A read-only vulnerability scan producing a report; nothing is edited");
+    // Per-role models are a setting rather than a switch now: crew_director_model,
+    // crew_coder_model and crew_auditor_model in config.json. The measured
+    // difference is large enough that it belongs in config, not behind a tickbox.
+    route_.set_sensitive(false);
+    route_.set_tooltip_text(
+        "Set crew_auditor_model / crew_coder_model in config.json instead");
+    debate_.set_sensitive(false);
+    debate_.set_tooltip_text("Not available yet in Auspex's own engine");
+    // Dedupe is not a switch here: overlapping work is ALWAYS held, because
+    // silently letting one coder overwrite another's approved change is not a mode
+    // worth offering. Ticked and locked, so the behaviour is visible.
+    dedupe_.set_active(true);
+    dedupe_.set_sensitive(false);
+    dedupe_.set_tooltip_text("Always on: overlapping work is held, never overwritten");
+    learn_.set_sensitive(false);
+    learn_.set_tooltip_text("Not available yet in Auspex's own engine");
+    security_.set_sensitive(false);
+    security_.set_tooltip_text("Not available yet in Auspex's own engine");
     options_.append(route_);
     options_.append(debate_);
     options_.append(dedupe_);
@@ -607,11 +647,12 @@ CrewWindow::CrewWindow() {
     amplify_.set_range(0, 7);
     amplify_.set_increments(1, 2);
     amplify_.set_value(0);
-    amplify_.set_tooltip_text(
-        "--amplify: N Director plans, keep the modal one, then an N-reviewer audit "
-        "panel. The most expensive option here. 0 off");
+    amplify_.set_sensitive(false);
+    amplify_.set_tooltip_text("Not available yet in Auspex's own engine");
 
     pack_label_.set_text("Pack");
+    pack_.set_sensitive(false);
+    pack_.set_tooltip_text("Not available yet in Auspex's own engine");
     packs_ = crew_packs(project_);
     {
         std::vector<Glib::ustring> labels;
@@ -664,7 +705,11 @@ CrewWindow::CrewWindow() {
 
     // Steering a coder while it works. The instruction is your words, sent as one
     // argument -- the model never composes what goes to a running coder.
-    steer_.set_placeholder_text("Tell the whole crew something\u2026");
+    // No engine equivalent: a coder here runs its loop to completion and has
+    // nowhere to receive a message. Disabled rather than silently dropped.
+    steer_.set_sensitive(false);
+    steer_send_.set_sensitive(false);
+    steer_.set_placeholder_text("Steering is not available in Auspex's own engine yet");
     steer_.set_hexpand(true);
     steer_.signal_activate().connect([this] { steer_send_.activate(); });
     steer_send_.signal_clicked().connect([this] {
@@ -805,58 +850,99 @@ void CrewWindow::choose_project() {
 }
 
 void CrewWindow::start() {
-    // Checked before anything else. Everything below is about WHAT to build; if
-    // there is no answer to WHERE, none of it should run -- ollamadev would not
-    // refuse, it would pick a folder of its own and edit that.
+    // WHERE first. Everything below is about what to build; with no answer to
+    // where, none of it should run.
     if (!is_project_dir(project_)) {
         status_.set_text(project_.empty()
                              ? "Choose a folder for the crew to work in first"
                              : project_.string() + " is not a folder any more");
         return;
     }
-
-    CrewOptions options;
-    options.route      = route_.get_active();
-    options.debate     = debate_.get_active();
-    options.dedupe     = dedupe_.get_active();
-    options.learn      = learn_.get_active();
-    options.security   = security_.get_active();
-    options.max_coders = coders_.get_value_as_int();
-    options.swarm      = swarm_.get_value_as_int();
-    options.amplify    = amplify_.get_value_as_int();
-
-    // The pack is taken by INDEX into the list the engine gave us, never from typed
-    // text, so an unknown name cannot reach the command line -- ollamadev would
-    // treat it as a prompt rather than refusing it.
-    if (const auto index = pack_.get_selected(); index > 0 && index <= packs_.size()) {
-        options.pack = packs_[index - 1];
+    if (running_.load()) {
+        status_.set_text("A run is already going. Stop it first.");
+        return;
     }
 
-    const auto argv = crew_run_command(std::string(task_.get_text()), options);
-    if (argv.empty()) {
+    const std::string task = trim(std::string(task_.get_text()));
+    if (task.empty()) {
         status_.set_text("Give the crew something to do first");
         return;
     }
 
-    if (!spawn_detached(argv, project_.string())) {
-        status_.set_text("Could not start ollamadev");
-        return;
-    }
+    const Config config = Config::load();
 
-    // Detached rather than held: a crew run outlasts this window, and a run that
-    // died because its window was closed would be the worst possible behaviour for
-    // something that edits files.
-    //
-    // The folder is named back, because it is the fact the run cannot be undone
-    // without: by the time a diff appears on the board it is too late to wonder
-    // which tree it came out of.
-    status_.set_text("Started in " + project_.string() +
-                     ". Progress appears below as the Director plans.");
+    RunOptions options;
+    options.project      = project_;
+    options.task         = task;
+    options.max_subtasks = coders_.get_value_as_int() > 0
+                               ? coders_.get_value_as_int()
+                               : 4;
+    // Swarm raises how many run AT ONCE; the coder cap bounds how many are
+    // planned. Two numbers, as in the engine.
+    options.parallel = swarm_.get_value_as_int() > 0 ? swarm_.get_value_as_int()
+                                                     : options.max_subtasks;
+    options.director_model = config.crew_director_model;
+    options.coder_model    = config.crew_coder_model;
+    options.auditor_model  = config.crew_auditor_model;
+
+    // A previous thread must be reaped before another starts, or two runs write
+    // one state file.
+    if (runner_.joinable()) runner_.join();
+
+    cancel_.store(false);
+    running_.store(true);
+    start_.set_sensitive(false);
+    stop_.set_sensitive(true);
     task_.set_text("");
+    status_.set_text("Started in " + project_.string() + ".");
+
+    runner_ = std::thread([this, config, options] {
+        RunEvents events;
+        events.changed = [this] { run_changed_.emit(); };
+        events.log = [this](const std::string& line) {
+            {
+                std::lock_guard lock(log_mutex_);
+                last_log_ = line;
+            }
+            run_changed_.emit();
+        };
+
+        const RunResult result = run_crew(config, options, events, &cancel_);
+        {
+            std::lock_guard lock(log_mutex_);
+            last_log_ = result.error.empty()
+                            ? std::to_string(result.applied) + " applied \u00b7 " +
+                                  std::to_string(result.held) + " held"
+                            : result.error;
+        }
+        running_.store(false);
+        run_changed_.emit();
+    });
+}
+
+CrewWindow::~CrewWindow() {
+    // Ask, then wait. The runner polls `cancel` between steps, so this blocks for
+    // at most one model call -- unpleasant on quit, and far better than detaching
+    // a thread that would go on writing a state file and emitting into a
+    // Dispatcher owned by a window that no longer exists.
+    cancel_.store(true);
+    if (runner_.joinable()) runner_.join();
+}
+
+void CrewWindow::stop() {
+    if (!running_.load()) return;
+    // Polled between steps rather than killing anything: a coder mid-call finishes
+    // its turn, and whatever was already written stays in its sandbox. Stopping a
+    // crew should not throw away the work it has done.
+    cancel_.store(true);
+    status_.set_text("Stopping after the current step\u2026");
+    stop_.set_sensitive(false);
 }
 
 void CrewWindow::refresh_run() {
-    const auto path = crew_state_path();
+    // Auspex's own state file now, not ollamadev's. See crew_run.hpp for why the
+    // two engines must not share one.
+    const auto path = auspex_run_state_path();
     if (path.empty()) return;
 
     std::error_code ec;
@@ -989,7 +1075,7 @@ void CrewWindow::refresh_run() {
 }
 
 void CrewWindow::refresh_board() {
-    const auto path = board_state_path();
+    const auto path = auspex_board_path();
     if (!path.empty()) {
         std::error_code ec;
         const auto stamp = std::filesystem::last_write_time(path, ec);
@@ -1003,7 +1089,7 @@ void CrewWindow::refresh_board() {
     while (Gtk::Widget* child = board_box_.get_first_child()) board_box_.remove(*child);
     board_rows_.clear();
 
-    const auto items = board_items(project_);
+    const auto items = read_board();
     if (items.empty()) {
         board_heading_.set_text("Nothing is being held for review.");
         board_scroller_.set_visible(false);
@@ -1188,28 +1274,30 @@ void CrewWindow::refresh_board() {
 
 void CrewWindow::decide(int n, bool accept) {
     // Checked against the board that actually exists, not trusted from the button.
-    // The buttons are built from a real board so this cannot normally fail -- but
-    // the board can change between drawing a row and pressing it, and accepting the
-    // wrong changeset is not something to leave to timing.
-    const auto items = board_items(project_);
-    if (!board_item(items, n)) {
+    // The buttons are built from a real board, but it can change between drawing a
+    // row and pressing it, and applying the wrong changeset is not something to
+    // leave to timing.
+    if (!board_item(read_board(), n)) {
         status_.set_text("Change " + std::to_string(n) + " is no longer on the board");
         have_board_mtime_ = false;
         refresh_board();
         return;
     }
 
-    const auto argv = accept ? crew_accept_command(n) : crew_discard_command(n);
-    if (argv.empty() || !spawn_detached(argv, project_.string())) {
-        status_.set_text("Could not reach the crew");
-        return;
+    std::string error;
+    const bool ok = accept ? accept_held(n, &error) : discard_held(n, &error);
+    if (!ok) {
+        status_.set_text("\u26a0 " + (error.empty() ? std::string("could not do that")
+                                                     : error));
+    } else {
+        status_.set_text((accept ? "\u2713 accepted change " : "\u2713 discarded change ") +
+                         std::to_string(n));
     }
 
-    status_.set_text((accept ? "Accepting change " : "Discarding change ") +
-                     std::to_string(n));
-    // Forced, because accepting one changeset can release or invalidate another and
-    // the file may not have been rewritten yet.
+    // Forced: accepting one changeset can release or invalidate another, and the
+    // file may not have been rewritten yet.
     have_board_mtime_ = false;
+    refresh_board();
 }
 
 // ---------------------------------------------------------------------------

@@ -1872,10 +1872,10 @@ void Panel::show_panel_menu(double x, double y) {
     add("Projects", [this] { show_projects(); });
     // Only when ollamadev is installed: a menu entry that always explains it
     // cannot work is worse than no entry.
+    // Crew needs no ollamadev now -- Auspex has its own engine. Team and Brain
+    // still drive the CLI, so they stay gated on it being installed.
+    add("Crew", [this] { show_crew(); });
     if (crew_available()) {
-        add("Crew", [this] { show_crew(); });
-        // Team and Brain sit with Crew because all three are the engine's, and
-        // none of them mean anything without it.
         add("Team", [this] { show_team({}); });
         add("Brain", [this] { show_brain(); });
     }

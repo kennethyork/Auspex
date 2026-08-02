@@ -5688,6 +5688,7 @@ int main(int argc, char** argv) {
         options.task    = args[1];
         options.project = args[2];
         if (args.size() >= 4) options.max_subtasks = std::atoi(args[3].c_str());
+        if (args.size() >= 5) options.auditor_model = args[4];
 
         auspex::RunEvents events;
         events.log = [](const std::string& line) { std::cout << "  " << line << "\n"; };

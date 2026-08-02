@@ -41,6 +41,18 @@ struct Config {
     std::string network_command;
     std::string background;
     std::string ollama_model     = "qwen3.5:9b";
+
+    // Per-role models for the crew. Empty falls back to ollama_model.
+    //
+    // The Auditor is the one worth setting. Measured on one task: a 9b model held
+    // correct code twice with confident, self-contradicting reasons, while a
+    // frontier model on the same diff correctly spotted that the coder had created
+    // src/calc.py instead of editing calc.py. Reviewing is the hardest of the three
+    // roles and the one where being wrong is most expensive -- a bad Auditor either
+    // holds everything, which makes the crew pointless, or lands something broken.
+    std::string crew_director_model;
+    std::string crew_coder_model;
+    std::string crew_auditor_model;
     std::string ollama_endpoint  = "http://127.0.0.1:11434";
     std::string whisper_endpoint = "http://127.0.0.1:5000/transcribe";
     int         sample_rate      = 16000;

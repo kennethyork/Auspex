@@ -74,6 +74,21 @@ struct RunOptions {
     // Empty uses config.ollama_model for every role.
     std::string model;
 
+    // Per-role overrides, each falling back to `model`.
+    //
+    // Separate because the roles are not equally hard. Planning and reviewing are
+    // judgement; coding against a fixed verb table is mostly transcription. An
+    // observed run had a 9b model hold correct Python twice with a confident,
+    // self-contradicting reason -- the Auditor is where a bigger model earns its
+    // cost, and where a small one quietly makes the whole crew useless by holding
+    // everything.
+    std::string director_model;
+    std::string coder_model;
+    std::string auditor_model;
+
+    // The model a given role should use, after the fallbacks.
+    std::string model_for(const std::string& role) const;
+
     CoderLimits coder;
     AuditLimits audit;
 

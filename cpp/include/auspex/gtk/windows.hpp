@@ -7,12 +7,17 @@
 // nothing and keep the stylesheet a faithful port.
 #pragma once
 
+#include <atomic>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <set>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <glibmm/dispatcher.h>
 
 #include <gtkmm/box.h>
 #include <gtkmm/button.h>
@@ -152,17 +157,36 @@ class CrewWindow : public Gtk::Window {
 public:
     CrewWindow();
 
+    // Cancels a run in flight and waits for it. A std::thread member that is
+    // still joinable when it is destroyed calls std::terminate, so this is not
+    // tidiness -- without it, quitting during a run takes the shell down.
+    ~CrewWindow() override;
+
     // Points the window at a folder. Called by the project picker, so choosing a
     // project there and pressing Crew do not have to be told the same thing twice.
     void set_project(const std::filesystem::path& path);
 
 private:
     void start();
+    void stop();
     void refresh_run();
     void refresh_board();
     void decide(int n, bool accept);
     void choose_project();
     void show_project();
+
+    // The run happens on its own thread and can take minutes. GTK may only be
+    // touched from the main thread, so the worker signals through a Dispatcher and
+    // the UI re-reads the state file the runner writes -- the same file the panel
+    // already watches, so there is one source of truth rather than two.
+    std::thread              runner_;
+    std::atomic<bool>        cancel_{false};
+    std::atomic<bool>        running_{false};
+    Glib::Dispatcher         run_changed_;
+    // Written by the worker, read on the GTK thread after a dispatch. Guarded
+    // because both threads touch it.
+    std::mutex               log_mutex_;
+    std::string              last_log_;
 
     Gtk::Box root_{Gtk::Orientation::VERTICAL, 12};
 
@@ -184,6 +208,7 @@ private:
     Gtk::Entry  task_;
     Gtk::Box    start_row_{Gtk::Orientation::HORIZONTAL, 8};
     Gtk::Button start_{"Start the crew"};
+    Gtk::Button stop_{"Stop"};
     Gtk::Button resume_{"Resume"};
 
     // The brain options. All opt-in, and a plain run is unchanged by them -- which
