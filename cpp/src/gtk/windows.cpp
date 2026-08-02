@@ -830,6 +830,8 @@ CrewWindow::CrewWindow() {
     root_.append(second_row_);
     root_.append(start_row_);
     root_.append(run_heading_);
+    crew_row_.set_visible(false);
+    root_.append(crew_row_);
     root_.append(lanes_);
     root_.append(steer_row_);
     root_.append(board_heading_);
@@ -1079,6 +1081,40 @@ void CrewWindow::refresh_run() {
                               ? (run.task.empty() ? "The crew is idle."
                                                   : "Idle. Last task: " + run.task)
                               : label + " \u2014 " + run.task);
+    // The crew, as members. Rebuilt rather than updated: four chips is nothing to
+    // redraw, and keeping widgets in step with a changing roster is how a row ends
+    // up showing a member that finished ten seconds ago.
+    while (Gtk::Widget* child = crew_row_.get_first_child()) crew_row_.remove(*child);
+    crew_chips_.clear();
+
+    const auto members = crew_members(run);
+    for (std::size_t i = 0; i < members.size(); ++i) {
+        const auto& member = members[i];
+
+        auto chip = std::make_unique<Gtk::Label>();
+        std::string text = member.name;
+        if (!member.detail.empty()) text += "  " + member.detail;
+        chip->set_text(text);
+        chip->set_xalign(0.0f);
+        // Working is the one that matters; done is dimmed; not yet reached is
+        // ordinary. Three states rather than two, because "has not started" and
+        // "has finished" look identical otherwise and mean opposite things.
+        if (member.working)   chip->add_css_class("accent");
+        else if (member.done) chip->add_css_class("dim-label");
+        chip->add_css_class(member.working ? "heading" : "caption");
+        crew_row_.append(*chip);
+        crew_chips_.push_back(std::move(chip));
+
+        if (i + 1 < members.size()) {
+            auto arrow = std::make_unique<Gtk::Label>();
+            arrow->set_text("\u2192");
+            arrow->add_css_class("dim-label");
+            crew_row_.append(*arrow);
+            crew_chips_.push_back(std::move(arrow));
+        }
+    }
+    crew_row_.set_visible(!members.empty());
+
     lanes_.set_visible(!run.subtasks.empty());
     // Only offered while something is actually running. A steer box on an idle
     // crew is a control that can only report that there is nothing to steer.

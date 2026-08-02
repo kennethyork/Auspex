@@ -7122,6 +7122,199 @@ void test_starter_skills() {
 }
 
 // ---------------------------------------------------------------------------
+// The crew has more than coders in it
+//
+// The run view could only ever show coders, because coders were the only thing in
+// the state file -- so a crew of five read as a crew of one.
+// ---------------------------------------------------------------------------
+void test_crew_members() {
+    using namespace auspex;
+    std::cout << "\ncrew members\n";
+
+    const auto member = [](const std::vector<CrewMember>& members,
+                           const std::string& name) -> CrewMember {
+        for (const auto& m : members) {
+            if (m.name == name) return m;
+        }
+        return {};
+    };
+
+    // ---- everyone is listed, in the order the work happens ----
+    {
+        const CrewRun run = parse_crew_run(R"({
+            "runId": "crew_1", "task": "do a thing", "active": true,
+            "phase": "build",
+            "subtasks": [{"n":1,"role":"coder","title":"a","state":"running"}]
+        })");
+        check(run.known, "the state parses");
+        check_eq(run.phase, std::string("build"), "and carries the phase");
+
+        const auto members = crew_members(run);
+        check_eq(members.size(), std::size_t{4}, "four members");
+        check_eq(members[0].name, std::string("Researcher"), "Researcher first");
+        check_eq(members[1].name, std::string("Director"), "then the Director");
+        check_eq(members[2].name, std::string("Coders"), "then the coders");
+        check_eq(members[3].name, std::string("Auditor"), "and the Auditor last");
+    }
+
+    // ---- the phase says who is working ----
+    {
+        for (const auto& [phase, who] :
+             std::vector<std::pair<std::string, std::string>>{
+                 {"research", "Researcher"},
+                 {"plan", "Director"},
+                 {"build", "Coders"},
+                 {"audit", "Auditor"}}) {
+            // Before any coder starts there are no subtasks -- the Director has
+            // not cut the job up yet. A fixture with a running coder during the
+            // research phase is a state that cannot occur, and pinning it would
+            // pin nonsense.
+            const bool coders_exist = phase == "build" || phase == "audit";
+            const CrewRun run = parse_crew_run(
+                R"({"runId":"r","task":"t","active":true,"phase":")" + phase +
+                R"(","subtasks":[)" +
+                (coders_exist
+                     ? R"({"n":1,"role":"coder","title":"a","state":"running"})"
+                     : "") +
+                R"(]})");
+            const auto members = crew_members(run);
+            check(member(members, who).working,
+                  "in the " + phase + " phase, the " + who + " is working");
+
+            // NOT an exclusivity check. The audit of one coder runs while the
+            // others are still writing, so two members working at once is the
+            // truth rather than a display bug -- asserting one would have pinned
+            // the wrong behaviour.
+            if (phase == "research" || phase == "plan") {
+                int working = 0;
+                for (const auto& m : members) working += m.working ? 1 : 0;
+                check_eq(working, 1,
+                         "and before any coder starts, only that one");
+            }
+        }
+    }
+
+    // ---- what each member says about itself ----
+    {
+        const CrewRun run = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,"phase":"build",
+            "subtasks":[
+              {"n":1,"role":"coder","title":"a","state":"running"},
+              {"n":2,"role":"tester","title":"b","state":"running"},
+              {"n":3,"role":"docs","title":"c","state":"done"}]
+        })");
+        const auto members = crew_members(run);
+        check_eq(member(members, "Director").detail, std::string("3 pieces"),
+                 "the Director says how many pieces it cut the job into");
+        check_eq(member(members, "Coders").detail, std::string("2 working"),
+                 "and the coders say how many are working");
+    }
+
+    // ---- the reviewers are named, and counted ----
+    //
+    // "Auditor" was one row whatever the run did, so a debate -- three voices,
+    // three model calls -- looked exactly like a single reviewer, and so did a
+    // panel of five. A switch you paid for should be visible in the crew it made.
+    {
+        const CrewRun debate = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,"phase":"audit","debate":true,
+            "subtasks":[{"n":1,"role":"coder","title":"a","state":"running"}]
+        })");
+        const auto voices = crew_members(debate);
+        check(!member(voices, "Advocate").name.empty(), "a debate has an Advocate");
+        check(!member(voices, "Skeptic").name.empty(), "a Skeptic");
+        check(!member(voices, "Judge").name.empty(), "and a Judge");
+        check(member(voices, "Auditor").name.empty(),
+              "and no plain Auditor -- the three ARE the review");
+
+        const CrewRun panel = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,"phase":"audit","amplify":5,
+            "subtasks":[{"n":1,"role":"coder","title":"a","state":"running"}]
+        })");
+        const auto voters = crew_members(panel);
+        check_eq(member(voters, "Auditors").detail, std::string("5 voting"),
+                 "a panel says how many are voting");
+
+        const CrewRun plain = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,"phase":"audit",
+            "subtasks":[{"n":1,"role":"coder","title":"a","state":"running"}]
+        })");
+        check(!member(crew_members(plain), "Auditor").name.empty(),
+              "and an ordinary run still has one Auditor");
+    }
+
+    // ---- the tests are a crew member when they run ----
+    {
+        const CrewRun tested = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,"phase":"build","verify":true,
+            "subtasks":[{"n":1,"role":"coder","title":"a","state":"running"}]
+        })");
+        check(!member(crew_members(tested), "Tests").name.empty(),
+              "with verify on, the suite is a member -- something is executing it "
+              "and deciding whether the work stands");
+
+        const CrewRun untested = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,"phase":"build",
+            "subtasks":[{"n":1,"role":"coder","title":"a","state":"running"}]
+        })");
+        check(member(crew_members(untested), "Tests").name.empty(),
+              "and with it off there is no row for something that never happens");
+    }
+
+    // ---- coders and the Auditor work at the same time ----
+    {
+        const CrewRun run = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,"phase":"audit",
+            "subtasks":[
+              {"n":1,"role":"coder","title":"a","state":"running"},
+              {"n":2,"role":"coder","title":"b","state":"running"}]
+        })");
+        const auto members = crew_members(run);
+        check(member(members, "Auditor").working, "the Auditor is reviewing");
+        check(member(members, "Coders").working,
+              "and the coders are still working -- the audit of one runs while the "
+              "others write, which is what the phase alone cannot say");
+    }
+
+    // ---- a held change is the Auditor's, and it says so ----
+    {
+        const CrewRun run = parse_crew_run(R"({
+            "runId":"r","task":"t","active":false,"phase":"land",
+            "subtasks":[
+              {"n":1,"role":"coder","title":"a","state":"held"},
+              {"n":2,"role":"coder","title":"b","state":"done"}]
+        })");
+        const auto members = crew_members(run);
+        check_eq(member(members, "Auditor").detail, std::string("1 held"),
+                 "the Auditor reports what it is holding");
+        check_eq(member(members, "Coders").detail, std::string("2/2 finished"),
+                 "and a finished coder is finished whether or not it landed");
+    }
+
+    // ---- an older state file marks nobody rather than guessing ----
+    {
+        const CrewRun run = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,
+            "subtasks":[{"n":1,"role":"coder","title":"a","state":"todo"}]
+        })");
+        check(run.phase.empty(), "a state file with no phase parses");
+        const auto members = crew_members(run);
+        check_eq(members.size(), std::size_t{4}, "the members are still listed");
+        int working = 0;
+        for (const auto& m : members) working += m.working ? 1 : 0;
+        check_eq(working, 0,
+                 "and with no phase and nothing running, nobody is marked -- we do "
+                 "not know, which is not the same as everybody having finished");
+    }
+
+    // ---- nothing has ever run ----
+    {
+        check(crew_members(parse_crew_run("not json")).empty(),
+              "an unreadable state file yields no crew at all");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A crew is not pointed at a container
 //
 // Found by opening the Crew window and LOOKING at it: it offered $HOME as the
@@ -9420,6 +9613,7 @@ int main(int argc, char** argv) {
     test_mcp();
     test_roles();
     test_starter_skills();
+    test_crew_members();
     test_project_guard();
     test_symbols();
     test_verify();

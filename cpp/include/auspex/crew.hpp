@@ -156,6 +156,18 @@ struct CrewRun {
     bool                     active = false;
     std::string              run_id;
     std::string              task;
+    // Which faculty is working: research, plan, build, audit, land. Empty for a
+    // run written before this existed, or one that has finished.
+    //
+    // Without it the only thing a run could show was its coders, because coders
+    // were the only thing recorded -- so a crew of five read as a crew of one.
+    std::string              phase;
+    // How this run reviews. A debate is three named voices; a panel is `amplify`
+    // Auditors. Both were invisible in the run view, so a run that paid for three
+    // model calls looked exactly like one that did not.
+    bool                     debate = false;
+    int                      amplify = 0;
+    bool                     verify = false;
     std::vector<CrewSubtask> subtasks;
     // False when the file is missing or unreadable, which is different from a run
     // that has finished: one means "no crew has ever run here", the other means
@@ -193,6 +205,25 @@ struct CrewProgress {
 };
 
 CrewProgress crew_progress(const CrewRun& run);
+
+// --- who is in the crew --------------------------------------------------------
+
+// One member of the crew, for the run view.
+struct CrewMember {
+    std::string name;    // "Researcher", "Director", "Coders", "Auditor"
+    std::string detail;  // "3 running", "held 1", or empty
+    bool        working = false;   // this one is what the crew is doing now
+    bool        done    = false;   // its part of this run is over
+
+    bool operator==(const CrewMember&) const = default;
+};
+
+// The crew as members rather than as subtasks.
+//
+// Derived from the run rather than stored, so there is one source of truth and no
+// second thing to keep in step. A run with no phase recorded -- an older state
+// file -- still returns the members, just with nobody marked as working.
+std::vector<CrewMember> crew_members(const CrewRun& run);
 
 // The subtask being worked on: the first that is not done. nullopt when the plan
 // is empty or everything has finished.

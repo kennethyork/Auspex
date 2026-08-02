@@ -498,6 +498,18 @@ CrewRun parse_crew_run(const std::string& json_text) {
     if (document.contains("runId") && document["runId"].is_string()) {
         run.run_id = document["runId"].get<std::string>();
     }
+    if (document.contains("phase") && document["phase"].is_string()) {
+        run.phase = trim(document["phase"].get<std::string>());
+    }
+    if (document.contains("debate") && document["debate"].is_boolean()) {
+        run.debate = document["debate"].get<bool>();
+    }
+    if (document.contains("amplify") && document["amplify"].is_number_integer()) {
+        run.amplify = document["amplify"].get<int>();
+    }
+    if (document.contains("verify") && document["verify"].is_boolean()) {
+        run.verify = document["verify"].get<bool>();
+    }
     if (document.contains("task") && document["task"].is_string()) {
         run.task = trim(document["task"].get<std::string>());
     }
@@ -567,6 +579,100 @@ std::string crew_subtask_model_line(const CrewSubtask& subtask) {
         line += subtask.route;
     }
     return line;
+}
+
+std::vector<CrewMember> crew_members(const CrewRun& run) {
+    std::vector<CrewMember> members;
+    if (!run.known) return members;
+
+    // Counting the coders first, because three of the four rows below describe
+    // themselves in terms of them.
+    int running = 0, finished = 0, held = 0;
+    for (const auto& subtask : run.subtasks) {
+        switch (crew_lane_of(subtask)) {
+            case CrewLane::Held:  ++held; break;
+            case CrewLane::Done:  ++finished; break;
+            case CrewLane::Doing: ++running; break;
+            case CrewLane::Todo:  break;
+        }
+    }
+    const int planned = static_cast<int>(run.subtasks.size());
+
+    // The order the work happens in, which is the order it should be read in.
+    // "Coders" is one row rather than one per coder: the lanes below already show
+    // them individually, and repeating that here would be the same list twice.
+    const std::string phase = run.phase;
+    const auto reached = [&phase](std::initializer_list<const char*> earlier) {
+        // A phase is "done" once a later one has started. With no phase recorded
+        // -- an older state file -- nothing is marked, which is honest: we do not
+        // know rather than guessing that everything finished.
+        if (phase.empty()) return false;
+        for (const char* name : earlier) {
+            if (phase == name) return true;
+        }
+        return false;
+    };
+
+    CrewMember researcher{"Researcher", {}, phase == "research", false};
+    researcher.done = reached({"plan", "build", "audit", "land"});
+    if (!run.active && planned > 0) researcher.done = true;
+    members.push_back(std::move(researcher));
+
+    CrewMember director{"Director",
+                        planned > 0 ? std::to_string(planned) + " piece" +
+                                          (planned == 1 ? "" : "s")
+                                    : std::string{},
+                        phase == "plan", planned > 0};
+    members.push_back(std::move(director));
+
+    std::string coders;
+    if (running > 0) coders = std::to_string(running) + " working";
+    else if (planned > 0) coders = std::to_string(finished + held) + "/" +
+                                   std::to_string(planned) + " finished";
+    // Working when a coder IS working, not only when the phase says so.
+    //
+    // The phase is one string and the crew is not one thing: the audit of coder 1
+    // runs on its worker thread while coders 2 and 3 are still writing. Watched on
+    // a live run -- the roster showed the Auditor lit and the coders dark, with
+    // three of them visibly in the Doing lane underneath. Two members working at
+    // once is the truth, not a display bug to be tidied away.
+    members.push_back({"Coders", coders, running > 0 || phase == "build",
+                       planned > 0 && running == 0});
+
+    // WHO reviews, by name and by number.
+    //
+    // "Auditor" was one row whatever the run was doing, so a debate -- an
+    // Advocate, a Skeptic and a Judge, three model calls -- looked identical to a
+    // single reviewer, and so did a panel of five. The switch you paid for should
+    // be visible in the crew it produced.
+    const bool reviewing = phase == "audit";
+    const bool review_done = reached({"land"}) || (!run.active && planned > 0);
+
+    if (run.debate) {
+        for (const char* voice : {"Advocate", "Skeptic", "Judge"}) {
+            members.push_back({voice, {}, reviewing, review_done});
+        }
+        if (held > 0) members.back().detail = std::to_string(held) + " held";
+    } else {
+        CrewMember auditor{"Auditor", {}, reviewing, review_done};
+        if (run.amplify > 1) {
+            auditor.name = "Auditors";
+            auditor.detail = std::to_string(run.amplify) + " voting";
+        }
+        if (held > 0) {
+            auditor.detail += (auditor.detail.empty() ? "" : ", ") +
+                              std::to_string(held) + " held";
+        }
+        members.push_back(std::move(auditor));
+    }
+
+    // The tests are a member of the crew when they run: something is executing
+    // this project's suite and deciding whether the work stands.
+    if (run.verify) {
+        members.push_back({"Tests", {}, phase == "build" && running > 0, review_done});
+    }
+
+    return members;
 }
 
 CrewProgress crew_progress(const CrewRun& run) {

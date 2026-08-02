@@ -1008,12 +1008,19 @@ struct Attempt {
 };
 
 std::string encode_state(const std::string& run_id, const std::string& task,
-                         bool active, const std::vector<Attempt>& attempts) {
+                         bool active, const std::vector<Attempt>& attempts,
+                         const std::string& phase, const RunOptions* options) {
     json document;
     document["runId"]  = run_id;
     document["task"]   = task;
     document["active"] = active;
     document["ts"]     = now_stamp();
+    // WHICH FACULTY IS WORKING, not just which coder.
+    //
+    // The run view could only ever show coders, because coders were the only thing
+    // in this file. The Researcher, the Director and the Auditor all did work and
+    // none of them appeared anywhere -- a crew of five that reads as a crew of one.
+    document["phase"]  = phase;
 
     json subtasks = json::array();
     for (const auto& attempt : attempts) {
@@ -1029,6 +1036,16 @@ std::string encode_state(const std::string& run_id, const std::string& task,
         subtasks.push_back(std::move(entry));
     }
     document["subtasks"] = std::move(subtasks);
+
+    // WHO REVIEWS, and how many of them. A debate is three named voices and a
+    // panel is N Auditors; both were invisible, so a run with either read as
+    // having one reviewer -- and the switch you paid three model calls for looked
+    // exactly like the switch you did not turn on.
+    if (options) {
+        document["debate"]  = options->debate;
+        document["amplify"] = options->amplify;
+        document["verify"]  = options->verify_attempts > 0;
+    }
 
     return safe_dump(document, 2);
 }
@@ -1251,19 +1268,28 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
     std::vector<Attempt> attempts;
     std::mutex           state_mutex;
 
+    std::string phase;
     const auto publish = [&](bool active) {
         std::lock_guard lock(state_mutex);
         write_atomically(auspex_run_state_path(),
-                         encode_state(result.run_id, options.task, active, attempts));
+                         encode_state(result.run_id, options.task, active, attempts,
+                                      phase, &options));
         if (events.changed) events.changed();
+    };
+    // Sets the phase and says it in one go, so the two can never disagree -- the
+    // log line and the roster are the same fact told twice.
+    const auto enter = [&](const std::string& name, const std::string& said) {
+        phase = name;
+        note(said);
+        publish(/*active=*/true);
     };
 
     // ---- plan ----
-    note("research: reading the project");
+    enter("research", "research: reading the project");
     const std::vector<std::string> files = list_file_names(options.project);
 
     publish(/*active=*/true);
-    note("plan: the Director is deciding what the pieces are");
+    enter("plan", "plan: the Director is deciding what the pieces are");
 
     // What the index thinks is relevant, when there is one. Silent when there is
     // not: an unindexed project must still be plannable.
@@ -1453,7 +1479,7 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
         attempts.push_back({piece, {}, {}, {}, "todo"});
     }
     publish(/*active=*/true);
-    note("build: " + std::to_string(attempts.size()) + " coders");
+    enter("build", "build: " + std::to_string(attempts.size()) + " coders");
 
     if (stopped()) {
         result.error = "cancelled";
@@ -1617,6 +1643,15 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
             // Audited on the worker thread. It is another model call, and doing it
             // here means a slow audit of one piece does not hold up the coder on
             // the next.
+            {
+                // The Auditor is working. Set under the same lock everything else
+                // in this file uses; several coders reach here at once and the
+                // phase is one string.
+                std::lock_guard lock(state_mutex);
+                phase = "audit";
+            }
+            publish(true);
+
             // Which review, in order of cost. Debate is three calls; a panel is
             // `amplify` calls; the plain Auditor is one.
             if (is_cli_backend(options.auditor_backend)) {
@@ -1705,7 +1740,7 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
     // Serial, and deliberately so. Two coders that edited one file are both
     // "accepted" and only one can win; deciding that on a thread would make which
     // one depends on timing.
-    note("land: applying what the Auditor passed");
+    enter("land", "land: applying what the Auditor passed");
 
     auto board = read_board();
     int  next_number = 0;

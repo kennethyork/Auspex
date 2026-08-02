@@ -252,6 +252,16 @@ private:
     // a run reads at a glance: a list of eight rows with a word beside each one
     // makes you count, three columns makes you look.
     Gtk::Label run_heading_;
+
+    // WHO IS IN THE CREW, above the lanes.
+    //
+    // The lanes are coders and nothing else, so a crew of five read as a crew of
+    // one -- the Researcher, the Director and the Auditor all worked and none of
+    // them ever appeared. This is the row that says they exist and which of them
+    // is working now.
+    Gtk::Box   crew_row_{Gtk::Orientation::HORIZONTAL, 4};
+    std::vector<std::unique_ptr<Gtk::Widget>> crew_chips_;
+
     Gtk::Box   lanes_{Gtk::Orientation::HORIZONTAL, 10};
     struct Lane {
         Gtk::Box            column{Gtk::Orientation::VERTICAL, 4};
