@@ -380,7 +380,7 @@ Audit parse_judgement(const std::string& reply) { return parse_audit(reply); }
 
 Audit debate_changeset(const Config& config, const PlannedSubtask& subtask,
                        const Changeset& changeset, const AuditLimits& limits,
-                       const std::string& model, Debate* detail) {
+                       const DebateModels& models, Debate* detail) {
     // The certain checks still come first. A debate about whether to land a leaked
     // credential is not a debate worth having.
     if (Audit certain = deterministic_audit(changeset, limits); certain.held()) {
@@ -388,14 +388,17 @@ Audit debate_changeset(const Config& config, const PlannedSubtask& subtask,
     }
 
     OllamaClient ollama(config);
-    const std::string which = model.empty() ? config.ollama_model : model;
 
     GenerateOptions options;
     options.json = true;
     options.disable_thinking = true;
     options.temperature = 0.3;   // two reviewers that answer identically are one
 
-    const auto ask = [&](const std::string& prompt) -> std::string {
+    const auto pick = [&config](const std::string& wanted) {
+        return wanted.empty() ? config.ollama_model : wanted;
+    };
+    const auto ask = [&](const std::string& which, const std::string& prompt)
+        -> std::string {
         const auto reply = ollama.generate(which, prompt, options);
         if (!reply) return {};
         return parse_argument(reply->response.empty() ? reply->thinking
@@ -403,9 +406,9 @@ Audit debate_changeset(const Config& config, const PlannedSubtask& subtask,
     };
 
     const std::string for_it =
-        ask(advocate_prompt(subtask, changeset, limits));
+        ask(pick(models.advocate), advocate_prompt(subtask, changeset, limits));
     const std::string against =
-        ask(skeptic_prompt(subtask, changeset, limits));
+        ask(pick(models.skeptic), skeptic_prompt(subtask, changeset, limits));
 
     if (for_it.empty() && against.empty()) {
         Audit unreachable;
@@ -416,7 +419,8 @@ Audit debate_changeset(const Config& config, const PlannedSubtask& subtask,
     GenerateOptions judging = options;
     judging.temperature = 0.1;   // deciding is not where variety helps
 
-    const auto verdict = ollama.generate(which, judge_prompt(subtask, for_it, against),
+    const auto verdict = ollama.generate(pick(models.judge),
+                                         judge_prompt(subtask, for_it, against),
                                          judging);
     if (!verdict) {
         Audit unreachable;

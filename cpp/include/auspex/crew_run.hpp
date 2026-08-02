@@ -21,6 +21,7 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <optional>
 #include <filesystem>
 #include <functional>
@@ -121,6 +122,14 @@ struct RunOptions {
 
     std::string director_backend = "ollama";
     std::string auditor_backend  = "ollama";
+
+    // Everything else, by role key. Kept as maps rather than a field each so a new
+    // role is a row in one table instead of an edit in five files.
+    std::map<std::string, std::string> role_models;
+    std::map<std::string, std::string> role_backends;
+
+    // The backend for a role, after its fallback chain.
+    std::string backend_for(const std::string& role) const;
 
     // One backend per coder, round-robin, so a plan of three can run on three
     // different providers at once. Empty falls back to coder_backend for all of
@@ -283,6 +292,28 @@ struct CrewPack {
 
 std::vector<CrewPack> builtin_packs();
 std::optional<CrewPack> find_pack(const std::string& name);
+
+// --- the roles you can point at a model ----------------------------------------
+//
+// Not every faculty takes one. The secret gate is a regex, the overlap guard is a
+// set comparison, landing is a file copy -- giving those a model picker would be
+// offering a choice that does nothing. These are the ones where a model really is
+// called, and each can have its own.
+//
+// The three debate voices are separate on purpose. A debate where the advocate and
+// the skeptic are the same model is one model arguing with itself, which produces
+// agreement rather than scrutiny -- the point of an adversarial review is that the
+// two sides do not share a blind spot.
+
+struct CrewRole {
+    std::string key;
+    std::string label;      // for the Brain
+    std::string hint;       // what this one does, one line
+    std::string fallback;   // whose setting it borrows when unset; empty = the
+                            // config's ollama_model
+};
+
+const std::vector<CrewRole>& configurable_roles();
 
 // --- what the crew is made of -------------------------------------------------
 //

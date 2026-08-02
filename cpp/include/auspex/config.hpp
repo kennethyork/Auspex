@@ -7,6 +7,7 @@
 #pragma once
 
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -50,10 +51,14 @@ struct Config {
     // src/calc.py instead of editing calc.py. Reviewing is the hardest of the three
     // roles and the one where being wrong is most expensive -- a bad Auditor either
     // holds everything, which makes the crew pointless, or lands something broken.
-    std::string crew_researcher_model;
-    std::string crew_director_model;
-    std::string crew_coder_model;
-    std::string crew_auditor_model;
+    // Per-role model and agent, keyed by role. A map rather than a field each so
+    // adding a role is a row in one table rather than an edit in five files.
+    //
+    // Keys are configurable_roles() in crew_run.hpp: researcher, director, coder,
+    // auditor, advocate, skeptic, judge, security. Read from config.json as
+    // crew_<role>_model and crew_<role>_backend.
+    std::map<std::string, std::string> crew_role_models;
+    std::map<std::string, std::string> crew_role_backends;
 
     // WHICH AGENT does each role, not just which model. "ollama" (or empty) is
     // Auspex's own loop; any agent CLI id hands the role to that tool.
@@ -61,10 +66,7 @@ struct Config {
     // This is a bigger lever than the model names above it: a role on claude or
     // codex is running whatever frontier model its owner configured, while a role
     // on ollama is capped at what Ollama serves.
-    std::string crew_researcher_backend;
-    std::string crew_director_backend;
-    std::string crew_coder_backend;
-    std::string crew_auditor_backend;
+
     std::string ollama_endpoint  = "http://127.0.0.1:11434";
     std::string whisper_endpoint = "http://127.0.0.1:5000/transcribe";
     int         sample_rate      = 16000;

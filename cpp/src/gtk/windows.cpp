@@ -933,18 +933,21 @@ void CrewWindow::start() {
     options.security = security_.get_active();
     if (amplify_.get_value_as_int() > 0) options.amplify = amplify_.get_value_as_int();
 
-    options.researcher_backend = config.crew_researcher_backend.empty()
-                                     ? "ollama" : config.crew_researcher_backend;
-    options.researcher_model   = config.crew_researcher_model;
-    options.director_backend = config.crew_director_backend.empty()
-                                   ? "ollama" : config.crew_director_backend;
-    options.coder_backend    = config.crew_coder_backend.empty()
-                                   ? "ollama" : config.crew_coder_backend;
-    options.auditor_backend  = config.crew_auditor_backend.empty()
-                                   ? "ollama" : config.crew_auditor_backend;
-    options.director_model = config.crew_director_model;
-    options.coder_model    = config.crew_coder_model;
-    options.auditor_model  = config.crew_auditor_model;
+    // Straight across, whatever roles exist. The engine's fallback chain does the
+    // rest, so a role left unset borrows from whatever it falls back to.
+    options.role_models   = config.crew_role_models;
+    options.role_backends = config.crew_role_backends;
+
+    const auto backend_of = [&config](const char* role) {
+        const auto found = config.crew_role_backends.find(role);
+        return (found == config.crew_role_backends.end() || found->second.empty())
+                   ? std::string("ollama")
+                   : found->second;
+    };
+    options.researcher_backend = backend_of("researcher");
+    options.director_backend   = backend_of("director");
+    options.coder_backend      = backend_of("coder");
+    options.auditor_backend    = backend_of("auditor");
 
     // A previous thread must be reaped before another starts, or two runs write
     // one state file.
@@ -1540,7 +1543,7 @@ void TeamWindow::launch() {
 BrainWindow::BrainWindow() {
     set_title("Auspex Brain");
     add_css_class("auspex-window");
-    set_default_size(640, 720);
+    set_default_size(700, 860);
     set_hide_on_close(true);
 
     heading_.set_markup("<b>The crew's brain</b> — what it is made of, and which "
@@ -1552,26 +1555,23 @@ BrainWindow::BrainWindow() {
     roles_.set_row_spacing(8);
     roles_.set_column_spacing(12);
 
-    static const std::vector<std::pair<const char*, const char*>> kRoles{
-        // The Researcher runs FIRST, so it is listed first: the order on screen is
-        // the order of the run.
-        {"researcher", "Researcher — reads"},
-        {"director", "Director — plans"},
-        {"coder",    "Coders — build"},
-        {"auditor",  "Auditor — reviews"},
-    };
-
+    // From the engine's own table, so a role added there appears here with no edit.
+    // Order is the order of the run.
     int row = 0;
-    for (const auto& [key, caption] : kRoles) {
+    for (const auto& role : configurable_roles()) {
         auto entry = std::make_unique<RoleRow>();
-        entry->key = key;
-        entry->label.set_text(caption);
+        entry->key = role.key;
+        entry->label.set_text(role.label);
+        entry->label.set_tooltip_text(
+            role.hint + (role.fallback.empty()
+                             ? ""
+                             : "  ·  unset follows the " + role.fallback));
         entry->label.set_xalign(0.0f);
         entry->models.set_hexpand(true);
 
         // The Auditor is the one worth setting, and the tooltip says why rather
         // than leaving it to be discovered the hard way.
-        if (std::string(key) == "auditor") {
+        if (role.key == "auditor") {
             entry->models.set_tooltip_text(
                 "The one worth changing. A small model here holds correct work with "
                 "confident wrong reasons, which makes the whole crew pointless.");
@@ -1661,11 +1661,10 @@ void BrainWindow::reload() {
             entry->backends.set_model(Gtk::StringList::create(labels));
         }
 
+        const auto found_backend = config.crew_role_backends.find(entry->key);
         const std::string chosen_backend =
-            entry->key == "researcher" ? config.crew_researcher_backend
-            : entry->key == "director" ? config.crew_director_backend
-            : entry->key == "coder"    ? config.crew_coder_backend
-                                       : config.crew_auditor_backend;
+            found_backend == config.crew_role_backends.end() ? std::string{}
+                                                             : found_backend->second;
         guint backend_index = 0;
         for (std::size_t i = 0; i < backends_.size(); ++i) {
             if (backends_[i] == chosen_backend) {
@@ -1678,16 +1677,22 @@ void BrainWindow::reload() {
     for (auto& entry : rows_) {
         // "Default" first, so a role can be put back to following ollama_model
         // without having to know what that is.
+        std::string follows = config.ollama_model;
+        for (const auto& role : configurable_roles()) {
+            if (role.key == entry->key && !role.fallback.empty()) {
+                follows = "the " + role.fallback;
+                break;
+            }
+        }
         std::vector<Glib::ustring> labels;
-        labels.emplace_back("Default (" + config.ollama_model + ")");
+        labels.emplace_back("Default (" + follows + ")");
         for (const auto& model : models_) labels.emplace_back(model);
         entry->models.set_model(Gtk::StringList::create(labels));
 
+        const auto found_model = config.crew_role_models.find(entry->key);
         const std::string current =
-            entry->key == "researcher" ? config.crew_researcher_model
-            : entry->key == "director" ? config.crew_director_model
-            : entry->key == "coder"    ? config.crew_coder_model
-                                       : config.crew_auditor_model;
+            found_model == config.crew_role_models.end() ? std::string{}
+                                                         : found_model->second;
 
         guint selected = 0;
         for (std::size_t i = 0; i < models_.size(); ++i) {

@@ -104,14 +104,28 @@ Config Config::load(const fs::path& path) {
             if (!id.empty()) cfg.pinned.push_back(std::move(id));
         }
     }
-    assign_if(j, "crew_researcher_backend", cfg.crew_researcher_backend);
-    assign_if(j, "crew_researcher_model",   cfg.crew_researcher_model);
-    assign_if(j, "crew_director_backend", cfg.crew_director_backend);
-    assign_if(j, "crew_coder_backend",    cfg.crew_coder_backend);
-    assign_if(j, "crew_auditor_backend",  cfg.crew_auditor_backend);
-    assign_if(j, "crew_director_model", cfg.crew_director_model);
-    assign_if(j, "crew_coder_model",    cfg.crew_coder_model);
-    assign_if(j, "crew_auditor_model",  cfg.crew_auditor_model);
+    // Every crew_<role>_model / crew_<role>_backend key, whatever the role is
+    // called. Read generically so the config and configurable_roles() cannot drift
+    // apart -- a role added to that table needs no change here at all.
+    for (const auto& [key, value] : j.items()) {
+        if (!value.is_string()) continue;
+        const std::string text = value.get<std::string>();
+        if (key.rfind("crew_", 0) != 0) continue;
+
+        constexpr std::string_view kModel   = "_model";
+        constexpr std::string_view kBackend = "_backend";
+        const auto ends_with = [&key](std::string_view suffix) {
+            return key.size() > suffix.size() &&
+                   key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+
+        if (ends_with(kModel)) {
+            cfg.crew_role_models[key.substr(5, key.size() - 5 - kModel.size())] = text;
+        } else if (ends_with(kBackend)) {
+            cfg.crew_role_backends[key.substr(5, key.size() - 5 - kBackend.size())] =
+                text;
+        }
+    }
     assign_if(j, "terminal",          cfg.terminal);
     assign_if(j, "launcher",          cfg.launcher);
     assign_if(j, "background",        cfg.background);

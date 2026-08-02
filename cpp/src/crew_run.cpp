@@ -175,6 +175,46 @@ Changeset load_changeset(const std::filesystem::path& dir) {
 }
 
 // ---------------------------------------------------------------------------
+const std::vector<CrewRole>& configurable_roles() {
+    static const std::vector<CrewRole> kRoles{
+        {"researcher", "Researcher", "reads the project before anything is planned", ""},
+        {"director",   "Director",   "decomposes the task into pieces", ""},
+        {"coder",      "Coders",     "build in parallel sandboxes", ""},
+        {"auditor",    "Auditor",    "reviews every changeset", ""},
+        // The debate voices fall back to the Auditor, because that is the job they
+        // are doing -- an unset advocate should review like the Auditor does, not
+        // like whatever the chat model happens to be.
+        {"advocate",   "Advocate",   "argues for landing a change", "auditor"},
+        {"skeptic",    "Skeptic",    "argues against landing it", "auditor"},
+        {"judge",      "Judge",      "rules on the two arguments", "auditor"},
+        {"security",   "Security",   "hunts vulnerabilities, read-only", "auditor"},
+    };
+    return kRoles;
+}
+
+std::string RunOptions::backend_for(const std::string& role) const {
+    // The role's own setting, then whatever it falls back to, then the run-wide
+    // one. Walked rather than hard-coded so a new role needs no new branch.
+    std::string key = role;
+    for (int hop = 0; hop < 4 && !key.empty(); ++hop) {
+        if (const auto found = role_backends.find(key);
+            found != role_backends.end() && !found->second.empty()) {
+            return found->second;
+        }
+        if (key == "director") return director_backend;
+        if (key == "auditor")  return auditor_backend;
+        if (key == "coder")    return coder_backend;
+        if (key == "researcher") return researcher_backend;
+
+        std::string next;
+        for (const auto& entry : configurable_roles()) {
+            if (entry.key == key) { next = entry.fallback; break; }
+        }
+        key = next;
+    }
+    return "ollama";
+}
+
 std::string RunOptions::backend_for_coder(int n) const {
     if (coder_backends.empty()) return coder_backend;
     // Round-robin, 1-based. A list shorter than the plan repeats rather than
@@ -186,11 +226,26 @@ std::string RunOptions::backend_for_coder(int n) const {
 }
 
 std::string RunOptions::model_for(const std::string& role) const {
-    // Role first, then the run-wide model, then (by returning empty) the config's.
-    if (role == "researcher" && !researcher_model.empty()) return researcher_model;
-    if (role == "director" && !director_model.empty()) return director_model;
-    if (role == "auditor"  && !auditor_model.empty())  return auditor_model;
-    if (role == "coder"    && !coder_model.empty())    return coder_model;
+    // The role's own setting, then whatever it falls back to, then the run-wide
+    // model, then (by returning empty) the config's. Walked rather than
+    // hard-coded, so adding a role is a row in one table.
+    std::string key = role;
+    for (int hop = 0; hop < 4 && !key.empty(); ++hop) {
+        if (const auto found = role_models.find(key);
+            found != role_models.end() && !found->second.empty()) {
+            return found->second;
+        }
+        if (key == "researcher" && !researcher_model.empty()) return researcher_model;
+        if (key == "director"   && !director_model.empty())   return director_model;
+        if (key == "auditor"    && !auditor_model.empty())    return auditor_model;
+        if (key == "coder"      && !coder_model.empty())      return coder_model;
+
+        std::string next;
+        for (const auto& entry : configurable_roles()) {
+            if (entry.key == key) { next = entry.fallback; break; }
+        }
+        key = next;
+    }
     return model;
 }
 
@@ -396,7 +451,7 @@ RunResult scan_security(const Config& config, const RunOptions& options,
     generate.disable_thinking = true;
     generate.temperature = 0.1;
 
-    const std::string model = options.model_for("auditor");
+    const std::string model = options.model_for("security");
     std::vector<Finding> findings;
     int done = 0;
 
@@ -883,7 +938,14 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
         // half-finished, not less, so skipping the review here would be exactly
         // backwards.
         attempt.audit = audit_changeset(config, attempt.subtask, attempt.changeset,
-                                        AuditLimits{}, config.crew_auditor_model);
+                                        AuditLimits{}, [&config] {
+                                            const auto found =
+                                                config.crew_role_models.find("auditor");
+                                            return found ==
+                                                           config.crew_role_models.end()
+                                                       ? std::string{}
+                                                       : found->second;
+                                        }());
 
         land_or_hold(result.run_id, project, attempt, landed, board, next_number,
                      result, note);
@@ -1170,9 +1232,15 @@ RunResult run_crew(const Config& config, const RunOptions& options,
                     }
                 }
             } else if (options.debate) {
+                // Three voices, three settings. A debate whose advocate and
+                // skeptic are the same model is one model arguing with itself.
+                DebateModels voices;
+                voices.advocate = options.model_for("advocate");
+                voices.skeptic  = options.model_for("skeptic");
+                voices.judge    = options.model_for("judge");
                 attempt.audit = debate_changeset(config, attempt.subtask,
                                                  attempt.changeset, options.audit,
-                                                 options.model_for("auditor"));
+                                                 voices);
             } else if (options.amplify > 1) {
                 attempt.audit = audit_panel(config, attempt.subtask, attempt.changeset,
                                             options.amplify, options.audit,

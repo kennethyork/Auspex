@@ -5775,6 +5775,68 @@ void test_crew_run() {
         std::filesystem::remove_all(root, ec);
     }
 
+    // ---- a model per role, with fallbacks ----
+    //
+    // The chain is what makes eight pickers usable: set the Auditor and the three
+    // debate voices follow it, because that is the job they are doing. Set one of
+    // them and only that one changes.
+    {
+        check(!configurable_roles().empty(), "there are roles to configure");
+
+        const auto find = [](const std::string& key) -> const CrewRole* {
+            for (const auto& r : configurable_roles()) if (r.key == key) return &r;
+            return nullptr;
+        };
+        check(find("researcher") && find("director") && find("coder") &&
+                  find("auditor"),
+              "the four that run every time");
+        check(find("advocate") && find("skeptic") && find("judge"),
+              "the three debate voices, separately");
+        check(find("security"), "and the security scanner");
+
+        // The voices fall back to the Auditor, not to the chat model: an unset
+        // advocate should review like the Auditor does.
+        check(find("advocate") && find("advocate")->fallback == "auditor",
+              "an unset advocate follows the Auditor");
+        check(find("director") && find("director")->fallback.empty(),
+              "and the Director follows nothing but the default");
+
+        RunOptions options;
+        options.model = "run-wide";
+        check_eq(options.model_for("advocate"), std::string("run-wide"),
+                 "unset everywhere, a role uses the run-wide model");
+
+        options.role_models["auditor"] = "big-model";
+        check_eq(options.model_for("auditor"), std::string("big-model"),
+                 "the Auditor takes its own");
+        check_eq(options.model_for("advocate"), std::string("big-model"),
+                 "and the advocate follows it without being set");
+        check_eq(options.model_for("skeptic"), std::string("big-model"),
+                 "and the skeptic");
+        check_eq(options.model_for("coder"), std::string("run-wide"),
+                 "but the coder does NOT -- it falls back elsewhere");
+
+        options.role_models["skeptic"] = "other-model";
+        check_eq(options.model_for("skeptic"), std::string("other-model"),
+                 "setting one voice changes only that voice");
+        check_eq(options.model_for("advocate"), std::string("big-model"),
+                 "the others still follow the Auditor");
+
+        // The same chain for backends, so a debate can genuinely be adversarial:
+        // an advocate and a skeptic on one model is one model arguing with itself.
+        RunOptions agents;
+        agents.auditor_backend = "claude";
+        check_eq(agents.backend_for("judge"), std::string("claude"),
+                 "the judge follows the Auditor's agent");
+        agents.role_backends["skeptic"] = "codex";
+        check_eq(agents.backend_for("skeptic"), std::string("codex"),
+                 "and a voice can be pointed at a different one");
+        check_eq(agents.backend_for("advocate"), std::string("claude"),
+                 "without moving the others");
+        check_eq(agents.backend_for("coder"), std::string("ollama"),
+                 "an unset role ends at ollama rather than nowhere");
+    }
+
     // ---- one backend per coder ----
     //
     // The difference between "several coders" and several DIFFERENT coders: two

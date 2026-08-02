@@ -147,11 +147,23 @@ std::string parse_argument(const std::string& reply);
 // rule as parse_audit -- anything unclear holds.
 Audit parse_judgement(const std::string& reply);
 
+// One model per voice. Empty falls back to the config's.
+//
+// Separate because a debate whose advocate and skeptic are the same model is one
+// model arguing with itself, which produces agreement rather than scrutiny. Two
+// different models do not share a blind spot, and that is the entire value of an
+// adversarial review over a second opinion.
+struct DebateModels {
+    std::string advocate;
+    std::string skeptic;
+    std::string judge;
+};
+
 // advocate -> skeptic -> judge. Three model calls, so three times the cost of one
 // Auditor; that is the trade and it is why it is opt-in.
 Audit debate_changeset(const Config& config, const PlannedSubtask& subtask,
                        const Changeset& changeset, const AuditLimits& limits = {},
-                       const std::string& model = {}, Debate* detail = nullptr);
+                       const DebateModels& models = {}, Debate* detail = nullptr);
 
 // `voters` independent Auditors, majority rules, TIES HOLD.
 //
