@@ -73,6 +73,14 @@ struct Config {
     // It matters more than it looks: run past the window and the model does not
     // fail, it FORGETS, and a coder whose subtask has scrolled out of view looks
     // exactly like a stupid model.
+    // How opaque Auspex's own windows are, 0.0 to 1.0.
+    //
+    // The window BACKGROUND only -- text and controls stay fully opaque, because
+    // fading a whole window fades what you are trying to read. Needs a compositor;
+    // without one X simply ignores the alpha and you get a solid window, which is
+    // the right way for this to fail.
+    double      window_opacity = 0.95;
+
     int         num_ctx = 0;
 
     // Where web_search() sends its query. %q is replaced with the encoded query.

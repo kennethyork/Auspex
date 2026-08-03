@@ -48,6 +48,8 @@ const Palette& theme_by_name(std::string_view name);
 // _generate_css(), including the libadwaita-specific ones (preferencespage,
 // preferencesgroup, actionrow, .navigationview) that have no C++ bindings and so
 // can only be reached through CSS.
-std::string generate_css(const Palette& palette);
+// `window_opacity` is how opaque Auspex's own windows are: the BACKGROUND only,
+// so text and controls stay readable. 1.0 is solid.
+std::string generate_css(const Palette& palette, double window_opacity = 0.95);
 
 }  // namespace auspex

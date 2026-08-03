@@ -1,4 +1,6 @@
 #include "auspex/theme.hpp"
+#include <algorithm>
+#include <sstream>
 
 #include <unordered_map>
 
@@ -73,14 +75,16 @@ window,
  * Requires a compositor. Without one the alpha is ignored and the panels are
  * simply opaque, which is a fine thing to degrade to.
  *
- * 0.95 is not a taste call: it is xfce4-panel's own default background-alpha of
- * 95, so the bars sit at the same weight as the panel they replace instead of
- * announcing themselves as something new. */
+ * The default 0.95 is not a taste call: it is xfce4-panel's own default
+ * background-alpha of 95, so the bars sit at the same weight as the panel they
+ * replace instead of announcing themselves as something new. window_opacity in
+ * config.json changes it, and changes it for the windows too -- one number for
+ * the whole shell. */
 window.auspex-panel,
 window.auspex-panel > box,
 window.auspex-panel box,
 window.auspex-panel .background {
-    background-color: alpha($panel_bg, 0.95);
+    background-color: alpha($panel_bg, $window_opacity);
 }
 
 /* Auspex's own windows -- launcher, chat, settings, board -- sit at the same
@@ -97,15 +101,16 @@ window.auspex-panel .background {
  * scrolledwindow and viewport are named because GTK paints them itself; without
  * them a scrolling list would be an opaque rectangle inside a glass window.
  *
- * Same 0.95 as the panels, and for the same reason -- one number for the whole
- * shell means these windows never look like they belong to a different program. */
+ * The SAME number as the panels, and for the same reason -- one setting for the
+ * whole shell means these windows never look like they belong to a different
+ * program. */
 window.auspex-window,
 window.auspex-window > box,
 window.auspex-window box,
 window.auspex-window scrolledwindow,
 window.auspex-window viewport,
 window.auspex-window .background {
-    background-color: alpha($panel_bg, 0.95);
+    background-color: alpha($panel_bg, $window_opacity);
 }
 
 box {
@@ -660,8 +665,16 @@ const Palette& theme_by_name(std::string_view name) {
     return kPlain;
 }
 
-std::string generate_css(const Palette& palette) {
+std::string generate_css(const Palette& palette, double window_opacity) {
+    // Formatted once, here, so the template can spell it $window_opacity like any
+    // colour rather than needing a second substitution pass.
+    std::ostringstream alpha;
+    alpha.precision(2);
+    alpha << std::fixed << std::clamp(window_opacity, 0.25, 1.0);
+    const std::string opacity = alpha.str();
+
     const std::unordered_map<std::string_view, std::string_view> vars{
+        {"window_opacity", opacity},
         {"panel_bg", palette.panel_bg},
         {"panel_fg", palette.panel_fg},
         {"button_bg", palette.button_bg},

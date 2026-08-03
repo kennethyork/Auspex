@@ -45,7 +45,10 @@ std::string ThemeManager::read_theme_name() const {
 }
 
 void ThemeManager::apply(const Palette& palette) {
-    const std::string css = generate_css(palette);
+    // Re-read with the palette, so changing window_opacity in config.json takes
+    // effect on the same reload that a theme change does.
+    const std::string css =
+        generate_css(palette, Config::load(config_path_).window_opacity);
     try {
         provider_->load_from_data(css);
     } catch (const Glib::Error& e) {

@@ -1,5 +1,7 @@
 #include "auspex/config.hpp"
 
+#include <algorithm>
+
 #include "auspex/process.hpp"
 
 #include <cstdlib>
@@ -89,6 +91,10 @@ Config Config::load(const fs::path& path) {
 
     assign_if(j, "panel_height",      cfg.panel_height);
     assign_if(j, "num_ctx",           cfg.num_ctx);
+    assign_if(j, "window_opacity",    cfg.window_opacity);
+    // Clamped, because 0.0 is an invisible window somebody then cannot find to
+    // fix, and above 1.0 is meaningless.
+    cfg.window_opacity = std::clamp(cfg.window_opacity, 0.25, 1.0);
     assign_if(j, "search_endpoint",   cfg.search_endpoint);
     assign_if(j, "workspace_count",   cfg.workspace_count);
     assign_if(j, "enable_effects",    cfg.enable_effects);
