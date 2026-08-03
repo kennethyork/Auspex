@@ -104,8 +104,15 @@ void WorkspaceSwitcher::poll() {
 // ---------------------------------------------------------------------------
 // WindowList
 // ---------------------------------------------------------------------------
+WindowList::~WindowList() {
+    // Quitting Auspex must not leave your other applications translucent with
+    // nothing on screen left to explain why.
+    glass_.restore_all();
+}
+
 WindowList::WindowList() : Gtk::Box(Gtk::Orientation::HORIZONTAL, 1) {
     set_hexpand(true);
+    screen_opacity_ = Config::load().screen_opacity;
 
     menu_.set_parent(*this);
     menu_.set_child(menu_box_);
@@ -187,7 +194,46 @@ void WindowList::show_window_menu(const std::string& window_id, Gtk::Widget& anc
     menu_.popup();
 }
 
+void ScreenGlass::apply(const Rect& screen, double opacity) {
+    if (opacity >= 1.0) {
+        restore_all();
+        return;
+    }
+
+    // Auspex's own windows are SKIPPED. They are already translucent by
+    // stylesheet, where only the background goes glass and the text stays solid;
+    // this on top would dim them twice and fade their own text for nothing.
+    std::vector<PlacedWindow> theirs;
+    for (auto& placed : list_placed_windows()) {
+        // CONTAINS, not starts-with. wmctrl prefixes every title with the host
+        // name, so "Auspex Desktop" arrives as
+        // "kennethhy-B450-... Auspex Desktop" and a starts-with test skipped
+        // nothing -- Auspex dimmed its own wallpaper substrate on the first run.
+        if (placed.window.title.find("Auspex") != std::string::npos) {
+            // Clear anything a previous run left on our own windows. Once, not
+            // every tick: this is a subprocess each.
+            if (!healed_) set_window_opacity(placed.window.id, 1.0);
+            continue;
+        }
+        theirs.push_back(std::move(placed));
+    }
+    healed_ = true;
+    apply_screen_opacity(screen, opacity, theirs, dimmed_);
+}
+
+void ScreenGlass::restore_all() {
+    for (const auto& id : dimmed_) set_window_opacity(id, 1.0);
+    dimmed_.clear();
+}
+
 void WindowList::poll() {
+    // Windows on this monitor go translucent; windows that have LEFT it are
+    // restored. Both directions, so dragging a window to another screen makes it
+    // opaque there rather than carrying the effect around the desk.
+    if (const auto monitor = primary_monitor()) {
+        glass_.apply(monitor->bounds, screen_opacity_);
+    }
+
     const auto windows = list_user_windows();
 
     // Two calls for the whole list rather than two per window.

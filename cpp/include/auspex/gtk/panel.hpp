@@ -62,9 +62,36 @@ private:
 };
 
 // One button per user window, kept in sync with wmctrl -l.
+// Windows on the panel's monitor, made translucent.
+//
+// Lives with the window list because that is the thing already polling for
+// windows -- a second timer walking the same list would be the same work twice
+// and could disagree with the first about what exists.
+class ScreenGlass {
+public:
+    // `opacity` of 1.0 turns it off and restores anything already dimmed.
+    void apply(const Rect& screen, double opacity);
+
+    // Restore everything. Called when the panel goes away, so quitting Auspex
+    // does not leave your other applications translucent with nothing on screen
+    // to explain why.
+    void restore_all();
+
+private:
+    std::set<std::string> dimmed_;
+    // Auspex's own windows are cleared ONCE at startup.
+    //
+    // A previous run can have left the property on them -- an earlier version of
+    // this dimmed its own wallpaper substrate -- and a fresh process restores only
+    // what is in its own set, which starts empty. Clearing them is safe precisely
+    // because we never set it on them: there is nothing of the user's to undo.
+    bool healed_ = false;
+};
+
 class WindowList : public Gtk::Box {
 public:
     WindowList();
+    ~WindowList() override;
 
     void set_restore_handler(sigc::slot<void(const std::string&)> handler) {
         on_restore_ = std::move(handler);
@@ -74,6 +101,12 @@ public:
     }
 
 private:
+    // The panel's monitor, made translucent. Driven from poll() because that is
+    // already walking the window list every second -- a second timer would do the
+    // same work twice and could disagree about what exists.
+    ScreenGlass glass_;
+    double      screen_opacity_ = 1.0;
+
     void poll();
 
     // Clicking a task button does what xfce4-panel's does: it toggles. Clicking the

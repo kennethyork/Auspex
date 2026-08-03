@@ -45,10 +45,10 @@ std::string ThemeManager::read_theme_name() const {
 }
 
 void ThemeManager::apply(const Palette& palette) {
-    // Re-read with the palette, so changing window_opacity in config.json takes
-    // effect on the same reload that a theme change does.
-    const std::string css =
-        generate_css(palette, Config::load(config_path_).window_opacity);
+    // Read here as well as in reload(), because the constructor calls apply()
+    // directly and would otherwise start at the compiled default.
+    window_opacity_ = Config::load(config_path_).window_opacity;
+    const std::string css = generate_css(palette, window_opacity_);
     try {
         provider_->load_from_data(css);
     } catch (const Glib::Error& e) {
@@ -60,8 +60,16 @@ void ThemeManager::apply(const Palette& palette) {
 
 void ThemeManager::reload() {
     const std::string name = read_theme_name();
-    if (name == theme_name_) return;
+    const double opacity = Config::load(config_path_).window_opacity;
+
+    // EITHER can have changed. This used to compare the theme name alone, so
+    // editing window_opacity did nothing until the next theme change -- and a
+    // setting that takes effect at some unrelated later moment is one you conclude
+    // is broken.
+    if (name == theme_name_ && opacity == window_opacity_) return;
+
     theme_name_ = name;
+    window_opacity_ = opacity;
     apply(theme_by_name(theme_name_));
 }
 

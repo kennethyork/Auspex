@@ -26,6 +26,7 @@
 #include <optional>
 
 #include "auspex/panel_dock.hpp"
+#include <set>
 #include <string>
 #include <vector>
 
@@ -189,6 +190,44 @@ std::optional<std::string> focused_window_id();
 
 // Every top-level window and its geometry, in one round trip.
 std::vector<PlacedWindow> list_placed_windows();
+
+// --- making other people's windows translucent ---------------------------------
+//
+// _NET_WM_WINDOW_OPACITY is the one mechanism that works on a window belonging to
+// another program, live, without asking it to restart or reload anything. The
+// compositor reads it and blends. xfce4-terminal's own setting needs its process
+// restarted; this does not.
+//
+// WHOLE-WINDOW, so the text dims with the background. That is the trade for it
+// working at all on a program Auspex does not own -- there is no way to reach
+// inside somebody else's window and translucent only the parts behind their text.
+//
+// OPT-IN AND OFF BY DEFAULT. This reaches outside Auspex and changes how other
+// applications look. A shell that quietly restyled every window on the machine
+// would be one you could not reason about, so it happens only when asked and only
+// on the monitor Auspex's own panel is docked to.
+
+// Set one window's opacity, 0.0-1.0. 1.0 REMOVES the property rather than setting
+// it to opaque, so a window Auspex stops managing goes back to whatever it was
+// rather than being pinned to fully opaque by us forever.
+bool set_window_opacity(std::string_view window_id, double opacity);
+
+// Apply `opacity` to every window whose centre is inside `screen`, and RESTORE
+// every window that has left it.
+//
+// Both directions, which is the whole point: drag a window to another monitor and
+// it goes back to being opaque there. Without the restore half, a window would
+// carry the panel monitor's translucency around the desk with it forever.
+//
+// The centre decides which monitor a window is on. Overlap would dim a window
+// because one corner of it crossed the boundary.
+//
+// `dimmed` is the set of window ids currently carrying our property, and it is
+// updated in place. It exists so this can be called on a timer without spawning
+// an xprop per window per tick: only windows that need CHANGING are touched.
+int apply_screen_opacity(const Rect& screen, double opacity,
+                         const std::vector<PlacedWindow>& windows,
+                         std::set<std::string>& dimmed);
 
 // Upstream skipped any title containing "MAGI" or "Desktop" to keep the panel out
 // of its own window list. "Desktop" is too broad -- it also hides a user window

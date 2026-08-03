@@ -48,6 +48,11 @@ private:
     Glib::RefPtr<Gtk::CssProvider> provider_;
     std::filesystem::path          config_path_;
     std::string                    theme_name_;
+    // Watched alongside the theme name. Without it, reload() returned early
+    // whenever the name was unchanged and an opacity edit did nothing at all --
+    // the setting only took effect on the next theme change or restart, which is
+    // a setting that appears not to work.
+    double                         window_opacity_ = -1.0;
     std::filesystem::file_time_type last_mtime_{};
 };
 

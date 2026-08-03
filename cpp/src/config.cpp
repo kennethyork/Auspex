@@ -92,9 +92,12 @@ Config Config::load(const fs::path& path) {
     assign_if(j, "panel_height",      cfg.panel_height);
     assign_if(j, "num_ctx",           cfg.num_ctx);
     assign_if(j, "window_opacity",    cfg.window_opacity);
+    assign_if(j, "screen_opacity",    cfg.screen_opacity);
     // Clamped, because 0.0 is an invisible window somebody then cannot find to
     // fix, and above 1.0 is meaningless.
     cfg.window_opacity = std::clamp(cfg.window_opacity, 0.25, 1.0);
+    // 0.1 floor: a window at 0 is one you cannot find in order to undo this.
+    cfg.screen_opacity = std::clamp(cfg.screen_opacity, 0.1, 1.0);
     assign_if(j, "search_endpoint",   cfg.search_endpoint);
     assign_if(j, "workspace_count",   cfg.workspace_count);
     assign_if(j, "enable_effects",    cfg.enable_effects);

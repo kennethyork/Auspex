@@ -1,5 +1,8 @@
 #include "auspex/desktop.hpp"
 
+#include <algorithm>
+#include <set>
+
 #include <charconv>
 #include <cstdio>
 #include <chrono>
@@ -180,6 +183,70 @@ std::vector<PlacedWindow> parse_placed_windows(const std::string& output) {
     }
 
     return result;
+}
+
+bool set_window_opacity(std::string_view window_id, double opacity) {
+    const std::string id = canonical_window_id(window_id);
+    if (id.empty()) return false;
+
+    // 1.0 REMOVES the property rather than writing "fully opaque". A window we
+    // stop managing should go back to whatever it was, not be pinned opaque by us
+    // for the rest of its life -- including after Auspex has exited.
+    if (opacity >= 1.0) {
+        return run({"xprop", "-id", id, "-remove", "_NET_WM_WINDOW_OPACITY"},
+                   /*capture=*/false)
+            .ok;
+    }
+
+    const double clamped = std::clamp(opacity, 0.1, 1.0);
+    // A CARDINAL scaled to 32 bits, which is what the spec says and what every
+    // compositor reads. 0.1 is the floor because a window at 0 is one you cannot
+    // find in order to undo this.
+    const auto value = static_cast<unsigned long>(clamped * 0xFFFFFFFFul);
+
+    return run({"xprop", "-id", id, "-f", "_NET_WM_WINDOW_OPACITY", "32c", "-set",
+                "_NET_WM_WINDOW_OPACITY", std::to_string(value)},
+               /*capture=*/false)
+        .ok;
+}
+
+int apply_screen_opacity(const Rect& screen, double opacity,
+                         const std::vector<PlacedWindow>& windows,
+                         std::set<std::string>& dimmed) {
+    int changed = 0;
+
+    std::set<std::string> should_be_dim;
+    for (const auto& placed : windows) {
+        // The CENTRE decides which monitor a window is on. Overlap would dim a
+        // window because one corner of it crossed the boundary.
+        const int cx = placed.bounds.x + placed.bounds.width / 2;
+        const int cy = placed.bounds.y + placed.bounds.height / 2;
+        if (cx < screen.x || cx >= screen.x + screen.width) continue;
+        if (cy < screen.y || cy >= screen.y + screen.height) continue;
+
+        should_be_dim.insert(canonical_window_id(placed.window.id));
+    }
+
+    // Restore first. A window dragged to another monitor should be opaque there
+    // BEFORE anything else is touched, because that is the change somebody is
+    // watching for -- and a window that has closed is simply forgotten.
+    for (auto it = dimmed.begin(); it != dimmed.end();) {
+        if (should_be_dim.count(*it) != 0) { ++it; continue; }
+        set_window_opacity(*it, 1.0);
+        it = dimmed.erase(it);
+        ++changed;
+    }
+
+    // Then dim what is newly here. Only what has CHANGED is touched, so this can
+    // run on a timer without spawning an xprop per window per tick.
+    for (const auto& id : should_be_dim) {
+        if (dimmed.count(id) != 0) continue;
+        if (set_window_opacity(id, opacity)) {
+            dimmed.insert(id);
+            ++changed;
+        }
+    }
+    return changed;
 }
 
 std::vector<PlacedWindow> list_placed_windows() {

@@ -81,6 +81,20 @@ struct Config {
     // the right way for this to fail.
     double      window_opacity = 0.95;
 
+    // Opacity applied to OTHER applications' windows on the panel's monitor.
+    //
+    // 1.0 is off, and off is the default: this reaches outside Auspex and changes
+    // how other programs look. A shell that quietly restyled every window on the
+    // machine would be one you could not reason about.
+    //
+    // Whole-window, so text dims with the background -- there is no way to reach
+    // inside somebody else's window and glass only what is behind their text. It
+    // is also the only mechanism that works on a running program without asking it
+    // to restart, which is why it exists at all.
+    //
+    // A window dragged to another monitor is restored to opaque.
+    double      screen_opacity = 1.0;
+
     int         num_ctx = 0;
 
     // Where web_search() sends its query. %q is replaced with the encoded query.
