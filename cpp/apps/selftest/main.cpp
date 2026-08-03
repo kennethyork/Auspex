@@ -7203,6 +7203,87 @@ void test_gitflow() {
               "while the crew's is not");
     }
 
+    // ---- a branch per coder ----
+    //
+    // The thing a shared working tree cannot give you: three coders landing into
+    // one tree leaves a pile you unpick by hand, while three branches can be
+    // checked out, diffed, cherry-picked or deleted one at a time.
+    {
+        // Names git will actually accept. A title is a sentence a model wrote,
+        // and a ref refuses spaces, "..", "~", "^", ":" among others -- a name
+        // git rejects is a run that fails at its very last step.
+        const std::string clean = branch_name("crew_123", 2, "Fix add() in calc.py");
+        check(clean.rfind("crew/crew_123/2-", 0) == 0, "the run and the number lead");
+        check(clean.find(' ') == std::string::npos, "no spaces");
+        check(clean.find("..") == std::string::npos, "no double dots");
+        check(clean.find('(') == std::string::npos, "no brackets");
+
+        const std::string nasty =
+            branch_name("crew_1", 1, "..~^:?*[ weird // title .lock");
+        for (const char* bad : {" ", "..", "~", "^", ":", "?", "*", "["}) {
+            check(nasty.find(bad) == std::string::npos,
+                  std::string("refuses ") + bad + " in a title");
+        }
+        check(nasty.back() != '.' && nasty.back() != '-',
+              "and does not end in a dot or a dash");
+
+        check(!branch_name("r", 1, "").empty(),
+              "a piece with no title still gets a name");
+    }
+
+    // ---- landing on a branch leaves everything else alone ----
+    {
+        Changeset change;
+        change.files.push_back({"a.py", "a = 2\n", false, 0});
+
+        // Something of yours, uncommitted, sitting in the tree.
+        { std::ofstream out(root / "wip.txt"); out << "not finished\n"; }
+        const std::string before = git_branch(root);
+
+        const CommitResult landed =
+            commit_to_branch(root, "crew/test/1-change-a", change, "change a");
+        check(landed.ok, "the change lands on its own branch");
+        check(!landed.commit.empty(), "with a hash");
+
+        check_eq(git_branch(root), before,
+                 "and you are still on the branch you were on");
+
+        const auto dirty = git_dirty_paths(root);
+        check(std::find(dirty.begin(), dirty.end(), "wip.txt") != dirty.end(),
+              "your uncommitted work is still uncommitted");
+
+        // The working tree does NOT have the change: it is on the branch, not
+        // both places. A change in two places is one you have to undo twice.
+        std::ifstream in(root / "a.py");
+        std::ostringstream now;
+        now << in.rdbuf();
+        check(now.str().find("a = 2") == std::string::npos,
+              "and the change is on the branch, not in your tree as well");
+
+        // No shed left behind: a stale worktree is something you have to prune
+        // by hand, and this makes one per coder.
+        const auto trees = run({"git", "worktree", "list"}, true, root.string());
+        check(trees.out.find("auspex-land-") == std::string::npos,
+              "and the throwaway worktree is gone");
+    }
+
+    // ---- branch refusals ----
+    {
+        Changeset change;
+        change.files.push_back({"a.py", "a = 3\n", false, 0});
+
+        check(!commit_to_branch(root, "crew/test/1-change-a", change, "again").ok,
+              "a branch that already exists is refused");
+        check(!commit_to_branch(root, "", change, "m").ok, "and an empty name");
+        check(!commit_to_branch(root, "crew/x", {}, "m").ok, "and an empty changeset");
+
+        Changeset escaping;
+        escaping.files.push_back({"../../etc/passwd", "boom", false, 0});
+        const auto out = commit_to_branch(root, "crew/y", escaping, "m");
+        check(!out.ok, "and a path outside the repository");
+        check(out.error.find("outside") != std::string::npos, "saying so");
+    }
+
     // ---- refusals ----
     {
         check(!commit_paths(root, {}, "message").ok, "nothing to commit is refused");
@@ -10167,6 +10248,7 @@ int main(int argc, char** argv) {
         if (args.size() >= 6 && args[5] == "security") options.security = true;
         if (args.size() >= 6 && args[5] == "learn")    options.learn = true;
         if (args.size() >= 6 && args[5] == "commit")   options.commit = true;
+        if (args.size() >= 6 && args[5] == "branch")   options.branch_per_coder = true;
         // Anything else in that slot naming a backend hands the coding to it.
         if (args.size() >= 6 && auspex::is_cli_backend(args[5])) {
             options.coder_backend = args[5];
@@ -10197,6 +10279,12 @@ int main(int argc, char** argv) {
                       << "      " << item.reason << "\n"
                       << "      " << item.files << " files, lands in "
                       << item.repo_root << "\n";
+        }
+        if (!result.branches.empty()) {
+            std::cout << "\nbranches:\n";
+            for (const auto& branch : result.branches) {
+                std::cout << "  " << branch << "\n";
+            }
         }
         std::cout << "\n" << auspex::usage_report(result.usage, "what it cost");
         return 0;

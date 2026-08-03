@@ -1089,6 +1089,7 @@ namespace {
 // Land or hold one attempt. Shared by run and resume, because "what happens to a
 // changeset" is the one decision that must not differ between them.
 void land_or_hold(const std::string& run_id, const std::filesystem::path& project,
+                  const std::string& branch,
                   Attempt& attempt, Changeset& landed, std::vector<BoardItem>& board,
                   int& next_number, RunResult& result,
                   const std::function<void(const std::string&)>& note) {
@@ -1107,6 +1108,37 @@ void land_or_hold(const std::string& run_id, const std::filesystem::path& projec
             }
             attempt.state = "held";
         }
+    }
+
+    // Its own branch, when that is what was asked for.
+    //
+    // Instead of the working tree, not as well as it: a change that is on a
+    // branch AND in your tree is one you have to undo twice. Your tree, index and
+    // current branch are untouched -- the commit is built in a throwaway worktree
+    // somewhere else.
+    if (!hold && !branch.empty()) {
+        const CommitResult landed_on = commit_to_branch(
+            project, branch, attempt.changeset,
+            commit_message(attempt.subtask.title, run_id,
+                           [&attempt] {
+                               std::vector<std::string> names;
+                               for (const auto& file : attempt.changeset.files) {
+                                   names.push_back(file.path);
+                               }
+                               return names;
+                           }()));
+        if (landed_on.ok) {
+            ++result.applied;
+            result.branches.push_back(branch);
+            if (note) {
+                note("branched #" + std::to_string(attempt.subtask.n) + " -> " +
+                     branch + " (" + landed_on.commit + ")");
+            }
+            return;
+        }
+        hold   = true;
+        reason = landed_on.error.empty() ? "could not be branched" : landed_on.error;
+        attempt.state = "held";
     }
 
     if (!hold) {
@@ -1241,7 +1273,8 @@ RunResult resume_crew(const Config& config, const std::filesystem::path& project
                                         AuditLimits{},
                                         with_config_roles(config, {}).model_for("auditor"));
 
-        land_or_hold(result.run_id, project, attempt, landed, board, next_number,
+        land_or_hold(result.run_id, project, /*branch=*/{}, attempt, landed, board,
+                     next_number,
                      result, note);
         destroy_sandbox(sandbox);
     }
@@ -1870,7 +1903,12 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
     Changeset landed;   // everything applied so far, for overlap detection
 
     for (auto& attempt : attempts) {
-        land_or_hold(result.run_id, options.project, attempt, landed, board,
+        land_or_hold(result.run_id, options.project,
+                     options.branch_per_coder
+                         ? branch_name(result.run_id, attempt.subtask.n,
+                                       attempt.subtask.title)
+                         : std::string{},
+                     attempt, landed, board,
                      next_number, result, events.log);
     }
 

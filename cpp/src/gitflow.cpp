@@ -1,7 +1,11 @@
 #include "auspex/gitflow.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <fstream>
 #include <sstream>
+
+#include <unistd.h>
 
 #include "auspex/process.hpp"
 #include "auspex/sandbox.hpp"
@@ -166,6 +170,160 @@ CommitResult commit_paths(const std::filesystem::path& root,
         hash.ok) {
         result.commit = trim(hash.out);
     }
+    result.ok = true;
+    return result;
+}
+
+
+
+std::string branch_name(const std::string& run_id, int n, const std::string& title) {
+    // Sanitised to what git will actually accept. A title is a sentence a model
+    // wrote, and a ref refuses spaces, "..", "~", "^", ":", "?", "*", "[", "\\",
+    // a leading or trailing "/", a trailing "." and a trailing ".lock". A name git
+    // rejects is a run that fails at its very last step.
+    std::string slug;
+    for (const char c : title) {
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            slug.push_back(static_cast<char>(std::tolower(c)));
+        } else if (!slug.empty() && slug.back() != '-') {
+            slug.push_back('-');
+        }
+        if (slug.size() >= 40) break;
+    }
+    while (!slug.empty() && slug.back() == '-') slug.pop_back();
+
+    std::string run = run_id.empty() ? "run" : run_id;
+    for (char& c : run) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') c = '-';
+    }
+
+    std::string name = "crew/" + run + "/" + std::to_string(n);
+    if (!slug.empty()) name += "-" + slug;
+    return name;
+}
+
+CommitResult commit_to_branch(const std::filesystem::path& root,
+                              const std::string& branch, const Changeset& changeset,
+                              const std::string& message) {
+    CommitResult result;
+
+    if (!is_git_repo(root)) {
+        result.error = "that project is not a git repository";
+        return result;
+    }
+    if (changeset.empty()) {
+        result.error = "there is nothing to commit";
+        return result;
+    }
+    if (trim(branch).empty() || trim(message).empty()) {
+        result.error = "a branch needs a name and a message";
+        return result;
+    }
+
+    // A repository with no commits has no HEAD to cut a branch from. Said plainly
+    // rather than letting git say it: "ambiguous argument HEAD" is not an error
+    // message about this program.
+    if (!run({"git", "rev-parse", "--verify", "HEAD"}, true, root.string()).ok) {
+        result.error = "this repository has no commits yet to branch from";
+        return result;
+    }
+    if (run({"git", "rev-parse", "--verify", "--quiet", "refs/heads/" + branch}, true,
+            root.string())
+            .ok) {
+        result.error = "the branch " + branch + " already exists";
+        return result;
+    }
+
+    // Every path checked BEFORE anything is created. These came from a changeset,
+    // which came ultimately from a model's choice of filename.
+    for (const auto& file : changeset.files) {
+        if (!safe_join(root, file.path)) {
+            result.error = "refusing to commit a path outside the repository: " +
+                           file.path;
+            return result;
+        }
+    }
+
+    // A THROWAWAY WORKTREE, somewhere else entirely.
+    //
+    // This is what leaves your working tree, your index and your current branch
+    // exactly where you left them -- and what lets several coders land at once,
+    // because each gets its own. Doing it in the real tree would mean stashing
+    // your work, and a tool that stashes your work is a tool you cannot trust.
+    std::error_code ec;
+    const auto shed = std::filesystem::temp_directory_path(ec) /
+                      ("auspex-land-" + std::to_string(::getpid()) + "-" + branch.substr(branch.rfind('/') + 1));
+    std::filesystem::remove_all(shed, ec);
+
+    if (!run({"git", "worktree", "add", "--detach", "--quiet", shed.string(), "HEAD"},
+             true, root.string())
+             .ok) {
+        result.error = "could not make a place to build the branch";
+        return result;
+    }
+
+    // Whatever happens below, the worktree goes. A shed left behind is a stale
+    // entry in `git worktree list` that the user has to prune by hand.
+    const auto tidy = [&root, &shed] {
+        std::error_code inner;
+        run({"git", "worktree", "remove", "--force", shed.string()}, true,
+            root.string());
+        std::filesystem::remove_all(shed, inner);
+        run({"git", "worktree", "prune"}, true, root.string());
+    };
+
+    if (!run({"git", "switch", "--quiet", "-c", branch}, true, shed.string()).ok) {
+        tidy();
+        result.error = "git would not take the branch name " + branch;
+        return result;
+    }
+
+    std::vector<std::string> paths;
+    for (const auto& file : changeset.files) {
+        const auto target = safe_join(shed, file.path);
+        if (!target) continue;
+
+        if (file.deleted) {
+            std::filesystem::remove(*target, ec);
+        } else {
+            std::filesystem::create_directories(target->parent_path(), ec);
+            std::ofstream out(*target, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                tidy();
+                result.error = "could not write " + file.path;
+                return result;
+            }
+            out << file.contents;
+        }
+        paths.push_back(file.path);
+    }
+
+    // --all so a deletion is staged as one. Scoped to these paths, so nothing
+    // else in the checkout can be swept in.
+    std::vector<std::string> add{"git", "add", "--all", "--"};
+    add.insert(add.end(), paths.begin(), paths.end());
+    if (!run(add, true, shed.string()).ok) {
+        tidy();
+        result.error = "could not stage the change";
+        return result;
+    }
+    result.staged = static_cast<int>(paths.size());
+
+    if (!run({"git", "commit", "--quiet", "--message", message}, true, shed.string())
+             .ok) {
+        tidy();
+        result.error = "git refused the commit";
+        return result;
+    }
+
+    if (const auto hash = run({"git", "rev-parse", "--short", "HEAD"}, true,
+                              shed.string());
+        hash.ok) {
+        result.commit = trim(hash.out);
+    }
+
+    // The worktree goes; the BRANCH stays. That is the whole point.
+    tidy();
     result.ok = true;
     return result;
 }

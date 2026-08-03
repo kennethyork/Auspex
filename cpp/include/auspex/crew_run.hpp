@@ -149,6 +149,19 @@ struct RunOptions {
     // are staged, so work you had in progress alongside is not swept in.
     bool        commit = false;
 
+    // Land each accepted changeset on its OWN branch instead of in your working
+    // tree: crew/<run>/<n>-<title>.
+    //
+    // The thing a shared tree cannot give you -- three coders landing into one
+    // tree leaves a pile you unpick by hand, while three branches can be checked
+    // out, diffed, cherry-picked or deleted one at a time.
+    //
+    // Your working tree is NOT touched: the commits are built in a throwaway
+    // worktree elsewhere. The coder still never touches git, and a sandbox is
+    // still a tree copy rather than a worktree, so it still cannot reach your
+    // history.
+    bool        branch_per_coder = false;
+
     // HOW MANY of each role this run may have.
     //
     // role -> the most pieces that may carry it. 0 means the role is off; a role
@@ -246,6 +259,9 @@ struct RunResult {
     std::string run_id;
     int         applied = 0;
     int         held    = 0;
+    // Branches this run created, when branch_per_coder was on. Named so the run
+    // can tell you where the work went rather than leaving you to find it.
+    std::vector<std::string> branches;
     // Set when the run could not proceed at all -- no plan, no project. A run that
     // planned and then held everything is not an error.
     std::string error;
