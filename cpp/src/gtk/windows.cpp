@@ -538,7 +538,11 @@ void CalendarWindow::go_today() {
 CrewWindow::CrewWindow() {
     set_title("Auspex Crew");
     add_css_class("auspex-window");
-    set_default_size(720, 780);
+    // 960, not 720. --check-windows measures this window's content at 888px with
+    // the tuning open, so the old default clipped out of the box -- three switches
+    // and part of the role grid unreachable on first run, which nobody would read
+    // as anything but broken.
+    set_default_size(960, 780);
     set_hide_on_close(true);
 
     // ---- where ----
@@ -1875,16 +1879,53 @@ BrainWindow::~BrainWindow() {
     if (measure_thread_.joinable()) measure_thread_.join();
 }
 
-void BrainWindow::measure() {
+void BrainWindow::measure(bool auditor) {
     if (measuring_.exchange(true)) return;   // already going
     measure_cancel_.store(false);
     measure_go_.set_sensitive(false);
+    measure_coder_.set_sensitive(false);
     measure_stop_.set_sensitive(true);
     measure_result_.set_text("measuring…");
 
     if (measure_thread_.joinable()) measure_thread_.join();
-    measure_thread_ = std::thread([this] {
+    measure_thread_ = std::thread([this, auditor] {
         const Config config = Config::load();
+
+        if (!auditor) {
+            // The coder suite. Every task runs in a directory of its own, never
+            // in a project of yours -- this is the one part of the crew that
+            // deliberately runs unreviewed model output.
+            EvalOptions options;
+            options.model = with_config_roles(config, {}).model_for("coder");
+
+            std::vector<EvalResult> results;
+            for (const auto& task : builtin_evals()) {
+                if (measure_cancel_.load()) break;
+                results.push_back(run_eval(config, task, options));
+            }
+
+            const EvalSummary summary = summarize_evals(results);
+            std::ostringstream coder_out;
+            if (summary.scored() == 0) {
+                // Not 0% and not 100%: neither would be true.
+                coder_out << "no tasks could be scored on this machine";
+            } else {
+                coder_out << summary.passed << "/" << summary.scored() << " passed";
+                if (measure_cancel_.load()) coder_out << " (stopped early)";
+                if (summary.skipped > 0) {
+                    coder_out << "  ·  " << summary.skipped
+                              << " skipped for a missing interpreter";
+                }
+            }
+            {
+                std::lock_guard lock(measure_mutex_);
+                measure_text_ = coder_out.str();
+            }
+            measuring_.store(false);
+            measure_done_.emit();
+            return;
+        }
+
         // The model this window has the Auditor set to -- the whole point is to
         // measure the choice you just made, not some default.
         AuditEvalOptions options;
@@ -2065,13 +2106,19 @@ BrainWindow::BrainWindow() {
     measure_result_.set_wrap(true);
     measure_result_.add_css_class("subtitle");
 
+    measure_coder_.set_tooltip_text(
+        "Run the coder suite against the model above: eight small tasks, each "
+        "scored by RUNNING the code rather than by asking a model. Each runs in a "
+        "directory of its own, never in your project.");
     measure_row_.append(measure_go_);
+    measure_row_.append(measure_coder_);
     measure_row_.append(measure_stop_);
     root_.append(measure_heading_);
     root_.append(measure_row_);
     root_.append(measure_result_);
 
-    measure_go_.signal_clicked().connect([this] { measure(); });
+    measure_go_.signal_clicked().connect([this] { measure(/*auditor=*/true); });
+    measure_coder_.signal_clicked().connect([this] { measure(/*auditor=*/false); });
     measure_stop_.signal_clicked().connect([this] { measure_cancel_.store(true); });
     measure_done_.connect([this] {
         {
@@ -2079,6 +2126,7 @@ BrainWindow::BrainWindow() {
             measure_result_.set_text(measure_text_);
         }
         measure_go_.set_sensitive(true);
+        measure_coder_.set_sensitive(true);
         measure_stop_.set_sensitive(false);
         if (measure_thread_.joinable()) measure_thread_.join();
     });

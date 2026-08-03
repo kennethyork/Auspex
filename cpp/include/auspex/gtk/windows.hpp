@@ -600,6 +600,10 @@ private:
     Gtk::Label   measure_heading_;
     Gtk::Box     measure_row_{Gtk::Orientation::HORIZONTAL, 6};
     Gtk::Button  measure_go_{"Measure the Auditor"};
+    // The other half. The Auditor corpus says whether the reviewer is right; this
+    // says whether the CODER produces code that works. Both from the window that
+    // chooses the models, because a choice you cannot measure is a guess.
+    Gtk::Button  measure_coder_{"Measure the coder"};
     Gtk::Button  measure_stop_{"Stop"};
     Gtk::Label   measure_result_;
     std::thread       measure_thread_;
@@ -608,7 +612,8 @@ private:
     Glib::Dispatcher  measure_done_;
     std::mutex        measure_mutex_;
     std::string       measure_text_;
-    void measure();
+    // `auditor` picks which corpus: the 13 audit cases, or the 8 coder tasks.
+    void measure(bool auditor);
 
     Gtk::Label  tokens_;
     Gtk::Label  status_;

@@ -12,6 +12,9 @@
 
 #include <adwaita.h>
 #include <gtkmm/application.h>
+#include <gtkmm/scrolledwindow.h>
+#include <gtkmm/expander.h>
+#include <gtkmm/viewport.h>
 
 #include "auspex/canvas.hpp"
 #include "auspex/config.hpp"
@@ -24,6 +27,103 @@
 #include "auspex/panel_dock.hpp"
 
 namespace {
+
+// Every window, by name, for the checks below and for --window.
+const std::vector<std::string>& window_names() {
+    static const std::vector<std::string> kNames{"crew", "brain", "projects", "team"};
+    return kNames;
+}
+
+// Does this window FIT at `width`, or does its content force it wider?
+//
+// GTK will not shrink a widget below its minimum, so a minimum wider than the
+// window is content you cannot reach -- not scrolled off, GONE. That is exactly
+// how a row of ten switches lost its last three, and how nine role cells lost
+// four, both in one day, both found by eye afterwards.
+//
+// measure() needs no display interaction and no clicking, which is the point: it
+// turns "I would have to look at it" into something a test can assert.
+struct Fit {
+    std::string name;
+    int minimum_width = 0;   // natural width, despite the name
+    int target_width  = 0;
+
+    bool fits() const { return minimum_width <= target_width; }
+};
+
+// Open every disclosure in the tree.
+//
+// A COLLAPSED Gtk::Expander does not measure its child, so everything folded away
+// contributes nothing to the window's width -- and the check reported a tidy
+// 432px for a window whose switch row clipped the moment you opened Tuning. The
+// worst case is what a person can actually reach, which is with it open.
+void expand_all(Gtk::Widget* widget) {
+    if (!widget) return;
+    if (auto* expander = dynamic_cast<Gtk::Expander*>(widget)) {
+        expander->set_expanded(true);
+    }
+    for (Gtk::Widget* child = widget->get_first_child(); child;
+         child = child->get_next_sibling()) {
+        expand_all(child);
+    }
+}
+
+Fit measure_window(Gtk::Window& window, const std::string& name, int width) {
+    expand_all(window.get_child());
+
+    Fit fit;
+    fit.name = name;
+    fit.target_width = width;
+
+    // PAST the scroller.
+    //
+    // A ScrolledWindow reports a tiny minimum because it can scroll, so measuring
+    // the window's own child hides what the content actually needs. The first
+    // version of this check did exactly that and passed the very bug it was
+    // written for -- a ten-switch row in a horizontal Box, reported as "fits,
+    // needs 432px" while three of the switches were unreachable.
+    //
+    // Only VERTICAL scrollers are unwrapped, and only horizontally. A window that
+    // genuinely scrolls sideways is allowed to be wider than its frame; these do
+    // not, by policy, so their content's width is a real constraint.
+    Gtk::Widget* content = window.get_child();
+    for (int hop = 0; hop < 4 && content; ++hop) {
+        if (auto* scroller = dynamic_cast<Gtk::ScrolledWindow*>(content)) {
+            if (scroller->property_hscrollbar_policy().get_value() !=
+                Gtk::PolicyType::NEVER) {
+                break;
+            }
+            content = scroller->get_child();
+            continue;
+        }
+        // AND the viewport inside it. GTK wraps a non-scrollable child in a
+        // Gtk::Viewport, and a viewport reports any width as acceptable -- so
+        // stopping at the scroller's child measured the wrapper rather than the
+        // content, and the crew window's number never moved no matter what was
+        // inside it.
+        if (auto* viewport = dynamic_cast<Gtk::Viewport*>(content)) {
+            content = viewport->get_child();
+            continue;
+        }
+        break;
+    }
+
+    int minimum = 0, natural = 0, ignore_a = 0, ignore_b = 0;
+    if (content) {
+        content->measure(Gtk::Orientation::HORIZONTAL, -1, minimum, natural,
+                         ignore_a, ignore_b);
+    }
+    // NATURAL, not minimum.
+    //
+    // A label's MINIMUM width is its longest unbreakable word, because it can
+    // wrap -- so ten checkboxes in a row "fit" a 950px window by squashing each
+    // to about 45px, and the check reported 432px while three switches were
+    // genuinely unreachable. Natural width is what the content wants without
+    // being squeezed, which is the question actually being asked.
+    fit.minimum_width = natural;
+    (void)minimum;
+    return fit;
+}
 
 // Opens one named window, for looking at. False when the name is unknown.
 bool open_single_window(Gtk::Application& app, const std::string& name,
@@ -46,6 +146,7 @@ bool open_single_window(Gtk::Application& app, const std::string& name,
         keep_open(new auspex::gtk::CrewWindow());
         return true;
     }
+    (void)window_names();
     if (name == "brain") {
         keep_open(new auspex::gtk::BrainWindow());
         return true;
@@ -82,13 +183,30 @@ int main(int argc, char** argv) {
     // came to be several features ahead of anything you can click. A window that
     // can be opened on its own can at least be SEEN.
     std::string only_window;
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--window") only_window = argv[i + 1];
+    int check_width = 0;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--window" && i + 1 < argc) only_window = argv[i + 1];
+        // --check-windows [width]: does every window FIT, or does its content
+        // force it wider than a person's window actually is?
+        if (arg == "--check-windows") {
+            check_width = (i + 1 < argc) ? std::atoi(argv[i + 1]) : 0;
+            if (check_width <= 0) check_width = 950;   // the width this is used at
+        }
     }
 
+    // A SEPARATE IDENTITY, and NON_UNIQUE, for the inspection modes.
+    //
+    // A running panel owns "one.auspex.Shell", so a second process with that id
+    // hands off to it and exits. That is what --check-windows did on its first
+    // run: no output, exit 0, looking exactly like a check that had passed. A
+    // check that silently does nothing is worse than no check at all.
+    const bool inspecting = !only_window.empty() || check_width > 0;
     auto app = Gtk::Application::create(
-        only_window.empty() ? "one.auspex.Shell" : "one.auspex.ShellWindow",
-        Gio::Application::Flags::HANDLES_COMMAND_LINE);
+        inspecting ? "one.auspex.ShellInspect" : "one.auspex.Shell",
+        Gio::Application::Flags::HANDLES_COMMAND_LINE |
+            (inspecting ? Gio::Application::Flags::NON_UNIQUE
+                        : Gio::Application::Flags::NONE));
     // Our own flag would otherwise be rejected as unknown before activate runs.
     app->signal_command_line().connect(
         [&app](const Glib::RefPtr<Gio::ApplicationCommandLine>&) {
@@ -127,6 +245,83 @@ int main(int argc, char** argv) {
         theme = std::make_unique<auspex::gtk::ThemeManager>(Gdk::Display::get_default());
         theme->start_watching();
         std::cout << "auspex-shell: theme '" << theme->current_theme_name() << "'\n";
+
+        // Every window measured, then stop. No display interaction, no clicking:
+        // a minimum wider than the target is content GTK will not shrink to fit,
+        // which is content you cannot reach.
+        if (check_width > 0) {
+            // The windows are PRESENTED before being measured.
+            //
+            // An unrealised widget has no display connection and cannot size its
+            // own text, so measure() on one returns a number that looks plausible
+            // and is not real -- the first version of this reported 432px for a
+            // window whose switch row alone needed over 900, and passed the exact
+            // bug it was written to catch. They flash on screen for a moment;
+            // that is the price of a number that means something.
+            // Held, or the application exits the moment the command-line
+            // handler returns and the timer below never fires -- which looked
+            // exactly like a check that had run and found nothing.
+            app->hold();
+            static std::vector<std::unique_ptr<Gtk::Window>> built;
+            for (const auto& name : window_names()) {
+                std::unique_ptr<Gtk::Window> window;
+                if (name == "crew")     window = std::make_unique<auspex::gtk::CrewWindow>();
+                else if (name == "brain") window = std::make_unique<auspex::gtk::BrainWindow>();
+                else if (name == "projects")
+                    window = std::make_unique<auspex::gtk::ProjectsWindow>(config);
+                else if (name == "team")
+                    window = std::make_unique<auspex::gtk::TeamWindow>(config);
+                if (!window) continue;
+                window->set_default_size(check_width, 400);
+                window->present();
+                built.push_back(std::move(window));
+            }
+
+            Glib::signal_timeout().connect_once(
+                [&app, check_width] {
+                    int bad = 0;
+                    for (std::size_t i = 0; i < built.size(); ++i) {
+                        const Fit fit = measure_window(*built[i], window_names()[i],
+                                                       check_width);
+                        std::cout << (fit.fits() ? "  fits   " : "  CLIPS  ")
+                                  << fit.name << "  needs " << fit.minimum_width
+                                  << "px, window is " << fit.target_width << "px\n";
+                        if (!fit.fits()) ++bad;
+                    }
+                    std::cout << (bad == 0
+                                      ? "every window fits\n"
+                                      : std::to_string(bad) + " window(s) would clip\n");
+                    for (auto& window : built) window->hide();
+                    built.clear();
+                    std::exit(bad == 0 ? 0 : 1);
+                },
+                600);
+            return;
+        }
+
+        if (false) {
+            int bad = 0;
+            for (const auto& name : window_names()) {
+                std::unique_ptr<Gtk::Window> window;
+                if (name == "crew")     window = std::make_unique<auspex::gtk::CrewWindow>();
+                else if (name == "brain") window = std::make_unique<auspex::gtk::BrainWindow>();
+                else if (name == "projects")
+                    window = std::make_unique<auspex::gtk::ProjectsWindow>(config);
+                else if (name == "team")
+                    window = std::make_unique<auspex::gtk::TeamWindow>(config);
+                if (!window) continue;
+
+                const Fit fit = measure_window(*window, name, check_width);
+                std::cout << (fit.fits() ? "  fits   " : "  CLIPS  ") << name
+                          << "  needs " << fit.minimum_width << "px, window is "
+                          << fit.target_width << "px\n";
+                if (!fit.fits()) ++bad;
+            }
+            std::cout << (bad == 0 ? "every window fits\n"
+                                   : std::to_string(bad) + " window(s) would clip\n");
+            app->quit();
+            std::exit(bad == 0 ? 0 : 1);
+        }
 
         // One window, then stop. The stylesheet is installed first: a harness that
         // skips it renders unstyled GTK, and every judgement made from the result
