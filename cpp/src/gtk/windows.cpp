@@ -842,7 +842,14 @@ CrewWindow::CrewWindow() {
     cost_.add_css_class("dim-label");
     cost_.set_visible(false);   // nothing to say until a run has finished
     root_.append(cost_);
-    set_child(root_);
+
+    // Vertical only. Horizontal scrolling would let the lanes run off the side
+    // rather than narrowing, which turns a readable three-column board into
+    // something you have to drag around.
+    root_scroller_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    root_scroller_.set_child(root_);
+    root_scroller_.set_vexpand(true);
+    set_child(root_scroller_);
 
     show_project();
     refresh_run();
@@ -1115,7 +1122,10 @@ void CrewWindow::refresh_run() {
     }
     crew_row_.set_visible(!members.empty());
 
-    lanes_.set_visible(!run.subtasks.empty());
+    // Visible whenever there is a crew at all, not only once the Director has cut
+    // the job up: the Researcher and the Director are working before any subtask
+    // exists, and hiding the lanes until then is hiding the first half of a run.
+    lanes_.set_visible(!run.subtasks.empty() || !members.empty());
     // Only offered while something is actually running. A steer box on an idle
     // crew is a control that can only report that there is nothing to steer.
     steer_row_.set_visible(run.active);
@@ -1226,6 +1236,53 @@ void CrewWindow::refresh_run() {
         // The one in flight is marked, so the Doing lane still reads at a glance
         // when it holds several.
         if (lane == &doing_) card->add_css_class("recording");
+
+        lane->body.append(*card);
+        run_rows_.push_back(std::move(card));
+    }
+
+    // THE REST OF THE CREW, as cards in the lanes.
+    //
+    // The lanes held coder subtasks and nothing else, so a run of five faculties
+    // read as a run of coders with a thin grey line above it. The Researcher, the
+    // Director and the Auditor do real work and took no space at all.
+    //
+    // They are cards rather than another row because that is what makes them look
+    // like members of the same crew: the same lane, the same shape, moving left to
+    // right as the run goes.
+    //
+    // AFTER the coders, not before. A lane is a column and the fold is real:
+    // putting three faculty cards first pushed the actual work out of sight, which
+    // was worse than not showing them at all.
+    for (const auto& member : members) {
+        if (member.name == "Coders") continue;   // the coders below ARE those
+
+        Lane* lane  = &todo_;
+        int   which = 0;
+        if (member.working)   { lane = &doing_; which = 1; }
+        else if (member.done) { lane = &done_;  which = 2; }
+        ++counts[which];
+
+        auto card = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 2);
+        card->add_css_class("code-block");
+
+        auto* who = Gtk::make_managed<Gtk::Label>(member.name);
+        who->set_xalign(0.0f);
+        who->add_css_class(member.working ? "heading" : "subtitle");
+        card->append(*who);
+
+        // What it is for, so a card is not just a noun. The Director's "3 pieces"
+        // and the Auditor's "1 held" land here.
+        std::string detail = member.detail;
+        if (detail.empty()) {
+            detail = member.working ? "working" : (member.done ? "finished" : "waiting");
+        }
+        auto* what = Gtk::make_managed<Gtk::Label>(detail);
+        what->set_xalign(0.0f);
+        what->set_wrap(true);
+        what->add_css_class("subtitle");
+        if (member.working) what->add_css_class("accent");
+        card->append(*what);
 
         lane->body.append(*card);
         run_rows_.push_back(std::move(card));

@@ -200,6 +200,15 @@ private:
     // accepted changeset would have landed there.
     std::filesystem::path project_;
     Gtk::Box    project_row_{Gtk::Orientation::HORIZONTAL, 8};
+    // The whole window scrolls.
+    //
+    // root_ used to be the window's child directly, so anything past the bottom
+    // edge was not merely off-screen, it was UNREACHABLE -- and the window grew
+    // this session by two switches, a crew roster and a card per faculty. A
+    // screenshot of it showed the option row sliced in half with no way to reach
+    // the rest.
+    Gtk::ScrolledWindow root_scroller_;
+
     Gtk::Label  project_label_;
     Gtk::Button project_pick_{"Change…"};
 

@@ -1579,6 +1579,18 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
                 // read and write sat in CoderOutcome::steps, unpublished until the
                 // coder had finished -- which is exactly when it stops being
                 // worth watching.
+                // Named BEFORE it starts, not after.
+                //
+                // outcome.model is only set when run_coder returns, so for the
+                // whole time a coder was actually working the board said "ollama"
+                // -- the one stretch when you might want to know which model is
+                // spending your money.
+                {
+                    std::lock_guard lock(state_mutex);
+                    attempt.outcome.model =
+                        coder_model.empty() ? config.ollama_model : coder_model;
+                }
+
                 const auto report = [&](const CoderStep& step) {
                     std::string doing;
                     switch (step.call.tool) {
