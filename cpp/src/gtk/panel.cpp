@@ -17,6 +17,7 @@
 #include <gtkmm/stringlist.h>
 
 #include "auspex/crew.hpp"
+#include "auspex/crew_run.hpp"
 #include "auspex/display.hpp"
 #include "auspex/gtk/voice.hpp"
 #include "auspex/process.hpp"
@@ -1163,7 +1164,7 @@ CrewButton::CrewButton() {
 }
 
 void CrewButton::poll() {
-    const auto path = crew_state_path();
+    const auto path = auspex_run_state_path();
     if (path.empty()) {
         set_visible(false);
         return;
@@ -1593,13 +1594,11 @@ void Panel::build_top() {
     pinned_ = std::make_unique<PinnedLaunchers>(config_);
     box_.append(*pinned_);
 
-    // Only when there is a crew to report on. On a machine without ollamadev this
-    // is not a feature that is switched off, it is one that does not exist.
-    if (crew_available()) {
-        crew_ = std::make_unique<CrewButton>();
-        crew_->set_board_handler([this] { show_crew(); });
-        box_.append(*crew_);
-    }
+    // The crew button is always shown. The crew is Auspex's own and does not
+    // require an external binary.
+    crew_ = std::make_unique<CrewButton>();
+    crew_->set_board_handler([this] { show_crew(); });
+    box_.append(*crew_);
 
     workspaces_ = std::make_unique<WorkspaceSwitcher>(config_.workspace_count);
     box_.append(*workspaces_);
