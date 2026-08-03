@@ -1,6 +1,8 @@
 #include "auspex/gtk/windows.hpp"
 
 #include <algorithm>
+#include <map>
+#include <iostream>
 #include <thread>
 #include <fstream>
 #include <sstream>
@@ -93,21 +95,76 @@ void make_glass(Gtk::Window& window) {
     window.add_css_class("auspex-window");
 
     Gtk::Window* target = &window;
-    const auto refresh = [target] {
-        if (on_panel_monitor(*target)) target->remove_css_class("auspex-solid");
-        else                           target->add_css_class("auspex-solid");
+    const auto refresh = [target](const char* why) {
+        const bool here = on_panel_monitor(*target);
+        if (here) target->remove_css_class("auspex-solid");
+        else      target->add_css_class("auspex-solid");
+        // Only ever reports a CHANGE. A 750ms tick that logged every time would
+        // bury the one line that matters under eighty identical ones.
+        static std::map<const Gtk::Window*, int> last;
+        const bool changed = last.find(target) == last.end() ||
+                             last[target] != static_cast<int>(here);
+        last[target] = static_cast<int>(here);
+        if (changed && std::getenv("AUSPEX_GLASS_DEBUG")) {
+            Gdk::Rectangle geometry;
+            std::string where = "no monitor";
+            if (const auto surface = target->get_surface()) {
+                if (const auto display = target->get_display()) {
+                    if (const auto monitor = display->get_monitor_at_surface(surface)) {
+                        monitor->get_geometry(geometry);
+                        where = std::to_string(geometry.get_x()) + "," +
+                                std::to_string(geometry.get_y()) + " " +
+                                std::to_string(geometry.get_width()) + "x" +
+                                std::to_string(geometry.get_height());
+                    }
+                }
+            }
+            const auto panel = primary_monitor();
+            std::cerr << "glass[" << why << "] on=" << (here ? "panel" : "elsewhere")
+                      << " monitor=" << where << " panel="
+                      << (panel ? std::to_string(panel->bounds.x) + "," +
+                                      std::to_string(panel->bounds.y)
+                                : std::string("none"))
+                      << " surface=" << (target->get_surface() ? "yes" : "no") << "\n";
+        }
     };
 
     // Connected on realize because there is no surface before then, and the
     // surface is what reports the crossings.
+    //
+    // NOT asked at realize time. A window that has not been placed yet reports
+    // whatever monitor the origin happens to fall on -- 0,0 on this desk, which
+    // is not the panel's -- so asking then marked every window solid and left it
+    // that way until something corrected it. Glass is the state to start in: it
+    // is what these windows are for, and being briefly glass in the wrong place
+    // is a smaller fault than being permanently solid in the right one.
+    //
+    // A TIMER as well as the signals. enter/leave-monitor are the right events
+    // and they do fire, but they are the only thing that would notice a window
+    // being dragged across, and if the window manager moves a window without GTK
+    // reconfiguring the surface they never arrive -- which is a window that stays
+    // glass on a screen with no panel on it, the exact bug this exists to fix. A
+    // monitor lookup is arithmetic on geometry the display already has: no
+    // subprocess, no round trip, cheap enough to simply ask.
     target->signal_realize().connect([target, refresh] {
         if (const auto surface = target->get_surface()) {
             surface->signal_enter_monitor().connect(
-                [refresh](const Glib::RefPtr<Gdk::Monitor>&) { refresh(); });
+                [refresh](const Glib::RefPtr<Gdk::Monitor>&) { refresh("enter"); });
             surface->signal_leave_monitor().connect(
-                [refresh](const Glib::RefPtr<Gdk::Monitor>&) { refresh(); });
+                [refresh](const Glib::RefPtr<Gdk::Monitor>&) { refresh("leave"); });
         }
-        refresh();
+
+        // Held in a shared_ptr so the timer can disconnect ITSELF when the window
+        // goes: a raw timer outliving its window would call refresh() on a
+        // destroyed object, and it would do it once a second forever.
+        auto beat = std::make_shared<sigc::connection>();
+        *beat = Glib::signal_timeout().connect(
+            [target, refresh] {
+                refresh("tick");
+                return true;
+            },
+            750);
+        target->signal_unrealize().connect([beat] { beat->disconnect(); });
     });
 }
 
