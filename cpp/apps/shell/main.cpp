@@ -30,7 +30,13 @@ namespace {
 
 // Every window, by name, for the checks below and for --window.
 const std::vector<std::string>& window_names() {
-    static const std::vector<std::string> kNames{"crew", "brain", "projects", "team"};
+    // ALL of them, not the four I happened to be working on. The check covered
+    // crew/brain/projects/team and reported "every window fits" while four other
+    // windows had never been measured once -- a green line about a subset reads
+    // exactly like a green line about everything.
+    static const std::vector<std::string> kNames{"launcher", "calendar", "crew",
+                                                 "brain",    "projects", "team",
+                                                 "chat",     "settings"};
     return kNames;
 }
 
@@ -125,6 +131,32 @@ Fit measure_window(Gtk::Window& window, const std::string& name, int width) {
     return fit;
 }
 
+// Build one window by name, or null when the name is unknown.
+//
+// ONE list, because there were three: the single-window mode, the width check and
+// a dead copy left behind by an earlier version. They had already drifted -- the
+// check knew about four windows and the shell about eight -- and a list that has
+// to be updated in three places is a list that will be updated in one.
+std::unique_ptr<Gtk::Window> make_window(const std::string& name,
+                                         const auspex::Config& config) {
+    if (name == "launcher") return std::make_unique<auspex::gtk::LauncherWindow>(config);
+    if (name == "calendar") return std::make_unique<auspex::gtk::CalendarWindow>();
+    if (name == "crew")     return std::make_unique<auspex::gtk::CrewWindow>();
+    if (name == "brain")    return std::make_unique<auspex::gtk::BrainWindow>();
+    if (name == "projects") return std::make_unique<auspex::gtk::ProjectsWindow>(config);
+    if (name == "team")     return std::make_unique<auspex::gtk::TeamWindow>(config);
+    if (name == "settings") return std::make_unique<auspex::gtk::SettingsWindow>(config);
+    if (name == "chat") {
+        // Chat needs a voice controller, and it must outlive the window. The
+        // constructor only picks an input device -- it does not open the
+        // microphone -- so building one to measure a window records nothing.
+        static std::unique_ptr<auspex::gtk::VoiceController> voice;
+        if (!voice) voice = std::make_unique<auspex::gtk::VoiceController>(config);
+        return std::make_unique<auspex::gtk::ChatWindow>(config, *voice);
+    }
+    return nullptr;
+}
+
 // Opens one named window, for looking at. False when the name is unknown.
 bool open_single_window(Gtk::Application& app, const std::string& name,
                         const auspex::Config& config) {
@@ -142,24 +174,10 @@ bool open_single_window(Gtk::Application& app, const std::string& name,
         window->present();
     };
 
-    if (name == "crew") {
-        keep_open(new auspex::gtk::CrewWindow());
-        return true;
-    }
-    (void)window_names();
-    if (name == "brain") {
-        keep_open(new auspex::gtk::BrainWindow());
-        return true;
-    }
-    if (name == "projects") {
-        keep_open(new auspex::gtk::ProjectsWindow(config));
-        return true;
-    }
-    if (name == "team") {
-        keep_open(new auspex::gtk::TeamWindow(config));
-        return true;
-    }
-    return false;
+    std::unique_ptr<Gtk::Window> window = make_window(name, config);
+    if (!window) return false;
+    keep_open(window.release());   // keep_open owns it from here
+    return true;
 }
 
 }  // namespace
@@ -190,8 +208,16 @@ int main(int argc, char** argv) {
         // --check-windows [width]: does every window FIT, or does its content
         // force it wider than a person's window actually is?
         if (arg == "--check-windows") {
-            check_width = (i + 1 < argc) ? std::atoi(argv[i + 1]) : 0;
-            if (check_width <= 0) check_width = 950;   // the width this is used at
+            // -1 means "each window against its OWN default size", which is the
+            // question that matters: a window is not usually opened at some width
+            // I chose, it is opened at the size it opens at. Checking everything
+            // against one shared width said "every window fits" while the crew
+            // window needed 888px and opened at 720 -- fine at the width I tested,
+            // broken on every first run.
+            check_width = (i + 1 < argc && argv[i + 1][0] != '-')
+                              ? std::atoi(argv[i + 1])
+                              : -1;
+            if (check_width == 0) check_width = -1;
         }
     }
 
@@ -201,7 +227,7 @@ int main(int argc, char** argv) {
     // hands off to it and exits. That is what --check-windows did on its first
     // run: no output, exit 0, looking exactly like a check that had passed. A
     // check that silently does nothing is worse than no check at all.
-    const bool inspecting = !only_window.empty() || check_width > 0;
+    const bool inspecting = !only_window.empty() || check_width != 0;
     auto app = Gtk::Application::create(
         inspecting ? "one.auspex.ShellInspect" : "one.auspex.Shell",
         Gio::Application::Flags::HANDLES_COMMAND_LINE |
@@ -249,7 +275,7 @@ int main(int argc, char** argv) {
         // Every window measured, then stop. No display interaction, no clicking:
         // a minimum wider than the target is content GTK will not shrink to fit,
         // which is content you cannot reach.
-        if (check_width > 0) {
+        if (check_width != 0) {
             // The windows are PRESENTED before being measured.
             //
             // An unrealised widget has no display connection and cannot size its
@@ -263,16 +289,23 @@ int main(int argc, char** argv) {
             // exactly like a check that had run and found nothing.
             app->hold();
             static std::vector<std::unique_ptr<Gtk::Window>> built;
+            static std::vector<int> widths;   // what each opens at, read before it does
             for (const auto& name : window_names()) {
-                std::unique_ptr<Gtk::Window> window;
-                if (name == "crew")     window = std::make_unique<auspex::gtk::CrewWindow>();
-                else if (name == "brain") window = std::make_unique<auspex::gtk::BrainWindow>();
-                else if (name == "projects")
-                    window = std::make_unique<auspex::gtk::ProjectsWindow>(config);
-                else if (name == "team")
-                    window = std::make_unique<auspex::gtk::TeamWindow>(config);
+                std::unique_ptr<Gtk::Window> window = make_window(name, config);
                 if (!window) continue;
-                window->set_default_size(check_width, 400);
+                // Only overridden when a width was asked for. Otherwise the
+                // window keeps the size it really opens at, which is the size
+                // being judged.
+                if (check_width > 0) window->set_default_size(check_width, 400);
+
+                // Read BEFORE present(). Once a window is realised, GTK writes the
+                // window's actual size back into default-width, so asking
+                // afterwards returns whatever the window manager settled on --
+                // launcher reported 950 when it opens at 520. The size it opens
+                // at is only knowable before it opens.
+                int opens_at = 0, ignore_height = 0;
+                window->get_default_size(opens_at, ignore_height);
+                widths.push_back(opens_at);
                 window->present();
                 built.push_back(std::move(window));
             }
@@ -281,8 +314,10 @@ int main(int argc, char** argv) {
                 [&app, check_width] {
                     int bad = 0;
                     for (std::size_t i = 0; i < built.size(); ++i) {
+                        const int width =
+                            check_width > 0 ? check_width : widths[i];
                         const Fit fit = measure_window(*built[i], window_names()[i],
-                                                       check_width);
+                                                       width);
                         std::cout << (fit.fits() ? "  fits   " : "  CLIPS  ")
                                   << fit.name << "  needs " << fit.minimum_width
                                   << "px, window is " << fit.target_width << "px\n";
@@ -297,30 +332,6 @@ int main(int argc, char** argv) {
                 },
                 600);
             return;
-        }
-
-        if (false) {
-            int bad = 0;
-            for (const auto& name : window_names()) {
-                std::unique_ptr<Gtk::Window> window;
-                if (name == "crew")     window = std::make_unique<auspex::gtk::CrewWindow>();
-                else if (name == "brain") window = std::make_unique<auspex::gtk::BrainWindow>();
-                else if (name == "projects")
-                    window = std::make_unique<auspex::gtk::ProjectsWindow>(config);
-                else if (name == "team")
-                    window = std::make_unique<auspex::gtk::TeamWindow>(config);
-                if (!window) continue;
-
-                const Fit fit = measure_window(*window, name, check_width);
-                std::cout << (fit.fits() ? "  fits   " : "  CLIPS  ") << name
-                          << "  needs " << fit.minimum_width << "px, window is "
-                          << fit.target_width << "px\n";
-                if (!fit.fits()) ++bad;
-            }
-            std::cout << (bad == 0 ? "every window fits\n"
-                                   : std::to_string(bad) + " window(s) would clip\n");
-            app->quit();
-            std::exit(bad == 0 ? 0 : 1);
         }
 
         // One window, then stop. The stylesheet is installed first: a harness that
