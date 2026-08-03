@@ -28,28 +28,34 @@ namespace {
 // Opens one named window, for looking at. False when the name is unknown.
 bool open_single_window(Gtk::Application& app, const std::string& name,
                         const auspex::Config& config) {
-    if (name == "crew") {
-        auto* window = new auspex::gtk::CrewWindow();
+    // HOLD the application for as long as the window lives.
+    //
+    // add_window() alone was not enough: with HANDLES_COMMAND_LINE the app exits
+    // when the command-line handler returns unless something is holding it, and
+    // the result was a mode that started, printed its theme line and vanished --
+    // intermittently, which is worse than never. Released when the window closes,
+    // so quitting still quits.
+    const auto keep_open = [&app](Gtk::Window* window) {
+        app.hold();
+        window->signal_hide().connect([&app] { app.release(); });
         app.add_window(*window);
         window->present();
+    };
+
+    if (name == "crew") {
+        keep_open(new auspex::gtk::CrewWindow());
         return true;
     }
     if (name == "brain") {
-        auto* window = new auspex::gtk::BrainWindow();
-        app.add_window(*window);
-        window->present();
+        keep_open(new auspex::gtk::BrainWindow());
         return true;
     }
     if (name == "projects") {
-        auto* window = new auspex::gtk::ProjectsWindow(config);
-        app.add_window(*window);
-        window->present();
+        keep_open(new auspex::gtk::ProjectsWindow(config));
         return true;
     }
     if (name == "team") {
-        auto* window = new auspex::gtk::TeamWindow(config);
-        app.add_window(*window);
-        window->present();
+        keep_open(new auspex::gtk::TeamWindow(config));
         return true;
     }
     return false;

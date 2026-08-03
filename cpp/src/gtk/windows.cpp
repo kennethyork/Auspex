@@ -715,12 +715,24 @@ CrewWindow::CrewWindow() {
     // Built from all_personas(), so a role you write into your own crew-roles
     // directory appears here without a line of GUI code -- the same way the pack
     // picker gained seven packs for free.
+    // Three pairs per row, so nine roles are three tidy rows at the width this
+    // window is used at.
+    constexpr int kRolesPerRow = 3;
+    int role_index = 0;
+
     for (const auto& persona : all_personas()) {
-        auto cell = std::make_unique<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 4);
+        const int column = (role_index % kRolesPerRow) * 2;
+        const int row    = role_index / kRolesPerRow;
+        ++role_index;
 
         auto* name = Gtk::make_managed<Gtk::Label>(persona.name);
         name->add_css_class("caption");
-        cell->append(*name);
+        // LEFT, like "Coders" and "Swarm" in the row below. The first column of
+        // this grid starts at the same edge those labels do, so left-aligning
+        // puts every role name on the one vertical line the rest of the window
+        // already uses. Right-aligned looked tidy on its own and was out of step
+        // with everything under it.
+        name->set_xalign(0.0f);
 
         auto* count = Gtk::make_managed<Gtk::SpinButton>();
         // Starts at 0, like every other number in this window, and means the same
@@ -737,12 +749,11 @@ CrewWindow::CrewWindow() {
         count->set_tooltip_text(tip);
         name->set_tooltip_text(tip);
 
-        cell->append(*count);
-        roles_row_.insert(*cell, -1);
+        roles_row_.attach(*name, column, row);
+        roles_row_.attach(*count, column + 1, row);
 
         role_counts_.push_back(count);
         role_names_.push_back(persona.name);
-        role_widgets_.push_back(std::move(cell));
     }
 
     coders_label_.set_text("Coders");
@@ -870,23 +881,38 @@ CrewWindow::CrewWindow() {
     status_.set_wrap(true);
 
     root_.set_margin(14);
+    // Breathing room. The window was edge-to-edge, which is what made a long
+    // stack of controls read as one undifferentiated block.
+    root_.set_margin(14);
+
     root_.append(project_row_);
     root_.append(task_label_);
     root_.append(task_);
-    root_.append(options_);
-    roles_row_.set_selection_mode(Gtk::SelectionMode::NONE);
-    roles_row_.set_max_children_per_line(6);
-    roles_row_.set_row_spacing(4);
-    roles_row_.set_column_spacing(10);
-    root_.append(roles_label_);
-    root_.append(roles_row_);
-    root_.append(second_row_);
+
+    // Everything below here is tuning, and it goes behind one disclosure.
+    tuning_box_.append(options_);
+    roles_row_.set_row_spacing(6);
+    roles_row_.set_column_spacing(8);
+    roles_row_.set_column_homogeneous(true);
+    tuning_box_.append(roles_label_);
+    tuning_box_.append(roles_row_);
+    tuning_box_.append(second_row_);
+    tuning_box_.set_margin_top(6);
+    tuning_box_.set_margin_start(4);
+    tuning_.set_child(tuning_box_);
+    tuning_.set_expanded(false);   // shut, or the disclosure discloses nothing
+    tuning_.set_margin_top(4);
+    root_.append(tuning_);
+
+    start_row_.set_margin_top(4);
     root_.append(start_row_);
+    run_heading_.set_margin_top(10);
     root_.append(run_heading_);
     crew_row_.set_visible(false);
     root_.append(crew_row_);
     root_.append(lanes_);
     root_.append(steer_row_);
+    board_heading_.set_margin_top(10);
     root_.append(board_heading_);
     root_.append(board_scroller_);
     root_.append(status_);
@@ -1209,7 +1235,13 @@ void CrewWindow::refresh_run() {
         ++counts[which];
 
         auto card = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 2);
-        card->add_css_class("code-block");
+        card->add_css_class("crew-card");
+        switch (crew_lane_of(subtask)) {
+            case CrewLane::Doing: card->add_css_class("crew-card-working"); break;
+            case CrewLane::Done:  card->add_css_class("crew-card-done"); break;
+            case CrewLane::Held:  card->add_css_class("crew-card-held"); break;
+            case CrewLane::Todo:  break;
+        }
 
         auto* title = Gtk::make_managed<Gtk::Label>(subtask.title);
         title->set_xalign(0.0f);
@@ -1325,7 +1357,11 @@ void CrewWindow::refresh_run() {
         ++counts[which];
 
         auto card = std::make_unique<Gtk::Box>(Gtk::Orientation::VERTICAL, 2);
-        card->add_css_class("code-block");
+        // The left border says the state, so a column is read by scanning down
+        // the edge rather than by reading every card.
+        card->add_css_class("crew-card");
+        if (member.working)   card->add_css_class("crew-card-working");
+        else if (member.done) card->add_css_class("crew-card-done");
 
         auto* who = Gtk::make_managed<Gtk::Label>(member.name);
         who->set_xalign(0.0f);

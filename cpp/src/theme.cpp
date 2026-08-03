@@ -561,6 +561,34 @@ window.auspex-panel togglebutton:active {
  *
  * The stripe is border-left, not a nested widget, because a border cannot be
  * clipped away by a scroller the way a 4px box can. */
+/* A crew card: one coder, or one faculty, in a lane.
+ *
+ * The left border is the state, because a column of cards is read by scanning
+ * down the edge rather than by reading each one. Working is the accent; finished
+ * is dimmed; waiting is the plain subtitle colour. Three colours rather than two,
+ * because "has not started" and "has finished" look identical otherwise and mean
+ * opposite things. */
+.crew-card {
+    background-color: $button_bg;
+    border-left: 3px solid $subtitle_fg;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 0 0 6px 0;
+}
+
+.crew-card-working {
+    border-left-color: $accent;
+    background-color: $button_hover;
+}
+
+.crew-card-done {
+    opacity: 0.72;
+}
+
+.crew-card-held {
+    border-left-color: $error;
+}
+
 .faculty {
     padding: 6px 10px;
     margin: 1px 0;

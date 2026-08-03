@@ -26,6 +26,7 @@
 #include <gtkmm/textview.h>
 #include <gtkmm/dropdown.h>
 #include <gtkmm/entry.h>
+#include <gtkmm/expander.h>
 #include <gtkmm/flowbox.h>
 #include <gtkmm/dropdown.h>
 #include <gtkmm/grid.h>
@@ -210,6 +211,20 @@ private:
     // the rest.
     Gtk::ScrolledWindow root_scroller_;
 
+    // The tuning, folded away.
+    //
+    // The common path through this window is three things: pick a project, say
+    // what to build, press Start. Everything else -- seven switches, nine role
+    // counts, three numbers and a pack -- is tuning, and it was all sitting
+    // between the task box and the button. Nineteen controls in front of a
+    // three-step job is a window you have to read before you can use it.
+    //
+    // Collapsed by default and remembering nothing: it is a disclosure, not a
+    // mode, so opening it changes what you can see and never what a run does.
+    Gtk::Expander tuning_{"Tuning"};
+    Gtk::Box      tuning_box_{Gtk::Orientation::VERTICAL, 8};
+
+
     // Which roles this crew may use.
     //
     // You have nine -- six built-in and whatever you have written into
@@ -227,11 +242,14 @@ private:
     // that starts at 0 everywhere else would be the one that switches your whole
     // crew off.
     Gtk::Label  roles_label_;
-    // A FlowBox, not a Box: nine roles do not fit one line at the width this
-    // window is actually used at, and a horizontal Box would clip the last few
-    // rather than wrapping them onto a second row.
-    Gtk::FlowBox roles_row_;
-    std::vector<std::unique_ptr<Gtk::Widget>>       role_widgets_;
+    // A GRID, not a Box and not a FlowBox.
+    //
+    // A Box clips the last few roles at the width this window is actually used
+    // at. A FlowBox wraps them, but every cell is a different width because the
+    // role names are -- "perf" against "architect" -- so the numbers came out
+    // ragged and nothing lined up with anything. A grid gives real columns: names
+    // in one, spinners in the next, aligned down the page.
+    Gtk::Grid roles_row_;
     std::vector<Gtk::SpinButton*>                   role_counts_;
     std::vector<std::string>                        role_names_;
 
