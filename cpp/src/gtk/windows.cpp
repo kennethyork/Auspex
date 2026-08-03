@@ -1166,6 +1166,24 @@ void CrewWindow::refresh_run() {
             card->append(*which_model);
         }
 
+        // What it is doing right now, and what it has changed so far.
+        //
+        // This is the line that turns "doing" into something worth watching:
+        // "reading cpp/src/gtk/panel.cpp · +12 −3". Every step was already
+        // recorded and none of it was published until the coder finished, which
+        // is exactly when it stops being interesting.
+        if (const std::string doing = crew_subtask_activity_line(subtask);
+            !doing.empty()) {
+            auto* activity = Gtk::make_managed<Gtk::Label>(doing);
+            activity->set_xalign(0.0f);
+            activity->set_wrap(true);
+            activity->add_css_class("subtitle");
+            // Marked while it is actually working, so a glance separates the
+            // coder in flight from the three that have stopped.
+            if (!subtask.activity.empty()) activity->add_css_class("accent");
+            card->append(*activity);
+        }
+
         // A steer box on the coder itself, as ollamadev-qt's CoderPane has. The
         // window already had one, but it auto-targeted the earliest running coder
         // -- fine with one in flight, guesswork with four. This says which.

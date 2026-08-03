@@ -533,6 +533,13 @@ CrewRun parse_crew_run(const std::string& json_text) {
             subtask.backend = string_field(entry, "backend");
             subtask.model   = string_field(entry, "model");
             subtask.route   = string_field(entry, "route");
+            subtask.activity = string_field(entry, "activity");
+            if (entry.contains("added") && entry["added"].is_number_integer()) {
+                subtask.added = entry["added"].get<int>();
+            }
+            if (entry.contains("removed") && entry["removed"].is_number_integer()) {
+                subtask.removed = entry["removed"].get<int>();
+            }
             run.subtasks.push_back(std::move(subtask));
         }
     }
@@ -566,6 +573,31 @@ CrewLane crew_lane_of(const CrewSubtask& subtask) {
     if (subtask.state == "todo")      return CrewLane::Todo;
     if (subtask.state.empty())        return CrewLane::Todo;   // nothing recorded yet
     return CrewLane::Doing;
+}
+
+void count_diff_lines(const std::string& diff, int* added, int* removed) {
+    int plus = 0, minus = 0;
+    for (const auto& line : split_lines(diff)) {
+        // The headers are not changes. "+++ b/x" and "--- a/x" both start with the
+        // marker character, and counting them would add two per file to every
+        // number -- small, wrong, and exactly the kind of thing nobody checks.
+        if (line.rfind("+++", 0) == 0 || line.rfind("---", 0) == 0) continue;
+        if (line.rfind("+", 0) == 0) ++plus;
+        else if (line.rfind("-", 0) == 0) ++minus;
+    }
+    if (added) *added = plus;
+    if (removed) *removed = minus;
+}
+
+std::string crew_subtask_activity_line(const CrewSubtask& subtask) {
+    std::string line = trim(subtask.activity);
+
+    if (subtask.added > 0 || subtask.removed > 0) {
+        const std::string counts = "+" + std::to_string(subtask.added) + " \u2212" +
+                                   std::to_string(subtask.removed);
+        line = line.empty() ? counts : line + "  \u00b7  " + counts;
+    }
+    return line;
 }
 
 std::string crew_subtask_model_line(const CrewSubtask& subtask) {

@@ -1017,7 +1017,7 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,
                        const CoderLimits& limits, const std::string& model,
                        const std::filesystem::path& mailbox, const SkillSet& skills,
-                       const McpAccess& mcp) {
+                       const McpAccess& mcp, const CoderProgress& on_step) {
     // Where the names in this subtask are DEFINED, worked out ONCE.
     //
     // Parsing the project costs a few seconds and cannot change while this coder
@@ -1071,6 +1071,8 @@ CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
         CoderStep current;
         current.call   = parse_tool_call(text);
         current.result = run_tool(current.call, sandbox, limits, skills, mcp);
+
+        if (on_step) on_step(current);
 
         if (current.call.tool == CoderTool::Finish) {
             outcome.finished = true;

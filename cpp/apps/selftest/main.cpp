@@ -7534,6 +7534,86 @@ void test_crew_members() {
         return {};
     };
 
+    // ---- what a coder is doing, not just that it is doing something ----
+    //
+    // cnvs.dev shows each agent's live operation and diff stats; Auspex showed a
+    // state word. The data existed the whole time -- every step was in
+    // CoderOutcome::steps and none of it was published until the coder finished,
+    // which is exactly when it stops being worth watching.
+    {
+        // Counting a diff, which is easy to get wrong: the +++ and --- headers
+        // are not changes, and counting them adds two per file to every number.
+        int added = 0, removed = 0;
+        count_diff_lines(
+            "--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n-    return a - b\n"
+            "+    return a + b\n+    # new\n",
+            &added, &removed);
+        check_eq(added, 2, "two lines added");
+        check_eq(removed, 1, "one removed");
+
+        int none_added = 0, none_removed = 0;
+        count_diff_lines("", &none_added, &none_removed);
+        check_eq(none_added, 0, "an empty diff adds nothing");
+
+        // The header-only case, which is what a wrong implementation passes.
+        int header_added = 0, header_removed = 0;
+        count_diff_lines("--- a/x\n+++ b/x\n", &header_added, &header_removed);
+        check_eq(header_added, 0, "a diff of only headers counts as no change");
+        check_eq(header_removed, 0, "in both directions");
+    }
+
+    // ---- the line a person reads ----
+    {
+        CrewSubtask working;
+        working.activity = "reading cpp/src/gtk/panel.cpp";
+        working.added = 12;
+        working.removed = 3;
+        const std::string line = crew_subtask_activity_line(working);
+        check(line.find("reading cpp/src/gtk/panel.cpp") != std::string::npos,
+              "what it is doing");
+        check(line.find("+12") != std::string::npos, "and what it has added");
+        check(line.find("3") != std::string::npos, "and removed");
+
+        CrewSubtask finished;
+        finished.added = 5;
+        finished.removed = 1;
+        const std::string done = crew_subtask_activity_line(finished);
+        check(!done.empty(), "a finished coder still shows its diff stats");
+        check(done.find("reading") == std::string::npos,
+              "without claiming to be doing anything");
+
+        CrewSubtask idle;
+        check(crew_subtask_activity_line(idle).empty(),
+              "and a coder with nothing to report says nothing, rather than "
+              "showing a separator with nothing either side of it");
+    }
+
+    // ---- it survives the round trip through the state file ----
+    {
+        const CrewRun run = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,"phase":"build",
+            "subtasks":[{"n":1,"role":"coder","title":"a","state":"running",
+                         "activity":"writing calc.py","added":7,"removed":2}]
+        })");
+        check_eq(run.subtasks.size(), std::size_t{1}, "the subtask parses");
+        if (!run.subtasks.empty()) {
+            check_eq(run.subtasks[0].activity, std::string("writing calc.py"),
+                     "with its activity");
+            check_eq(run.subtasks[0].added, 7, "and its additions");
+            check_eq(run.subtasks[0].removed, 2, "and its removals");
+        }
+
+        // A state file written before this existed still parses, with nothing to
+        // report rather than zeros pretending to be measurements.
+        const CrewRun older = parse_crew_run(R"({
+            "runId":"r","task":"t","active":true,
+            "subtasks":[{"n":1,"role":"coder","title":"a","state":"running"}]
+        })");
+        check(older.subtasks[0].activity.empty(), "an older state file has none");
+        check(crew_subtask_activity_line(older.subtasks[0]).empty(),
+              "and shows nothing at all");
+    }
+
     // ---- everyone is listed, in the order the work happens ----
     {
         const CrewRun run = parse_crew_run(R"({

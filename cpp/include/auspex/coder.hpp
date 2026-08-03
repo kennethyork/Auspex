@@ -335,10 +335,19 @@ std::string researcher_prompt(const std::string& task,
                               const std::vector<CoderStep>& steps,
                               const CoderLimits& limits);
 
+// Called after every step, on the coder's own thread.
+//
+// A run takes minutes and the only thing anybody could see was a state word --
+// "doing". Every step was already in CoderOutcome::steps and none of it was
+// published until the coder had finished, which is exactly when it stops being
+// interesting. Whoever takes this must be safe to call from a worker thread.
+using CoderProgress = std::function<void(const CoderStep&)>;
+
 CoderOutcome run_coder(const Config& config, const PlannedSubtask& subtask,
                        const std::filesystem::path& sandbox,
                        const CoderLimits& limits = {}, const std::string& model = {},
                        const std::filesystem::path& mailbox = {},
-                       const SkillSet& skills = {}, const McpAccess& mcp = {});
+                       const SkillSet& skills = {}, const McpAccess& mcp = {},
+                       const CoderProgress& on_step = {});
 
 }  // namespace auspex

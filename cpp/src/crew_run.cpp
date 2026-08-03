@@ -1006,6 +1006,14 @@ struct Attempt {
     Changeset      changeset;
     Audit          audit;
     std::string    state;   // the word written into the state file
+
+    // What this coder is doing right now, and what it has changed so far.
+    //
+    // Written from the coder's own thread as each step finishes, read on the GTK
+    // thread. Guarded by the same state_mutex everything else in this file uses.
+    std::string    activity;
+    int            added   = 0;
+    int            removed = 0;
 };
 
 std::string encode_state(const std::string& run_id, const std::string& task,
@@ -1034,6 +1042,9 @@ std::string encode_state(const std::string& run_id, const std::string& task,
         entry["backend"] = attempt.outcome.model.empty() ? "ollama"
                                                        : attempt.outcome.model;
         entry["route"] = "";
+        entry["activity"] = attempt.activity;
+        entry["added"]    = attempt.added;
+        entry["removed"]  = attempt.removed;
         subtasks.push_back(std::move(entry));
     }
     document["subtasks"] = std::move(subtasks);
@@ -1562,11 +1573,51 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
                     piece.detail = piece.detail + "\n\n" + no_cheating_note();
                 }
 
+                // What it is doing, published as it happens.
+                //
+                // The board used to say "doing" for minutes at a time while every
+                // read and write sat in CoderOutcome::steps, unpublished until the
+                // coder had finished -- which is exactly when it stops being
+                // worth watching.
+                const auto report = [&](const CoderStep& step) {
+                    std::string doing;
+                    switch (step.call.tool) {
+                        case CoderTool::Read:    doing = "reading "; break;
+                        case CoderTool::Write:   doing = "writing "; break;
+                        case CoderTool::Replace: doing = "editing "; break;
+                        case CoderTool::Delete:  doing = "deleting "; break;
+                        case CoderTool::List:    doing = "looking around"; break;
+                        case CoderTool::Run:     doing = "running tests"; break;
+                        case CoderTool::Skill:   doing = "opening a skill"; break;
+                        case CoderTool::Mcp:     doing = "calling a tool"; break;
+                        case CoderTool::Finish:  doing = "finishing"; break;
+                        case CoderTool::Unknown: doing = "thinking"; break;
+                    }
+                    if (!step.call.path.empty()) doing += step.call.path;
+
+                    {
+                        std::lock_guard lock(state_mutex);
+                        attempt.activity = doing;
+                        // Counted from the sandbox as it stands, so the numbers
+                        // move while the coder works rather than appearing all at
+                        // once when it stops.
+                        if (step.call.tool == CoderTool::Write ||
+                            step.call.tool == CoderTool::Replace ||
+                            step.call.tool == CoderTool::Delete) {
+                            const Changeset so_far =
+                                capture_changeset(options.project, sandbox);
+                            count_diff_lines(so_far.diff, &attempt.added,
+                                             &attempt.removed);
+                        }
+                    }
+                    publish(/*active=*/true);
+                };
+
                 attempt.outcome = run_coder(config, piece, sandbox,
                                             limits, coder_model,
                                             steer_mailbox(result.run_id,
                                                           attempt.subtask.n),
-                                            skills, mcp);
+                                            skills, mcp, report);
             }
 
             // Do the tests still pass?
@@ -1626,6 +1677,12 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
             }
 
             attempt.changeset = capture_changeset(options.project, sandbox);
+            {
+                std::lock_guard lock(state_mutex);
+                attempt.activity.clear();   // it is not doing anything now
+                count_diff_lines(attempt.changeset.diff, &attempt.added,
+                                 &attempt.removed);
+            }
 
             // A green suite proves nothing if the suite was edited to be green.
             // Checked on the diff rather than on intent: adding tests only adds

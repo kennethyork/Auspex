@@ -126,6 +126,19 @@ struct CrewSubtask {
     std::string model;
     std::string route;
 
+    // What this coder is doing RIGHT NOW: "reading cpp/src/gtk/panel.cpp",
+    // "writing calc.py". Empty when it is not running.
+    //
+    // A state word says a coder is "doing"; this says what. It is the difference
+    // between a progress bar and a window you can actually watch, and the data
+    // existed all along -- every step was in CoderOutcome::steps and none of it
+    // was ever published.
+    std::string activity;
+
+    // Lines this coder has added and removed so far. Both zero before it writes.
+    int added   = 0;
+    int removed = 0;
+
     bool operator==(const CrewSubtask&) const = default;
 };
 
@@ -151,6 +164,16 @@ bool crew_subtask_held(const CrewSubtask& subtask);
 // "gpt-oss:20b-cloud · hard" -- the model and the routing note, for one line under
 // a subtask's title. Empty when nothing is known about either.
 std::string crew_subtask_model_line(const CrewSubtask& subtask);
+
+// "reading panel.cpp · +12 −3", or as much of it as is known. Empty when nothing
+// is known, so a row that has nothing to say stays quiet rather than showing a
+// separator with nothing either side of it.
+std::string crew_subtask_activity_line(const CrewSubtask& subtask);
+
+// How many lines a unified diff adds and removes. Pure, so the counting is
+// testable without a crew -- and it is easy to get wrong, because the +++ and ---
+// header lines are not changes.
+void count_diff_lines(const std::string& diff, int* added, int* removed);
 
 struct CrewRun {
     bool                     active = false;
