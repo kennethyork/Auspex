@@ -64,7 +64,9 @@ bool is_known_role(const std::string& role) {
 std::string director_prompt(const std::string& task,
                             const std::vector<std::string>& files,
                             int max_subtasks, const std::string& hint,
-                            const std::string& focus) {
+                            const std::string& focus,
+                            const std::vector<std::string>& roles,
+                            const std::map<std::string, int>& role_limits) {
     if (max_subtasks < 1) max_subtasks = 1;
 
     std::ostringstream out;
@@ -84,7 +86,31 @@ std::string director_prompt(const std::string& task,
     // With descriptions, not as a bare list of words. The Director was previously
     // choosing between six nouns and had to guess what they meant; "reviewer"
     // in particular reads like a coder unless you are told it never edits.
-    out << role_catalog(all_personas()) << "\n";
+    {
+        // Only the roles this run will honour. Offering one it would then collapse
+        // to "coder" spends a Director call on a choice that gets thrown away.
+        auto offered = all_personas();
+        if (!roles.empty()) {
+            offered.erase(std::remove_if(offered.begin(), offered.end(),
+                                         [&roles](const RolePersona& p) {
+                                             return std::find(roles.begin(),
+                                                              roles.end(),
+                                                              p.name) == roles.end();
+                                         }),
+                          offered.end());
+        }
+        out << role_catalog(offered);
+
+        // How many of each, when a limit was set. Said as a rule rather than
+        // buried in the catalogue line, because it is a constraint on the plan
+        // and the rest of that block is a description of the choices.
+        for (const auto& [role, limit] : role_limits) {
+            if (limit <= 0) continue;
+            out << "- at most " << limit << " piece" << (limit == 1 ? "" : "s")
+                << " may be \"" << role << "\"\n";
+        }
+        out << "\n";
+    }
 
     // The file listing, not the contents. The Director decides how to cut a job
     // up; for that it needs to know what exists. Contents would spend the whole

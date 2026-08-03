@@ -149,6 +149,26 @@ struct RunOptions {
     // are staged, so work you had in progress alongside is not swept in.
     bool        commit = false;
 
+    // HOW MANY of each role this run may have.
+    //
+    // role -> the most pieces that may carry it. 0 means the role is off; a role
+    // absent from the map is unlimited. Empty means no limits at all.
+    //
+    // max_subtasks caps the total and `parallel` caps how many run at once;
+    // neither can say "three coders and one tester", which is the thing you
+    // actually want to ask for. The Director was offered every role on every run
+    // and the whole mix was its own decision.
+    std::map<std::string, int> role_limits;
+
+    // The cap for a role: -1 when there is none.
+    int role_limit(const std::string& role) const;
+
+    // True when this role may be used at all (its limit is not 0).
+    bool role_allowed(const std::string& role) const;
+
+    // The roles this run will honour, for the Director's prompt.
+    std::vector<std::string> offered_roles() const;
+
     // Write the shipped starter skills that match this task into the project.
     //
     // ON by default, unlike most things here, because the failure mode is mild

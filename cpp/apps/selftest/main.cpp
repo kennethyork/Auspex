@@ -7534,6 +7534,50 @@ void test_crew_members() {
         return {};
     };
 
+    // ---- how many of each role ----
+    //
+    // max_subtasks caps the total and `parallel` caps how many run at once;
+    // neither can say "three coders and one tester", which is the thing you
+    // actually want to ask for.
+    {
+        RunOptions none;
+        check(none.role_allowed("coder"), "with no limits every role is allowed");
+        check(none.role_allowed("tester"), "including ones nobody mentioned");
+        check_eq(none.role_limit("coder"), -1, "and none of them has a cap");
+
+        // An ABSENT limit is unlimited, not zero. The failure mode of every
+        // allowlist that defaults to empty is a crew that can do nothing.
+        RunOptions some;
+        some.role_limits["tester"] = 2;
+        check(some.role_allowed("coder"),
+              "a role nobody limited is still allowed when another one is");
+        check_eq(some.role_limit("tester"), 2, "and the limit is what was set");
+
+        RunOptions off;
+        off.role_limits["docs"] = 0;
+        check(!off.role_allowed("docs"), "zero switches a role off");
+        check(off.role_allowed("coder"), "without switching off the others");
+
+        const auto offered = off.offered_roles();
+        check(std::find(offered.begin(), offered.end(), "docs") == offered.end(),
+              "and a role that is off is not offered to the Director -- offering "
+              "one the run will not honour spends a call on a choice that gets "
+              "thrown away");
+        check(std::find(offered.begin(), offered.end(), "coder") != offered.end(),
+              "while the rest still are");
+    }
+
+    // ---- the Director is told the numbers ----
+    {
+        std::map<std::string, int> limits{{"tester", 1}, {"docs", 0}};
+        const std::string prompt =
+            director_prompt("do a thing", {}, 4, {}, {}, {"coder", "tester"}, limits);
+        check(prompt.find("at most 1 piece may be \"tester\"") != std::string::npos,
+              "a cap is stated as a rule");
+        check(prompt.find("\"docs\"") == std::string::npos,
+              "and a role set to 0 is not mentioned at all");
+    }
+
     // ---- what a coder is doing, not just that it is doing something ----
     //
     // cnvs.dev shows each agent's live operation and diff stats; Auspex showed a

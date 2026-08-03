@@ -28,6 +28,7 @@
 #include "auspex/crew.hpp"
 #include "auspex/cli_coder.hpp"
 #include "auspex/crew_run.hpp"
+#include "auspex/roles.hpp"
 #include "auspex/usage.hpp"
 #include "auspex/gtk/voice.hpp"
 #include "auspex/ollama_client.hpp"
@@ -698,6 +699,52 @@ CrewWindow::CrewWindow() {
     options_.append(verify_);
     options_.append(starters_);
 
+    // The roles this crew may use, one box each, all ticked.
+    //
+    // Built from all_personas(), so a role you write into your own crew-roles
+    // directory appears here without a line of GUI code -- the same way the pack
+    // picker gained seven packs for free.
+    // The label says what the widget SHOWS. It used to say "blank is no limit"
+    // while the spinner read -1, which is a label contradicting the thing beside
+    // it -- small, and the sort of wrongness that makes a person distrust the
+    // rest of the window.
+    roles_label_.set_text("How many of each role  (0 leaves it to the Director)");
+    roles_label_.set_xalign(0.0f);
+    roles_label_.add_css_class("subtitle");
+
+    // Built from all_personas(), so a role you write into your own crew-roles
+    // directory appears here without a line of GUI code -- the same way the pack
+    // picker gained seven packs for free.
+    for (const auto& persona : all_personas()) {
+        auto cell = std::make_unique<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 4);
+
+        auto* name = Gtk::make_managed<Gtk::Label>(persona.name);
+        name->add_css_class("caption");
+        cell->append(*name);
+
+        auto* count = Gtk::make_managed<Gtk::SpinButton>();
+        // Starts at 0, like every other number in this window, and means the same
+        // thing there: leave it alone.
+        count->set_range(0, 12);
+        count->set_increments(1, 1);
+        count->set_value(0);
+        count->set_width_chars(3);
+
+        std::string tip = persona.description;
+        if (persona.read_only) tip += " (never edits)";
+        if (persona.custom) tip += "  — your own role";
+        tip += "\n0 leaves it to the Director · N means at most N pieces";
+        count->set_tooltip_text(tip);
+        name->set_tooltip_text(tip);
+
+        cell->append(*count);
+        roles_row_.insert(*cell, -1);
+
+        role_counts_.push_back(count);
+        role_names_.push_back(persona.name);
+        role_widgets_.push_back(std::move(cell));
+    }
+
     coders_label_.set_text("Coders");
     coders_.set_range(0, 12);
     coders_.set_increments(1, 2);
@@ -827,6 +874,12 @@ CrewWindow::CrewWindow() {
     root_.append(task_label_);
     root_.append(task_);
     root_.append(options_);
+    roles_row_.set_selection_mode(Gtk::SelectionMode::NONE);
+    roles_row_.set_max_children_per_line(6);
+    roles_row_.set_row_spacing(4);
+    roles_row_.set_column_spacing(10);
+    root_.append(roles_label_);
+    root_.append(roles_row_);
     root_.append(second_row_);
     root_.append(start_row_);
     root_.append(run_heading_);
@@ -973,6 +1026,14 @@ void CrewWindow::start() {
     options.learn    = learn_.get_active();
     options.security = security_.get_active();
     options.starter_skills = starters_.get_active();
+
+    // Only the numbers you actually set. 0 is "leave it alone", which is the same
+    // as saying nothing and one fewer thing for the engine to carry.
+    for (std::size_t i = 0; i < role_counts_.size(); ++i) {
+        if (const int value = role_counts_[i]->get_value_as_int(); value > 0) {
+            options.role_limits[role_names_[i]] = value;
+        }
+    }
 
     // ONE switch, not two. verify_attempts without allow_run runs nothing, so a
     // person ticking "Run the tests" and getting silence would be right to think

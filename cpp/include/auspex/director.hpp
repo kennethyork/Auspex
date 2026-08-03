@@ -18,6 +18,7 @@
 #pragma once
 
 #include <optional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -72,10 +73,17 @@ struct Plan {
 // store", "a REST API". It goes ABOVE the task, because it changes what a
 // sensible plan looks like: the same "add a discount field" is cut up differently
 // for a shop than for a library.
+// `roles` limits what the Director may assign. Empty offers all of them.
+//
+// Offering a role the run will not honour is worse than not offering it: the
+// Director spends a call choosing, and parse_plan turns the choice into
+// something else.
 std::string director_prompt(const std::string& task,
                             const std::vector<std::string>& files,
                             int max_subtasks, const std::string& hint = {},
-                            const std::string& focus = {});
+                            const std::string& focus = {},
+                            const std::vector<std::string>& roles = {},
+                            const std::map<std::string, int>& role_limits = {});
 
 // Reads the Director's reply.
 //

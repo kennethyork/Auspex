@@ -26,6 +26,7 @@
 #include <gtkmm/textview.h>
 #include <gtkmm/dropdown.h>
 #include <gtkmm/entry.h>
+#include <gtkmm/flowbox.h>
 #include <gtkmm/dropdown.h>
 #include <gtkmm/grid.h>
 #include <gtkmm/checkbutton.h>
@@ -208,6 +209,32 @@ private:
     // screenshot of it showed the option row sliced in half with no way to reach
     // the rest.
     Gtk::ScrolledWindow root_scroller_;
+
+    // Which roles this crew may use.
+    //
+    // You have nine -- six built-in and whatever you have written into
+    // ~/.ollamadev/crew-roles -- and the window showed none of them. The Director
+    // was offered all of them on every run and there was no way to say "this job
+    // is code and tests, not documentation".
+    //
+    // A NUMBER each: at most this many pieces may carry the role. "Three coders
+    // and one tester" is the thing you actually want to ask for, and neither
+    // max_subtasks nor parallel can say it.
+    //
+    // ZERO IS THE DEFAULT AND MEANS "leave it to the Director" -- the same thing
+    // 0 already means in Coders, Swarm and Amplify two rows below. Giving it the
+    // opposite meaning here would be two conventions in one window, and the row
+    // that starts at 0 everywhere else would be the one that switches your whole
+    // crew off.
+    Gtk::Label  roles_label_;
+    // A FlowBox, not a Box: nine roles do not fit one line at the width this
+    // window is actually used at, and a horizontal Box would clip the last few
+    // rather than wrapping them onto a second row.
+    Gtk::FlowBox roles_row_;
+    std::vector<std::unique_ptr<Gtk::Widget>>       role_widgets_;
+    std::vector<Gtk::SpinButton*>                   role_counts_;
+    std::vector<std::string>                        role_names_;
+
 
     Gtk::Label  project_label_;
     Gtk::Button project_pick_{"Change…"};

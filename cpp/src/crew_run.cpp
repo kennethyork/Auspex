@@ -268,6 +268,26 @@ RunOptions with_config_roles(const Config& config, RunOptions options) {
     return options;
 }
 
+int RunOptions::role_limit(const std::string& role) const {
+    const auto found = role_limits.find(role);
+    return found == role_limits.end() ? -1 : found->second;
+}
+
+bool RunOptions::role_allowed(const std::string& role) const {
+    // An ABSENT limit is unlimited, not zero. A map nobody has filled in must not
+    // silently mean the crew can do nothing -- that is the failure mode of every
+    // allowlist that defaults to empty.
+    return role_limit(role) != 0;
+}
+
+std::vector<std::string> RunOptions::offered_roles() const {
+    std::vector<std::string> offered;
+    for (const auto& persona : all_personas()) {
+        if (role_allowed(persona.name)) offered.push_back(persona.name);
+    }
+    return offered;
+}
+
 std::string RunOptions::model_for(const std::string& role) const {
     // The role's own setting, then whatever it falls back to, then the run-wide
     // model, then (by returning empty) the config's. Walked rather than
@@ -1461,7 +1481,8 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
         const std::string reply =
             ask_cli(options.director_backend, options.model_for("director"),
                     director_prompt(options.task, files, options.max_subtasks,
-                                    hint, options.focus),
+                                    hint, options.focus, options.offered_roles(),
+                                    options.role_limits),
                     options.project);
         plan = parse_plan(reply, options.max_subtasks);
     } else if (options.amplify > 1) {
@@ -1475,6 +1496,36 @@ RunResult run_crew(const Config& config, const RunOptions& requested,
         result.error = plan.error;
         publish(/*active=*/false);
         return finish(result);
+    }
+
+    // Enforced on the way back as well as offered on the way out.
+    //
+    // A Director asked for at most two testers will sometimes plan three. The
+    // extra becomes a `coder` rather than being dropped: the piece of work is
+    // still worth doing, it just does not get the role that was full. If `coder`
+    // itself is switched off the piece goes, because there is nobody to give it
+    // to.
+    {
+        std::map<std::string, int> used;
+        std::vector<PlannedSubtask> kept;
+        for (auto& subtask : plan.subtasks) {
+            const int limit = options.role_limit(subtask.role);
+            if (limit == 0 || (limit > 0 && used[subtask.role] >= limit)) {
+                subtask.role = "coder";
+            }
+            const int coder_limit = options.role_limit("coder");
+            if (subtask.role == "coder" && coder_limit == 0) continue;
+            if (subtask.role == "coder" && coder_limit > 0 &&
+                used["coder"] >= coder_limit) {
+                continue;
+            }
+            ++used[subtask.role];
+            kept.push_back(std::move(subtask));
+        }
+        plan.subtasks = std::move(kept);
+        for (std::size_t i = 0; i < plan.subtasks.size(); ++i) {
+            plan.subtasks[i].n = static_cast<int>(i) + 1;
+        }
     }
 
     for (const auto& subtask : plan.subtasks) {
