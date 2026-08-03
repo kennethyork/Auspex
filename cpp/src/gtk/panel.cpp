@@ -200,9 +200,12 @@ void ScreenGlass::apply(const Rect& screen, double opacity) {
         return;
     }
 
-    // Auspex's own windows are SKIPPED. They are already translucent by
-    // stylesheet, where only the background goes glass and the text stays solid;
-    // this on top would dim them twice and fade their own text for nothing.
+    // Auspex's own windows are SKIPPED. They do this themselves, by stylesheet,
+    // where only the background goes glass and the text stays solid -- this on top
+    // would dim them twice and fade their own text for nothing. They follow the
+    // same rule as everything here, including going solid when dragged to another
+    // monitor; they just hear about the crossing from GDK instead of from wmctrl.
+    // See make_glass() in windows.cpp.
     std::vector<PlacedWindow> theirs;
     for (auto& placed : list_placed_windows()) {
         // CONTAINS, not starts-with. wmctrl prefixes every title with the host

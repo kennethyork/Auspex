@@ -121,6 +121,19 @@ void test_css() {
     check(css.find("alpha(#c0caf5, 0.2)") != std::string::npos,
           "scrollbar alpha() keeps its colour argument");
 
+    // A window dragged off the panel's screen goes solid, like every other window
+    // on the desktop does. The rule needs BOTH classes or it would not outrank the
+    // translucent one it exists to override -- and a specificity mistake here is
+    // invisible until you drag a window to another monitor and it stays glass.
+    check(css.find("window.auspex-window.auspex-solid") != std::string::npos,
+          "an off-monitor window has a rule to go solid");
+    {
+        const auto glass = css.find("window.auspex-window,");
+        const auto solid = css.find("window.auspex-window.auspex-solid,");
+        check(glass != std::string::npos && solid != std::string::npos && solid > glass,
+              "the solid rule comes after the glass one it overrides");
+    }
+
     // Panel controls carry no chrome until you touch them. Twenty filled plates on
     // one bar reads as a row of boxes rather than a row of things to press.
     {

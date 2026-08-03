@@ -113,6 +113,27 @@ window.auspex-window .background {
     background-color: alpha($panel_bg, $window_opacity);
 }
 
+/* ...UNLESS the window has been moved off the panel's screen.
+ *
+ * Every other window on the desktop is dimmed only while it is on the panel's
+ * monitor and goes solid again when dragged to another one. Auspex's own windows
+ * did not follow that rule: their translucency came from this stylesheet, which
+ * has no idea where a window is, so they stayed glass on every screen. Carrying
+ * the effect to a monitor that has no panel on it is exactly the thing the
+ * screen-wide version was written not to do.
+ *
+ * Two classes beat one, so this wins over the rule above without !important.
+ * Toggled on the window as it crosses monitors, which GDK reports directly --
+ * no polling, and no asking the window manager where anything is. */
+window.auspex-window.auspex-solid,
+window.auspex-window.auspex-solid > box,
+window.auspex-window.auspex-solid box,
+window.auspex-window.auspex-solid scrolledwindow,
+window.auspex-window.auspex-solid viewport,
+window.auspex-window.auspex-solid .background {
+    background-color: $panel_bg;
+}
+
 box {
     background-color: $panel_bg;
 }

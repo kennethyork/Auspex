@@ -14,6 +14,9 @@
 #include <gtkmm/separator.h>
 #include <gtkmm/stringlist.h>
 
+#include <gdkmm/monitor.h>
+#include <gdkmm/surface.h>
+#include <gdkmm/display.h>
 #include <gdkmm/clipboard.h>
 
 #include <nlohmann/json.hpp>
@@ -24,6 +27,7 @@
 #include <gtkmm/stringobject.h>
 
 #include "auspex/audio.hpp"
+#include "auspex/desktop.hpp"
 #include "auspex/autostart.hpp"
 #include "auspex/crew.hpp"
 #include "auspex/cli_coder.hpp"
@@ -56,6 +60,59 @@ std::vector<std::string> split_words(const std::string& command) {
 
 }  // namespace
 
+namespace {
+
+// Is this window on the same monitor as the panel?
+//
+// Unknown counts as YES. The alternative is a window that flashes solid for the
+// moment between mapping and GDK knowing where it is, and being glass somewhere
+// it should not be is a smaller fault than flickering everywhere.
+bool on_panel_monitor(Gtk::Window& window) {
+    const auto surface = window.get_surface();
+    const auto display = window.get_display();
+    if (!surface || !display) return true;
+
+    const auto monitor = display->get_monitor_at_surface(surface);
+    const auto panel   = primary_monitor();
+    if (!monitor || !panel) return true;
+
+    Gdk::Rectangle geometry;
+    monitor->get_geometry(geometry);
+    // Origin, not size: two monitors can be the same size, but only one starts
+    // at a given corner of the desk.
+    return geometry.get_x() == panel->bounds.x && geometry.get_y() == panel->bounds.y;
+}
+
+// Make `window` one of the shell's glass windows, and keep it honest as it moves.
+//
+// The class alone made it translucent everywhere, including on monitors with no
+// panel. GDK reports monitor crossings on the surface, so this costs nothing
+// until the window actually moves -- no timer, and nothing asking wmctrl where
+// anything is.
+void make_glass(Gtk::Window& window) {
+    window.add_css_class("auspex-window");
+
+    Gtk::Window* target = &window;
+    const auto refresh = [target] {
+        if (on_panel_monitor(*target)) target->remove_css_class("auspex-solid");
+        else                           target->add_css_class("auspex-solid");
+    };
+
+    // Connected on realize because there is no surface before then, and the
+    // surface is what reports the crossings.
+    target->signal_realize().connect([target, refresh] {
+        if (const auto surface = target->get_surface()) {
+            surface->signal_enter_monitor().connect(
+                [refresh](const Glib::RefPtr<Gdk::Monitor>&) { refresh(); });
+            surface->signal_leave_monitor().connect(
+                [refresh](const Glib::RefPtr<Gdk::Monitor>&) { refresh(); });
+        }
+        refresh();
+    });
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // LauncherWindow
 // ---------------------------------------------------------------------------
@@ -63,7 +120,7 @@ LauncherWindow::LauncherWindow(const Config& config) : config_(config) {
     set_title("Auspex Launcher");
     // Opts this window into the shell's translucency. See the .auspex-window rule
     // in theme.cpp: the glass is the window and its layout boxes, never the rows.
-    add_css_class("auspex-window");
+    make_glass(*this);
     set_default_size(520, 560);
 
     // NOT modal. A modal window needs a transient parent to mean anything, and the
@@ -211,7 +268,7 @@ void LauncherWindow::launch_selected() {
 // ---------------------------------------------------------------------------
 CalendarWindow::CalendarWindow() {
     set_title("Auspex Calendar");
-    add_css_class("auspex-window");
+    make_glass(*this);
     set_default_size(980, 660);
 
     events_ = EventStore::load();
@@ -537,7 +594,7 @@ void CalendarWindow::go_today() {
 // ---------------------------------------------------------------------------
 CrewWindow::CrewWindow() {
     set_title("Auspex Crew");
-    add_css_class("auspex-window");
+    make_glass(*this);
     // 960, not 720. --check-windows measures this window's content at 888px with
     // the tuning open, so the old default clipped out of the box -- three switches
     // and part of the role grid unreachable on first run, which nobody would read
@@ -1716,7 +1773,7 @@ void CrewWindow::decide(int n, bool accept) {
 // ---------------------------------------------------------------------------
 TeamWindow::TeamWindow(const Config& config) : config_(config) {
     set_title("Auspex Team");
-    add_css_class("auspex-window");
+    make_glass(*this);
     set_default_size(620, 620);
     set_hide_on_close(true);
 
@@ -1968,7 +2025,7 @@ void BrainWindow::measure(bool auditor) {
 
 BrainWindow::BrainWindow() {
     set_title("Auspex Brain");
-    add_css_class("auspex-window");
+    make_glass(*this);
     set_default_size(700, 860);
     set_hide_on_close(true);
 
@@ -2422,7 +2479,7 @@ void BrainWindow::show_usage() {
 // ---------------------------------------------------------------------------
 ProjectsWindow::ProjectsWindow(const Config& config) : config_(config) {
     set_title("Auspex Projects");
-    add_css_class("auspex-window");
+    make_glass(*this);
     set_default_size(820, 560);
     set_hide_on_close(true);
 
@@ -2703,7 +2760,7 @@ void ProjectsWindow::open_files() {
 ChatWindow::ChatWindow(const Config& config, VoiceController& voice)
     : config_(config), voice_(voice) {
     set_title("Auspex");
-    add_css_class("auspex-window");
+    make_glass(*this);
     set_default_size(680, 620);
 
     log_.set_margin(12);
@@ -2828,7 +2885,7 @@ void ChatWindow::add_message(const std::string& text, bool from_user) {
 // ---------------------------------------------------------------------------
 SettingsWindow::SettingsWindow(Config config) : config_(std::move(config)) {
     set_title("Auspex Settings");
-    add_css_class("auspex-window");
+    make_glass(*this);
     set_default_size(520, 620);
 
     root_.set_margin(14);
