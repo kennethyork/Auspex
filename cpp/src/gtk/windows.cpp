@@ -29,6 +29,7 @@
 #include <gtkmm/stringobject.h>
 
 #include "auspex/audio.hpp"
+#include "auspex/smoke.hpp"
 #include "auspex/desktop.hpp"
 #include "auspex/autostart.hpp"
 #include "auspex/crew.hpp"
@@ -1061,6 +1062,9 @@ void CrewWindow::set_project(const std::filesystem::path& path) {
 }
 
 void CrewWindow::choose_project() {
+    // A file chooser is not dangerous, but it is modal and it would sit on the
+    // screen after the test that opened it had gone.
+    if (smoke_refuse("file chooser")) return;
     auto dialog = Gtk::FileDialog::create();
     dialog->set_title("Which folder should the crew work in?");
     if (is_project_dir(project_)) {
@@ -1830,6 +1834,9 @@ void TeamWindow::set_project(const std::filesystem::path& path) {
 }
 
 void TeamWindow::choose_project() {
+    // A file chooser is not dangerous, but it is modal and it would sit on the
+    // screen after the test that opened it had gone.
+    if (smoke_refuse("file chooser")) return;
     auto dialog = Gtk::FileDialog::create();
     dialog->set_title("Which folder should the team work in?");
     if (is_project_dir(project_)) {
@@ -2310,6 +2317,7 @@ void BrainWindow::save_models() {
     std::filesystem::create_directories(path.parent_path(), ec);
     const auto temp = path.string() + ".tmp";
     {
+        if (smoke_refuse("write file")) return;
         std::ofstream out(temp, std::ios::trunc);
         if (!out) {
             status_.set_text("⚠ could not write the config");
@@ -2634,6 +2642,9 @@ void ProjectsWindow::select(const std::filesystem::path& path) {
 }
 
 void ProjectsWindow::browse() {
+    // A file chooser is not dangerous, but it is modal and it would sit on the
+    // screen after the test that opened it had gone.
+    if (smoke_refuse("file chooser")) return;
     auto dialog = Gtk::FileDialog::create();
     dialog->set_title("Open a folder");
     if (is_project_dir(selected_)) {
@@ -3201,6 +3212,7 @@ void SettingsWindow::save() {
     // a truncated config, and the shell would fall back to defaults on next start.
     const auto temporary = path.string() + ".tmp";
     {
+        if (smoke_refuse("write config")) return;
         std::ofstream out(temporary, std::ios::trunc);
         if (!out) {
             status_.set_text("Could not write " + path.string());

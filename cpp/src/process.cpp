@@ -1,5 +1,7 @@
 #include "auspex/process.hpp"
 
+#include "auspex/smoke.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -20,6 +22,12 @@ namespace auspex {
 
 ProcessResult run(const std::vector<std::string>& argv, bool capture,
                   const std::string& cwd) {
+    // Every agent CLI, every git command, text-to-speech and every application
+    // the launcher starts comes through here.
+    if (smoke_refuse("spawn: " + (argv.empty() ? std::string("?") : argv[0]))) {
+        return {};
+    }
+
     ProcessResult result;
     if (argv.empty()) return result;
 
@@ -91,6 +99,10 @@ ProcessResult run(const std::vector<std::string>& argv, bool capture,
 LimitedResult run_limited(const std::vector<std::string>& argv, const std::string& cwd,
                           int timeout_seconds, std::size_t max_output,
                           const std::string& stdin_text) {
+    if (smoke_refuse("spawn: " + (argv.empty() ? std::string("?") : argv[0]))) {
+        return {};
+    }
+
     LimitedResult result;
     if (argv.empty()) return result;
 
@@ -230,6 +242,10 @@ LimitedResult run_limited(const std::vector<std::string>& argv, const std::strin
 }
 
 bool spawn_detached(const std::vector<std::string>& argv, const std::string& cwd) {
+    if (smoke_refuse("spawn: " + (argv.empty() ? std::string("?") : argv[0]))) {
+        return false;
+    }
+
     if (argv.empty()) return false;
 
     const pid_t first = ::fork();

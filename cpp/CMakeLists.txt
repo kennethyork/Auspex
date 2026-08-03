@@ -229,6 +229,7 @@ add_library(auspex-core STATIC
     src/audio.cpp
     src/asr.cpp
     src/tts.cpp
+    src/smoke.cpp
     src/theme.cpp
     src/panel_dock.cpp
     src/process.cpp

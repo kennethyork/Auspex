@@ -7,7 +7,10 @@
 // binary does none of that: it runs as an ordinary application inside your existing
 // Xfce session, so xfwm4 keeps compositing and a crash costs you a panel rather
 // than a desktop.
+#include <cmath>
+#include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <memory>
 
 #include <adwaita.h>
@@ -23,6 +26,14 @@
 #include "auspex/gtk/panel.hpp"
 #include "auspex/gtk/theming.hpp"
 #include "auspex/gtk/voice.hpp"
+#include <gtkmm/switch.h>
+#include <gtkmm/checkbutton.h>
+#include <gtkmm/button.h>
+#include "auspex/smoke.hpp"
+#include <gtkmm/listboxrow.h>
+#include <gtkmm/entry.h>
+#include <thread>
+#include <chrono>
 #include "auspex/gtk/windows.hpp"
 #include "auspex/panel_dock.hpp"
 
@@ -131,6 +142,72 @@ Fit measure_window(Gtk::Window& window, const std::string& name, int width) {
     return fit;
 }
 
+// Put something in every text field.
+//
+// Handlers validate before they act, so an empty form means every press lands in
+// a guard clause and the test measures nothing but the guard clauses.
+void fill_entries(Gtk::Widget* widget) {
+    if (!widget) return;
+    if (auto* entry = dynamic_cast<Gtk::Entry*>(widget)) {
+        if (entry->get_text().empty()) entry->set_text("smoke");
+    }
+    for (Gtk::Widget* child = widget->get_first_child(); child;
+         child = child->get_next_sibling()) {
+        fill_entries(child);
+    }
+}
+
+// Every control in a window, deepest last.
+//
+// Collected BEFORE anything is pressed, never during. A handler is free to add a
+// row, hide a box or rebuild a list, and walking the tree while that happens is
+// walking a tree that is being edited underneath you.
+void collect_controls(Gtk::Widget* widget, std::vector<Gtk::Widget*>& found) {
+    if (!widget) return;
+    if (dynamic_cast<Gtk::Button*>(widget) || dynamic_cast<Gtk::Switch*>(widget) ||
+        dynamic_cast<Gtk::CheckButton*>(widget) ||
+        dynamic_cast<Gtk::ListBoxRow*>(widget)) {
+        found.push_back(widget);
+    }
+    for (Gtk::Widget* child = widget->get_first_child(); child;
+         child = child->get_next_sibling()) {
+        collect_controls(child, found);
+    }
+}
+
+// Press one control, whatever kind it is.
+//
+// Insensitive controls are SKIPPED rather than forced. A greyed-out Stop button
+// is greyed out because there is nothing to stop, and activating it anyway would
+// test a state the program is written to prevent -- and would report a crash
+// that no user could ever reach.
+bool press(Gtk::Widget* widget) {
+    if (!widget->get_sensitive() || !widget->get_mapped()) return false;
+    if (auto* toggle = dynamic_cast<Gtk::Switch*>(widget)) {
+        toggle->set_active(!toggle->get_active());
+        return true;
+    }
+    if (auto* check = dynamic_cast<Gtk::CheckButton*>(widget)) {
+        check->set_active(!check->get_active());
+        return true;
+    }
+    if (auto* row = dynamic_cast<Gtk::ListBoxRow*>(widget)) {
+        // The launcher is a list, not a row of buttons, so without this it
+        // reported "pressed 0/0" and looked like a window with nothing in it.
+        row->activate();
+        return true;
+    }
+    if (auto* button = dynamic_cast<Gtk::Button*>(widget)) {
+        // activate(), not a synthesised click. This is GTK's own API for "do what
+        // this widget does", called in this process on a widget this process
+        // built. Nothing is sent to the X server, no pointer moves, and no window
+        // but ours can possibly receive it.
+        button->activate();
+        return true;
+    }
+    return false;
+}
+
 // Build one window by name, or null when the name is unknown.
 //
 // ONE list, because there were three: the single-window mode, the width check and
@@ -183,6 +260,18 @@ bool open_single_window(Gtk::Application& app, const std::string& name,
 }  // namespace
 
 int main(int argc, char** argv) {
+    // ARMED HERE, before anything else in the program runs.
+    //
+    // The guards read AUSPEX_SMOKE once and cache it, so setting it later than
+    // the first thing that consults it would leave them off -- and --smoke with
+    // the guards off is a program that presses "Talk" and opens the microphone
+    // for real. Set from argv directly rather than from the parsed flag, because
+    // the parsed flag arrives inside the command-line handler, which is already
+    // too late to be sure.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--smoke") ::setenv("AUSPEX_SMOKE", "1", 1);
+    }
+
     // Panels are dock windows that reserve screen edges via _NET_WM_STRUT_PARTIAL.
     // None of that exists under Wayland, so fail loudly rather than drawing a
     // floating window that silently does not dock.
@@ -201,12 +290,22 @@ int main(int argc, char** argv) {
     // came to be several features ahead of anything you can click. A window that
     // can be opened on its own can at least be SEEN.
     std::string only_window;
+    bool smoke = false;
+    bool check_glass = false;
     int check_width = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--window" && i + 1 < argc) only_window = argv[i + 1];
         // --check-windows [width]: does every window FIT, or does its content
         // force it wider than a person's window actually is?
+        if (arg == "--check-glass") {
+            check_glass = true;
+            continue;
+        }
+        if (arg == "--smoke") {
+            smoke = true;
+            continue;
+        }
         if (arg == "--check-windows") {
             // -1 means "each window against its OWN default size", which is the
             // question that matters: a window is not usually opened at some width
@@ -227,7 +326,7 @@ int main(int argc, char** argv) {
     // hands off to it and exits. That is what --check-windows did on its first
     // run: no output, exit 0, looking exactly like a check that had passed. A
     // check that silently does nothing is worse than no check at all.
-    const bool inspecting = !only_window.empty() || check_width != 0;
+    const bool inspecting = !only_window.empty() || check_width != 0 || smoke || check_glass;
     auto app = Gtk::Application::create(
         inspecting ? "one.auspex.ShellInspect" : "one.auspex.Shell",
         Gio::Application::Flags::HANDLES_COMMAND_LINE |
@@ -275,6 +374,241 @@ int main(int argc, char** argv) {
         // Every window measured, then stop. No display interaction, no clicking:
         // a minimum wider than the target is content GTK will not shrink to fit,
         // which is content you cannot reach.
+        if (check_glass) {
+            // The check I should have written before claiming the windows were
+            // transparent. I measured ONE window, got a number I liked and said
+            // it held for eight; the Team window was letting through nothing at
+            // all. This asks the same question of every window, of the property
+            // the compositor actually reads.
+            app->hold();
+            static std::vector<std::unique_ptr<Gtk::Window>> shown;
+            for (const auto& name : window_names()) {
+                std::unique_ptr<Gtk::Window> window = make_window(name, config);
+                if (!window) continue;
+                window->present();
+                shown.push_back(std::move(window));
+            }
+
+            // RETRIED until it settles, not sampled once.
+            //
+            // The dimming is another process's timer, and eight windows appearing
+            // at once are not all dimmed in the same tick. Sampling once at six
+            // seconds reported three windows solid that were merely not dimmed
+            // YET -- a check that races the thing it is checking, which is worse
+            // than no check because it fails on a healthy system.
+            static int attempt = 0;
+            Glib::signal_timeout().connect(
+                [&app, config]() -> bool {
+                    ++attempt;
+                    constexpr int kLastAttempt = 12;
+                    // The dimming is done by the RUNNING SHELL, on a timer. With
+                    // no shell running nothing dims anything, and reporting eight
+                    // failures would be blaming the windows for the absence of
+                    // the thing that dims them.
+                    bool shell_running = false;
+                    for (const auto& placed : auspex::list_placed_windows()) {
+                        if (placed.window.title.find("Auspex Panel") !=
+                            std::string::npos) {
+                            shell_running = true;
+                        }
+                    }
+                    if (!shell_running) {
+                        std::cout << "no panel is running, so nothing is dimming "
+                                     "anything -- start the shell first\n";
+                        for (auto& window : shown) window->hide();
+                        shown.clear();
+                        std::exit(2);
+                    }
+
+                    std::ostringstream report;
+                    const double want = config.screen_opacity;
+                    int bad = 0, checked = 0;
+                    for (const auto& placed : auspex::list_placed_windows()) {
+                        const std::string& title = placed.window.title;
+                        if (title.find("Auspex") == std::string::npos) continue;
+
+                        const bool is_chrome =
+                            title.find("Auspex Panel") != std::string::npos ||
+                            title.find("Auspex Desktop") != std::string::npos;
+                        const auto opacity =
+                            auspex::window_opacity(placed.window.id);
+
+                        std::string name = title.substr(title.find("Auspex"));
+                        if (is_chrome) {
+                            // The bars and the wallpaper are supposed to carry
+                            // nothing: they dim themselves, and dimming them from
+                            // outside as well would fade the clock and grey out
+                            // the wallpaper.
+                            report << (opacity ? "  WRONG  " : "  ok     ") << name
+                                   << "  chrome, should carry no opacity"
+                                   << (opacity ? " but carries one" : "") << "\n";
+                            if (opacity) ++bad;
+                            continue;
+                        }
+
+                        // IS IT EVEN ON THE PANEL'S MONITOR?
+                        //
+                        // Eight windows opening at once get cascaded by the
+                        // window manager, and some land mostly on another screen.
+                        // Those are supposed NOT to be dimmed -- so demanding it
+                        // of them made this check fail at random on a shell that
+                        // was behaving perfectly, which is the worst kind of
+                        // check to have. Same rule the dimming pass uses: the
+                        // centre decides.
+                        //
+                        // It also means this now tests the OTHER half for free.
+                        // A window off the panel's monitor must carry no opacity,
+                        // which is the drag-to-another-screen behaviour I could
+                        // not test by dragging.
+                        const auto panel_screen = auspex::primary_monitor();
+                        const int cx = placed.bounds.x + placed.bounds.width / 2;
+                        const int cy = placed.bounds.y + placed.bounds.height / 2;
+                        const bool here =
+                            panel_screen &&
+                            cx >= panel_screen->bounds.x &&
+                            cx < panel_screen->bounds.x + panel_screen->bounds.width &&
+                            cy >= panel_screen->bounds.y &&
+                            cy < panel_screen->bounds.y + panel_screen->bounds.height;
+
+                        if (!here) {
+                            report << (opacity ? "  WRONG  " : "  off    ") << name
+                                   << "  not on the panel's monitor, so it should "
+                                   << "carry no opacity"
+                                   << (opacity ? " but carries one" : "") << "\n";
+                            if (opacity) ++bad;
+                            continue;
+                        }
+
+                        ++checked;
+                        const bool dimmed =
+                            opacity && std::abs(*opacity - want) < 0.02;
+                        report << (dimmed ? "  glass  " : "  SOLID  ") << name
+                               << "  ";
+                        if (opacity) report << "opacity " << *opacity;
+                        else report << "no opacity property";
+                        report << ", wanted " << want << "\n";
+                        if (!dimmed) ++bad;
+                    }
+
+                    if (checked == 0) {
+                        std::cout << "no windows were checked\n";
+                        ++bad;
+                    }
+
+                    // Still settling: say nothing and look again. Only the last
+                    // attempt is allowed to report, so the output is one verdict
+                    // rather than a dozen contradictory ones.
+                    if (bad != 0 && attempt < kLastAttempt) {
+                        report.str("");
+                        return true;
+                    }
+                    std::cout << report.str();
+                    std::cout << (bad == 0
+                                      ? "every window is dimmed like the desktop\n"
+                                      : std::to_string(bad) + " window(s) wrong\n");
+                    for (auto& window : shown) window->hide();
+                    shown.clear();
+                    std::exit(bad == 0 ? 0 : 1);
+                    return false;
+                },
+                // Every 1.5s, up to twelve times: long enough for another
+                // process's poll to come round several times over.
+                1500);
+            return;
+        }
+
+        if (smoke) {
+            // Belt and braces. If this is ever false the guards are not on, and
+            // the next thing this mode would do is press every button in the
+            // shell with nothing stopping any of them.
+            if (!auspex::smoke_mode()) {
+                std::cerr << "auspex-shell: --smoke could not arm its guards; "
+                             "refusing to press anything\n";
+                std::exit(2);
+            }
+
+            // Same reason --check-windows holds: with HANDLES_COMMAND_LINE the
+            // application exits the moment this handler returns.
+            app->hold();
+            static std::vector<std::unique_ptr<Gtk::Window>> alive;
+            for (const auto& name : window_names()) {
+                std::unique_ptr<Gtk::Window> window = make_window(name, config);
+                if (!window) continue;
+                window->present();
+                alive.push_back(std::move(window));
+            }
+
+            Glib::signal_timeout().connect_once(
+                [&app] {
+                    int total = 0, refused_total = 0, dead = 0;
+                    for (std::size_t i = 0; i < alive.size(); ++i) {
+                        auspex::smoke_reset();
+
+                        // FILLED FIRST. Nearly every handler validates before it
+                        // does anything -- no task, no project, no prompt -- so
+                        // pressing Start on an empty form exercises the guard
+                        // clause and nothing else. The first run of this pressed
+                        // 104 controls and reached an external sink exactly zero
+                        // times, which looked like a pass and was really a
+                        // measurement of how far the buttons had NOT got.
+                        fill_entries(alive[i]->get_child());
+
+                        std::vector<Gtk::Widget*> controls;
+                        collect_controls(alive[i]->get_child(), controls);
+
+                        int pressed = 0;
+                        for (Gtk::Widget* control : controls) {
+                            if (press(control)) ++pressed;
+                        }
+                        // Let anything the handlers posted to the main loop run,
+                        // so a crash lands inside this check rather than after it.
+                        // Several of these hand their work to a thread, and a
+                        // refusal recorded on that thread arrives after the click
+                        // returns -- so this pumps for a while rather than just
+                        // draining what is already queued.
+                        for (int spin = 0; spin < 400; ++spin) {
+                            while (Glib::MainContext::get_default()->pending()) {
+                                Glib::MainContext::get_default()->iteration(false);
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+
+                        const auto refused = auspex::smoke_refusals();
+                        total += pressed;
+                        refused_total += static_cast<int>(refused.size());
+
+                        std::cout << "  " << window_names()[i] << ": pressed "
+                                  << pressed << "/" << controls.size()
+                                  << ", refused " << refused.size();
+                        if (!refused.empty()) {
+                            std::cout << " (";
+                            for (std::size_t r = 0; r < refused.size() && r < 4; ++r) {
+                                std::cout << (r ? ", " : "") << refused[r];
+                            }
+                            if (refused.size() > 4) std::cout << ", …";
+                            std::cout << ")";
+                        }
+                        std::cout << "\n";
+                        if (pressed == 0 && !controls.empty()) ++dead;
+                    }
+
+                    // A window whose controls all did nothing is the failure this
+                    // is really looking for: it is what a window looks like when
+                    // its buttons were never connected to anything.
+                    std::cout << "pressed " << total << " control(s), "
+                              << refused_total << " reached something that touches "
+                              << "the outside world and was refused\n";
+                    std::cout << (dead == 0 ? "every window responded\n"
+                                            : std::to_string(dead) +
+                                                  " window(s) did nothing at all\n");
+                    for (auto& window : alive) window->hide();
+                    alive.clear();
+                    std::exit(dead == 0 ? 0 : 1);
+                },
+                800);
+            return;
+        }
+
         if (check_width != 0) {
             // The windows are PRESENTED before being measured.
             //

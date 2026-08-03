@@ -1,5 +1,7 @@
 #include "auspex/audio.hpp"
 
+#include "auspex/smoke.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -140,6 +142,9 @@ std::optional<std::vector<float>> load_mono16k(const std::filesystem::path& path
 
 std::optional<std::vector<float>> record_mono16k(std::chrono::milliseconds duration,
                                                  std::string* error) {
+    // The microphone. Never opened by a test.
+    if (smoke_refuse("microphone")) return std::nullopt;
+
     return record_impl(nullptr, duration, error);
 }
 
@@ -147,6 +152,9 @@ std::optional<std::vector<float>> record_mono16k_until(
     const std::function<bool()>& should_stop,
     std::chrono::milliseconds max_duration,
     std::string* error) {
+    // The microphone. Never opened by a test.
+    if (smoke_refuse("microphone")) return std::nullopt;
+
     return record_impl(should_stop, max_duration, error);
 }
 

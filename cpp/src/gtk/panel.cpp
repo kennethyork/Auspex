@@ -1,5 +1,7 @@
 #include "auspex/gtk/panel.hpp"
 
+#include <cmath>
+
 #include <set>
 
 #include <ctime>
@@ -233,6 +235,51 @@ void ScreenGlass::apply(const Rect& screen, double opacity) {
     }
     healed_ = true;
     apply_screen_opacity(screen, opacity, theirs, dimmed_);
+
+    // A WINDOW ID THAT CAME BACK AS SOMETHING ELSE.
+    //
+    // X reuses window ids. Close a dimmed window and open another inside one poll
+    // interval and the new window inherits the id, is found in `dimmed_`, and is
+    // skipped as already done -- so it stays opaque forever while we believe we
+    // dimmed it. --check-glass caught this as an intermittent failure on two of
+    // eight windows, which is what a race looks like from the outside.
+    //
+    // The title is what gives it away, and comparing titles costs nothing: a
+    // window whose title has changed since we dimmed it is either a different
+    // window wearing its id, or the same window with something new to say. Both
+    // are worth one property write. The round-robin below is the backstop for the
+    // case this misses -- an id reused by a window with an identical title.
+    for (const auto& placed : theirs) {
+        const std::string id = canonical_window_id(placed.window.id);
+        if (dimmed_.count(id) == 0) continue;
+        auto known = titles_.find(id);
+        if (known != titles_.end() && known->second == placed.window.title) continue;
+        titles_[id] = placed.window.title;
+        set_window_opacity(id, opacity);
+    }
+
+    // SELF-HEALING, one window per tick.    // SELF-HEALING, one window per tick.
+    //
+    // `dimmed_` is a set of X window ids, and X reuses ids. Close a dimmed window
+    // and open another inside one poll interval and the new window inherits the
+    // id, is found in the set, and is skipped as already done -- so it stays
+    // opaque forever while we believe we dimmed it. --check-glass caught this as
+    // an intermittent failure on exactly two of eight windows, which is what a
+    // race looks like from the outside.
+    //
+    // The alternative is asking for every window's property on every tick, which
+    // is the xprod-per-window-per-tick that the fast path exists to avoid. One
+    // window per tick costs a single lookup and heals any window within a few
+    // seconds, which for a thing you are looking at is soon enough.
+    if (!dimmed_.empty()) {
+        if (heal_next_ >= dimmed_.size()) heal_next_ = 0;
+        auto it = dimmed_.begin();
+        std::advance(it, heal_next_++);
+        const auto carried = window_opacity(*it);
+        if (!carried || std::abs(*carried - opacity) > 0.02) {
+            set_window_opacity(*it, opacity);
+        }
+    }
 }
 
 void ScreenGlass::restore_all() {

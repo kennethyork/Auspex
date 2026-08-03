@@ -212,6 +212,15 @@ std::vector<PlacedWindow> list_placed_windows();
 // rather than being pinned to fully opaque by us forever.
 bool set_window_opacity(std::string_view window_id, double opacity);
 
+// What opacity a window is currently carrying, or nullopt when it carries none.
+//
+// The counterpart to setting it, and the thing a check needs: "is this window
+// dimmed like the rest of the desktop" is a question about the property the
+// compositor actually reads, not about what the stylesheet intended. Absent is
+// a real answer -- 1.0 removes the property rather than writing an opaque value
+// -- so nullopt means opaque, not unknown.
+std::optional<double> window_opacity(std::string_view window_id);
+
 // Apply `opacity` to every window whose centre is inside `screen`, and RESTORE
 // every window that has left it.
 //

@@ -1,5 +1,7 @@
 #include "auspex/desktop.hpp"
 
+#include <optional>
+
 #include <algorithm>
 #include <set>
 
@@ -183,6 +185,26 @@ std::vector<PlacedWindow> parse_placed_windows(const std::string& output) {
     }
 
     return result;
+}
+
+std::optional<double> window_opacity(std::string_view window_id) {
+    const auto result = run({"xprop", "-id", std::string(window_id),
+                             "_NET_WM_WINDOW_OPACITY"},
+                            /*capture=*/true);
+    if (!result.ok) return std::nullopt;
+
+    // "_NET_WM_WINDOW_OPACITY(CARDINAL) = 3221225471", or "... not found."
+    const auto equals = result.out.find('=');
+    if (equals == std::string::npos) return std::nullopt;
+
+    try {
+        const auto raw = std::stoull(trim(result.out.substr(equals + 1)));
+        // The property is a fraction of 0xFFFFFFFF, which is how a CARDINAL
+        // carries a number between zero and one.
+        return static_cast<double>(raw) / 4294967295.0;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
 }
 
 bool set_window_opacity(std::string_view window_id, double opacity) {

@@ -86,6 +86,11 @@ private:
     // what is in its own set, which starts empty. Clearing them is safe precisely
     // because we never set it on them: there is nothing of the user's to undo.
     bool healed_ = false;
+    // What each dimmed window was called when we dimmed it. A title that has
+    // changed means the id may belong to a different window now.
+    std::map<std::string, std::string> titles_;
+    // Round-robin cursor for the self-heal above; X reuses window ids.
+    std::size_t heal_next_ = 0;
 };
 
 class WindowList : public Gtk::Box {

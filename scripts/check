@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+#
+# Everything that can check itself, in one command.
+#
+# The checks existed before this did; what was missing was running them. Each one
+# was built the day something broke, and each one then sat there while I claimed
+# the next thing worked -- a stylesheet check that would have caught the Team
+# window, written after the Team window had already shipped opaque and been found
+# by somebody else looking at their screen.
+#
+# So this is not a convenience. It is the difference between checks that exist and
+# checks that run, which is the whole distance between the two grades.
+#
+# Exits non-zero if any of them fail. Prints one verdict at the end.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+build="$here/cpp/build"
+: "${DISPLAY:=:0.0}"
+export DISPLAY
+
+if [ ! -x "$build/auspex-selftest" ] || [ ! -x "$build/auspex-shell" ]; then
+    echo "check: nothing built yet -- run: cmake --build cpp/build -j8" >&2
+    exit 2
+fi
+
+failed=()
+skipped=()
+
+run_check() {
+    local name="$1"; shift
+    printf '\n=== %s ===\n' "$name"
+    if "$@"; then
+        return 0
+    fi
+    local status=$?
+    # 2 means "could not run", which is not the same as "found a problem" -- a
+    # check that never ran must not be reported as a check that passed, and must
+    # not be reported as a failure either.
+    if [ "$status" -eq 2 ]; then
+        skipped+=("$name")
+    else
+        failed+=("$name")
+    fi
+    return 0
+}
+
+# Unit checks first: they need no display and they are the fastest to fail.
+run_check "unit checks"    "$build/auspex-selftest"
+
+# Then the GUI, cheapest question first. Layout before behaviour: a control that
+# is off the edge of the window cannot be usefully said to work.
+run_check "window layout"  timeout 180 "$build/auspex-shell" --check-windows
+
+# Pressing every control in every window. Safe because every way this program can
+# reach outside itself refuses while --smoke is on; see cpp/include/auspex/smoke.hpp.
+run_check "controls"       timeout 300 "$build/auspex-shell" --smoke
+
+# Transparency, which needs a running panel to do the dimming. Exits 2 when there
+# is none, and is reported as skipped rather than passed.
+run_check "transparency"   timeout 180 "$build/auspex-shell" --check-glass
+
+echo
+if [ ${#skipped[@]} -gt 0 ]; then
+    printf 'skipped: %s\n' "${skipped[*]}"
+fi
+if [ ${#failed[@]} -eq 0 ]; then
+    echo "all checks passed"
+    exit 0
+fi
+printf 'FAILED: %s\n' "${failed[*]}"
+exit 1

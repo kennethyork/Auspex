@@ -6,11 +6,23 @@
 
 #include <curl/curl.h>
 
+#include "auspex/smoke.hpp"
+
 #include "auspex/process.hpp"
 
 namespace auspex {
 
 namespace {
+
+// curl_easy_perform, except that smoke mode does not reach the network.
+//
+// Wrapped rather than guarded at each call site: there are two here and two in
+// the other file that talks to the network, and a guard you have to remember to
+// add to the next one is a guard that will be missing from the next one.
+CURLcode guarded_curl_perform(CURL* curl) {
+    if (smoke_refuse("http")) return CURLE_COULDNT_CONNECT;
+    return curl_easy_perform(curl);
+}
 
 std::size_t collect(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
     auto* out = static_cast<std::string*>(userdata);
@@ -260,7 +272,7 @@ SearchResult web_search(const std::string& query, int limit,
     curl_easy_setopt(curl, CURLOPT_USERAGENT,
                      "Mozilla/5.0 (X11; Linux x86_64) auspex/0.2");
 
-    const CURLcode rc = curl_easy_perform(curl);
+    const CURLcode rc = guarded_curl_perform(curl);
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     curl_easy_cleanup(curl);
@@ -322,7 +334,7 @@ FetchedPage fetch_page(const std::string& url, std::size_t max_bytes) {
     curl_easy_setopt(curl, CURLOPT_USERAGENT,
                      "Mozilla/5.0 (X11; Linux x86_64) auspex/0.2");
 
-    const CURLcode rc = curl_easy_perform(curl);
+    const CURLcode rc = guarded_curl_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &page.status);
     curl_easy_cleanup(curl);
 

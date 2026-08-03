@@ -5,6 +5,8 @@
 #include <utility>
 
 #include <curl/curl.h>
+
+#include "auspex/smoke.hpp"
 #include <nlohmann/json.hpp>
 
 #include "auspex/context_tuner.hpp"
@@ -26,6 +28,16 @@ std::string_view OracleStatus::label() const {
 }
 
 namespace {
+
+// curl_easy_perform, except that smoke mode does not reach the network.
+//
+// Wrapped rather than guarded at each call site: there are two here and two in
+// the other file that talks to the network, and a guard you have to remember to
+// add to the next one is a guard that will be missing from the next one.
+CURLcode guarded_curl_perform(CURL* curl) {
+    if (smoke_refuse("http")) return CURLE_COULDNT_CONNECT;
+    return curl_easy_perform(curl);
+}
 
 std::size_t write_cb(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
     auto* out = static_cast<std::string*>(userdata);
@@ -95,7 +107,7 @@ OllamaClient::HttpResult OllamaClient::get(const std::string& path,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout.count()));
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
-    const CURLcode rc = curl_easy_perform(curl);
+    const CURLcode rc = guarded_curl_perform(curl);
     if (rc != CURLE_OK) return result;
 
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status);
@@ -138,7 +150,7 @@ OllamaClient::HttpResult OllamaClient::post_json(const std::string& path,
     constexpr int kAttempts = 3;
     for (int attempt = 0; attempt < kAttempts; ++attempt) {
         result.body.clear();
-        const CURLcode rc = curl_easy_perform(curl);
+        const CURLcode rc = guarded_curl_perform(curl);
         if (rc != CURLE_OK) break;
 
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status);
