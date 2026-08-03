@@ -268,7 +268,11 @@ private:
     // The brain options. All opt-in, and a plain run is unchanged by them -- which
     // is why they are switches rather than a mode: each buys something at a cost in
     // time and tokens, and the honest default is none of them.
-    Gtk::Box         options_{Gtk::Orientation::HORIZONTAL, 14};
+    // A FlowBox, for the same reason the roles are a grid: a horizontal Box CLIPS
+    // rather than wraps, and this row grew from five switches to ten. The window
+    // had to be 1220px wide to show them all -- at the width it is actually used
+    // at, the last three were simply gone.
+    Gtk::FlowBox     options_;
     Gtk::CheckButton route_{"Route models"};
     Gtk::CheckButton debate_{"Debate"};
     Gtk::CheckButton dedupe_{"Dedupe"};
@@ -286,6 +290,28 @@ private:
     // Write the shipped starter skills that match this task into the project.
     // On by default, matching RunOptions.
     Gtk::CheckButton starters_{"Starter skills"};
+
+    // Land each coder on its own branch rather than in your working tree. The
+    // feature that makes one coder's work reviewable without the other two, and
+    // it was reachable only by typing a positional argument at a selftest binary.
+    Gtk::CheckButton branch_{"Branch per coder"};
+
+    // Commit what lands, with a message naming the run. Meaningless when Branch
+    // is on -- that already commits -- so it is disabled rather than left as a
+    // switch that quietly does nothing.
+    Gtk::CheckButton commit_{"Commit what lands"};
+
+    // Keep running: re-run the task whenever the tree settles.
+    Gtk::CheckButton watch_{"Keep watching"};
+
+    // What gates are configured, read-only. Hooks are edited in a file, but a
+    // gate you have forgotten you installed is worse than no gate -- this is the
+    // one place that says they exist.
+    Gtk::Label hooks_note_;
+
+    // Read from the switch on the GTK thread before the worker starts, because a
+    // worker thread must not touch a widget.
+    bool watch_now_ = false;
     Gtk::Box         second_row_{Gtk::Orientation::HORIZONTAL, 14};
     Gtk::Label       coders_label_;
     Gtk::SpinButton  coders_;
@@ -501,6 +527,13 @@ class BrainWindow : public Gtk::Window {
 public:
     BrainWindow();
 
+    // Cancels a measurement in flight and waits for it.
+    //
+    // Not tidiness: a std::thread member that is still joinable when it is
+    // destroyed calls std::terminate, so closing this window mid-measurement
+    // would take the whole shell with it. The same reason CrewWindow has one.
+    ~BrainWindow() override;
+
 private:
     void reload();
     void save_models();
@@ -552,6 +585,30 @@ private:
     std::vector<std::unique_ptr<Gtk::Widget>> map_rows_;
     std::string         last_active_;
     bool                have_map_ = false;
+
+    // MEASURE THE MODEL YOU JUST PICKED.
+    //
+    // This window is where the Auditor's model is chosen, and until now nothing
+    // in it could tell you whether the choice was any good -- the corpus that
+    // knows lived behind a selftest flag. The sweep that found gpt-oss:120b
+    // making a FALSE ACCEPT, on the model I had recommended, was run from a
+    // terminal and no part of the interface would ever have shown it.
+    //
+    // On a worker thread with a cancel token, like every other model call here:
+    // thirteen cases against a cloud model is tens of seconds, and a frozen
+    // window for that long reads as a crash.
+    Gtk::Label   measure_heading_;
+    Gtk::Box     measure_row_{Gtk::Orientation::HORIZONTAL, 6};
+    Gtk::Button  measure_go_{"Measure the Auditor"};
+    Gtk::Button  measure_stop_{"Stop"};
+    Gtk::Label   measure_result_;
+    std::thread       measure_thread_;
+    std::atomic<bool> measuring_{false};
+    std::atomic<bool> measure_cancel_{false};
+    Glib::Dispatcher  measure_done_;
+    std::mutex        measure_mutex_;
+    std::string       measure_text_;
+    void measure();
 
     Gtk::Label  tokens_;
     Gtk::Label  status_;

@@ -28,6 +28,9 @@
 #include "auspex/crew.hpp"
 #include "auspex/cli_coder.hpp"
 #include "auspex/crew_run.hpp"
+#include "auspex/eval.hpp"
+#include "auspex/hooks.hpp"
+#include "auspex/watch.hpp"
 #include "auspex/roles.hpp"
 #include "auspex/usage.hpp"
 #include "auspex/gtk/voice.hpp"
@@ -691,13 +694,59 @@ CrewWindow::CrewWindow() {
         "Write the shipped skills that match this task into .auspex/skills. "
         "Anything you have written yourself is never overwritten.");
 
-    options_.append(route_);
-    options_.append(debate_);
-    options_.append(dedupe_);
-    options_.append(learn_);
-    options_.append(security_);
-    options_.append(verify_);
-    options_.append(starters_);
+    options_.set_selection_mode(Gtk::SelectionMode::NONE);
+    options_.set_max_children_per_line(5);
+    options_.set_row_spacing(2);
+    options_.set_column_spacing(14);
+
+    options_.insert(route_, -1);
+    options_.insert(debate_, -1);
+    options_.insert(dedupe_, -1);
+    options_.insert(learn_, -1);
+    options_.insert(security_, -1);
+    branch_.set_tooltip_text(
+        "Land each coder on its own branch, crew/<run>/<n>-<title>, instead of in "
+        "your working tree. One coder's work can then be reviewed, cherry-picked "
+        "or thrown away without touching the others. Your working tree, index and "
+        "current branch are left exactly as they are.");
+    commit_.set_tooltip_text(
+        "Commit what lands, with a message naming the run and the task. Only the "
+        "paths this run changed are staged, so work you have in progress is not "
+        "swept in.");
+    watch_.set_tooltip_text(
+        "After the run, keep watching: run the task again whenever the tree "
+        "settles. Changes the crew itself makes do not count as a reason to run "
+        "again.");
+
+    // Branch already commits, so Commit alongside it is a switch that does
+    // nothing. Disabled rather than ignored -- a control that silently has no
+    // effect is worse than one that is plainly unavailable.
+    const auto sync_commit = [this] {
+        commit_.set_sensitive(!branch_.get_active());
+        if (branch_.get_active()) commit_.set_active(false);
+    };
+    branch_.signal_toggled().connect(sync_commit);
+    sync_commit();
+
+    options_.insert(verify_, -1);
+    options_.insert(starters_, -1);
+    options_.insert(branch_, -1);
+    options_.insert(commit_, -1);
+    options_.insert(watch_, -1);
+
+    // The gates you have installed, if any. A hook you have forgotten is worse
+    // than no hook, and nothing else in the interface mentions them.
+    if (const auto hooks = load_hooks(); !hooks.empty()) {
+        hooks_note_.set_text(std::to_string(hooks.size()) + " hook" +
+                             (hooks.size() == 1 ? "" : "s") + " will gate this run");
+        hooks_note_.set_tooltip_text(render_hooks(hooks));
+    } else {
+        hooks_note_.set_text("No hooks configured");
+        hooks_note_.set_tooltip_text("Gates of your own live in " +
+                                     hooks_path().string());
+    }
+    hooks_note_.set_xalign(0.0f);
+    hooks_note_.add_css_class("subtitle");
 
     // The roles this crew may use, one box each, all ticked.
     //
@@ -897,6 +946,7 @@ CrewWindow::CrewWindow() {
     tuning_box_.append(roles_label_);
     tuning_box_.append(roles_row_);
     tuning_box_.append(second_row_);
+    tuning_box_.append(hooks_note_);
     tuning_box_.set_margin_top(6);
     tuning_box_.set_margin_start(4);
     tuning_.set_child(tuning_box_);
@@ -1068,6 +1118,11 @@ void CrewWindow::start() {
         options.verify_attempts = 2;
         options.coder.allow_run = true;
     }
+    options.branch_per_coder = branch_.get_active();
+    options.commit           = commit_.get_active();
+    // Read on the GTK thread and handed to the worker, rather than the worker
+    // reaching back into a widget it must not touch.
+    watch_now_ = watch_.get_active();
     if (amplify_.get_value_as_int() > 0) options.amplify = amplify_.get_value_as_int();
 
     // Straight across, whatever roles exist. The engine's fallback chain does the
@@ -1108,7 +1163,26 @@ void CrewWindow::start() {
             run_changed_.emit();
         };
 
-        const RunResult result = run_crew(config, options, events, &cancel_);
+        // Keep watching, or run once.
+        //
+        // watch_project runs the crew itself and blocks until told to stop, so it
+        // takes the same cancel token the Stop button already sets -- the button
+        // does not need to know which of the two it is stopping.
+        RunResult result;
+        if (watch_now_) {
+            WatchOptions watching;
+            watching.project = options.project;
+            watching.task    = options.task;
+
+            WatchEvents watch_events;
+            watch_events.log = events.log;
+            const int runs = watch_project(config, watching, watch_events, &cancel_);
+            result.applied = 0;
+            result.error = runs == 0 ? "watching stopped without running"
+                                     : std::to_string(runs) + " run(s) while watching";
+        } else {
+            result = run_crew(config, options, events, &cancel_);
+        }
         {
             std::lock_guard lock(log_mutex_);
             last_log_ = result.error.empty()
@@ -1794,6 +1868,63 @@ void TeamWindow::launch() {
 // ---------------------------------------------------------------------------
 // BrainWindow
 // ---------------------------------------------------------------------------
+BrainWindow::~BrainWindow() {
+    // Ask, then wait. The loop checks between cases, so this blocks for at most
+    // one model call.
+    measure_cancel_.store(true);
+    if (measure_thread_.joinable()) measure_thread_.join();
+}
+
+void BrainWindow::measure() {
+    if (measuring_.exchange(true)) return;   // already going
+    measure_cancel_.store(false);
+    measure_go_.set_sensitive(false);
+    measure_stop_.set_sensitive(true);
+    measure_result_.set_text("measuring…");
+
+    if (measure_thread_.joinable()) measure_thread_.join();
+    measure_thread_ = std::thread([this] {
+        const Config config = Config::load();
+        // The model this window has the Auditor set to -- the whole point is to
+        // measure the choice you just made, not some default.
+        AuditEvalOptions options;
+        options.model = with_config_roles(config, {}).model_for("auditor");
+
+        std::vector<AuditEvalResult> results;
+        for (const auto& item : builtin_audit_cases()) {
+            if (measure_cancel_.load()) break;
+            results.push_back(run_audit_case(config, item, options));
+        }
+
+        const AuditEvalSummary summary = summarize_audit(results);
+        std::ostringstream out;
+        if (results.empty()) {
+            out << "stopped before anything was measured";
+        } else {
+            out << summary.correct << "/" << summary.total() << " correct";
+            if (measure_cancel_.load()) out << " (stopped early)";
+            // Never one averaged number: an Auditor that holds everything and one
+            // that accepts everything both score 50%, and only one can hurt you.
+            out << "  ·  " << summary.false_holds << " false hold"
+                << (summary.false_holds == 1 ? "" : "s") << " (work thrown away)"
+                << "  ·  " << summary.false_accepts << " false accept"
+                << (summary.false_accepts == 1 ? "" : "s")
+                << " (broken code landed)";
+            if (summary.invented_quotes > 0) {
+                out << "  ·  " << summary.invented_quotes
+                    << " held on evidence not in the diff";
+            }
+        }
+
+        {
+            std::lock_guard lock(measure_mutex_);
+            measure_text_ = out.str();
+        }
+        measuring_.store(false);
+        measure_done_.emit();
+    });
+}
+
 BrainWindow::BrainWindow() {
     set_title("Auspex Brain");
     add_css_class("auspex-window");
@@ -1919,6 +2050,39 @@ BrainWindow::BrainWindow() {
     root_.append(probe_result_);
     root_.append(map_heading_);
     root_.append(map_scroller_);
+
+    // Measure the model you just picked.
+    measure_heading_.set_text("Is the Auditor any good?");
+    measure_heading_.set_xalign(0.0f);
+    measure_heading_.add_css_class("title");
+    measure_go_.set_tooltip_text(
+        "Run the Auditor corpus against the model above: thirteen changesets whose "
+        "right answer is beyond argument. Reports the two errors apart -- a false "
+        "HOLD wastes a coder's work, a false ACCEPT puts broken code in your "
+        "project, and only the split tells them apart.");
+    measure_stop_.set_sensitive(false);
+    measure_result_.set_xalign(0.0f);
+    measure_result_.set_wrap(true);
+    measure_result_.add_css_class("subtitle");
+
+    measure_row_.append(measure_go_);
+    measure_row_.append(measure_stop_);
+    root_.append(measure_heading_);
+    root_.append(measure_row_);
+    root_.append(measure_result_);
+
+    measure_go_.signal_clicked().connect([this] { measure(); });
+    measure_stop_.signal_clicked().connect([this] { measure_cancel_.store(true); });
+    measure_done_.connect([this] {
+        {
+            std::lock_guard lock(measure_mutex_);
+            measure_result_.set_text(measure_text_);
+        }
+        measure_go_.set_sensitive(true);
+        measure_stop_.set_sensitive(false);
+        if (measure_thread_.joinable()) measure_thread_.join();
+    });
+
     root_.append(tokens_);
     root_.append(status_);
     set_child(root_);
