@@ -121,17 +121,20 @@ void test_css() {
     check(css.find("alpha(#c0caf5, 0.2)") != std::string::npos,
           "scrollbar alpha() keeps its colour argument");
 
-    // A window dragged off the panel's screen goes solid, like every other window
-    // on the desktop does. The rule needs BOTH classes or it would not outrank the
-    // translucent one it exists to override -- and a specificity mistake here is
-    // invisible until you drag a window to another monitor and it stays glass.
-    check(css.find("window.auspex-window.auspex-solid") != std::string::npos,
-          "an off-monitor window has a rule to go solid");
+
+    // The shell's own windows are OPAQUE in the stylesheet. Their translucency
+    // comes from the window manager now, like every other window's, and a stray
+    // alpha here would dim them twice -- 0.75 of 0.75, a much darker window than
+    // anybody asked for. The bars keep theirs.
     {
-        const auto glass = css.find("window.auspex-window,");
-        const auto solid = css.find("window.auspex-window.auspex-solid,");
-        check(glass != std::string::npos && solid != std::string::npos && solid > glass,
-              "the solid rule comes after the glass one it overrides");
+        const auto rule = css.find("window.auspex-window,");
+        check(rule != std::string::npos, "the shell's windows have a rule");
+        const auto body = css.find('}', rule);
+        check(css.substr(rule, body - rule).find("alpha(") == std::string::npos,
+              "the shell's own windows are not dimmed by stylesheet as well");
+        check(css.find("window.auspex-panel,") != std::string::npos &&
+                  css.find("alpha(", css.find("window.auspex-panel,")) < body + 4000,
+              "the bars still dim themselves");
     }
 
     // Panel controls carry no chrome until you touch them. Twenty filled plates on

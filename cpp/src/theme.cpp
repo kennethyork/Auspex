@@ -87,52 +87,32 @@ window.auspex-panel .background {
     background-color: alpha($panel_bg, $window_opacity);
 }
 
-/* Auspex's own windows -- launcher, chat, settings, board -- sit at the same
- * weight as the bars, so the desktop reads as one surface rather than a
- * translucent strip with opaque boxes floating over it.
+/* Auspex's own windows are OPAQUE here, on purpose.
  *
- * What is deliberately NOT translucent is everything you actually read. Entries,
- * buttons, list rows, message bubbles and code blocks all set their own opaque
- * background further down, and those rules win here: only the window itself and
- * the layout boxes between the content go see-through. Text over a photograph is
- * the failure mode this design exists to avoid, and it is avoided by choosing
- * WHICH surfaces are glass, not by picking a timid alpha.
+ * They used to carry the same alpha as the bars. It looked reasonable on its own
+ * and wrong in company: a stylesheet can only fade the surfaces it names, so the
+ * background went glass while every list, text view, card and button stayed
+ * solid -- and next to terminals you can see straight through, the crew window
+ * read as the one opaque thing on the screen.
  *
- * scrolledwindow and viewport are named because GTK paints them itself; without
- * them a scrolling list would be an opaque rectangle inside a glass window.
+ * Their translucency now comes from _NET_WM_WINDOW_OPACITY, applied by the same
+ * pass that dims every other window on the panel's monitor, at screen_opacity.
+ * That fades the text too, which this rule deliberately did not -- but matching
+ * the desktop is the thing being asked for, and a window that dims like every
+ * other window also stops dimming like every other window when you drag it to a
+ * screen with no panel on it.
  *
- * The SAME number as the panels, and for the same reason -- one setting for the
- * whole shell means these windows never look like they belong to a different
- * program. */
+ * Opaque HERE so it is not dimmed twice: 0.75 of 0.75 is 0.56, which is a
+ * different and much darker window than the one anybody asked for. */
 window.auspex-window,
 window.auspex-window > box,
 window.auspex-window box,
 window.auspex-window scrolledwindow,
 window.auspex-window viewport,
 window.auspex-window .background {
-    background-color: alpha($panel_bg, $window_opacity);
-}
-
-/* ...UNLESS the window has been moved off the panel's screen.
- *
- * Every other window on the desktop is dimmed only while it is on the panel's
- * monitor and goes solid again when dragged to another one. Auspex's own windows
- * did not follow that rule: their translucency came from this stylesheet, which
- * has no idea where a window is, so they stayed glass on every screen. Carrying
- * the effect to a monitor that has no panel on it is exactly the thing the
- * screen-wide version was written not to do.
- *
- * Two classes beat one, so this wins over the rule above without !important.
- * Toggled on the window as it crosses monitors, which GDK reports directly --
- * no polling, and no asking the window manager where anything is. */
-window.auspex-window.auspex-solid,
-window.auspex-window.auspex-solid > box,
-window.auspex-window.auspex-solid box,
-window.auspex-window.auspex-solid scrolledwindow,
-window.auspex-window.auspex-solid viewport,
-window.auspex-window.auspex-solid .background {
     background-color: $panel_bg;
 }
+
 
 box {
     background-color: $panel_bg;

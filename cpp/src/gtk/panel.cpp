@@ -200,19 +200,30 @@ void ScreenGlass::apply(const Rect& screen, double opacity) {
         return;
     }
 
-    // Auspex's own windows are SKIPPED. They do this themselves, by stylesheet,
-    // where only the background goes glass and the text stays solid -- this on top
-    // would dim them twice and fade their own text for nothing. They follow the
-    // same rule as everything here, including going solid when dragged to another
-    // monitor; they just hear about the crossing from GDK instead of from wmctrl.
-    // See make_glass() in windows.cpp.
+    // The BARS and the WALLPAPER are skipped; Auspex's tool windows are not.
+    //
+    // All of them used to be skipped, because they dimmed themselves by
+    // stylesheet. That fades only the background and leaves every surface you
+    // read opaque, which is a defensible look and is NOT what the rest of the
+    // desktop does -- so the crew window sat among terminals you could see
+    // straight through and read as the one solid thing on the screen. Asked for
+    // windows that work like transparent windows, the answer is to use the same
+    // mechanism as transparent windows rather than a second one that approximates
+    // it.
+    //
+    // The bars keep their own stylesheet alpha: a panel is a strip of chrome, and
+    // dimming its text would make the clock hard to read for no gain. The desktop
+    // substrate holds the wallpaper, so dimming it would fade the wallpaper into
+    // grey.
     std::vector<PlacedWindow> theirs;
     for (auto& placed : list_placed_windows()) {
         // CONTAINS, not starts-with. wmctrl prefixes every title with the host
         // name, so "Auspex Desktop" arrives as
         // "kennethhy-B450-... Auspex Desktop" and a starts-with test skipped
         // nothing -- Auspex dimmed its own wallpaper substrate on the first run.
-        if (placed.window.title.find("Auspex") != std::string::npos) {
+        const std::string& title = placed.window.title;
+        if (title.find("Auspex Panel") != std::string::npos ||
+            title.find("Auspex Desktop") != std::string::npos) {
             // Clear anything a previous run left on our own windows. Once, not
             // every tick: this is a subprocess each.
             if (!healed_) set_window_opacity(placed.window.id, 1.0);
